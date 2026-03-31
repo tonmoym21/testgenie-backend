@@ -1,0 +1,48 @@
+TESTGENIE - REMAINING FEATURES INSTALLATION GUIDE
+==================================================
+
+This archive contains files for: Observability, Reporting, CI/CD.
+Apply them to your existing backend and frontend projects.
+
+=== BACKEND CHANGES ===
+
+1. Copy these NEW files into your backend project:
+   src/routes/reports.js      -> backend/src/routes/reports.js
+   src/routes/screenshots.js  -> backend/src/routes/screenshots.js
+   docker/init.sql            -> backend/docker/init.sql (REPLACE existing)
+   .github/workflows/ci.yml   -> backend/.github/workflows/ci.yml
+
+2. Edit src/index.js - add these two lines:
+
+   AFTER the line: const executeRoutes = require('./routes/execute');
+   ADD:
+     const reportsRoutes = require('./routes/reports');
+     const screenshotsRoutes = require('./routes/screenshots');
+
+   AFTER the line: app.use('/api', executeRoutes);
+   ADD:
+     app.use('/api/reports', reportsRoutes);
+     app.use('/api/screenshots', screenshotsRoutes);
+
+
+=== FRONTEND CHANGES ===
+
+1. Copy these NEW files:
+   pages/ExecutionsPage.jsx      -> frontend/src/pages/ExecutionsPage.jsx
+   pages/ExecutionDetailPage.jsx -> frontend/src/pages/ExecutionDetailPage.jsx
+   pages/DashboardPage.jsx       -> frontend/src/pages/DashboardPage.jsx
+
+2. REPLACE these files:
+   components/Layout.jsx  -> frontend/src/components/Layout.jsx (REPLACE)
+   App.jsx                -> frontend/src/App.jsx (REPLACE)
+
+3. Add frontend CI:
+   .github/workflows/ci.yml -> frontend/.github/workflows/ci.yml
+
+
+=== VERIFY ===
+
+After applying all changes:
+1. Restart backend: npm run dev
+2. Restart frontend: npm run dev
+3. Login and you should see Dashboard, Projects, Executions in the sidebar
