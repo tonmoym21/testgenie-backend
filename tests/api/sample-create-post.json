@@ -1,0 +1,38 @@
+{
+  "test": {
+    "name": "JSONPlaceholder - Create Post",
+    "type": "api",
+    "config": {
+      "method": "POST",
+      "url": "https://jsonplaceholder.typicode.com/posts",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "title": "TestGenie Rocks",
+        "body": "AI-powered QA automation is the future",
+        "userId": 1
+      },
+      "timeout": 10000,
+      "assertions": [
+        {
+          "target": "status",
+          "operator": "equals",
+          "expected": 201
+        },
+        {
+          "target": "body",
+          "operator": "equals",
+          "expected": "TestGenie Rocks",
+          "path": "title"
+        },
+        {
+          "target": "body",
+          "operator": "exists",
+          "expected": true,
+          "path": "id"
+        }
+      ]
+    }
+  }
+}

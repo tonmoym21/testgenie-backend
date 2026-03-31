@@ -1,0 +1,35 @@
+{
+  "test": {
+    "name": "JSONPlaceholder - Get Users",
+    "type": "api",
+    "config": {
+      "method": "GET",
+      "url": "https://jsonplaceholder.typicode.com/users/1",
+      "timeout": 10000,
+      "assertions": [
+        {
+          "target": "status",
+          "operator": "equals",
+          "expected": 200
+        },
+        {
+          "target": "body",
+          "operator": "equals",
+          "expected": "Leanne Graham",
+          "path": "name"
+        },
+        {
+          "target": "body",
+          "operator": "exists",
+          "expected": true,
+          "path": "email"
+        },
+        {
+          "target": "response_time",
+          "operator": "less_than",
+          "expected": 5000
+        }
+      ]
+    }
+  }
+}

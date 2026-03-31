@@ -1,0 +1,43 @@
+{
+  "test": {
+    "name": "Google Search - Playwright",
+    "type": "ui",
+    "config": {
+      "url": "https://www.google.com",
+      "headless": true,
+      "steps": [
+        {
+          "action": "navigate",
+          "value": "https://www.google.com"
+        },
+        {
+          "action": "assert_title",
+          "value": "Google"
+        },
+        {
+          "action": "fill",
+          "selector": "textarea[name='q']",
+          "value": "TestGenie QA automation"
+        },
+        {
+          "action": "screenshot"
+        },
+        {
+          "action": "click",
+          "selector": "input[name='btnK']"
+        },
+        {
+          "action": "wait",
+          "value": "2000"
+        },
+        {
+          "action": "assert_url",
+          "value": "search"
+        },
+        {
+          "action": "screenshot"
+        }
+      ]
+    }
+  }
+}

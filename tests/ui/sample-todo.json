@@ -1,0 +1,32 @@
+{
+  "test": {
+    "name": "Playwright Demo Site - Todo App",
+    "type": "ui",
+    "config": {
+      "url": "https://demo.playwright.dev/todomvc",
+      "headless": true,
+      "steps": [
+        {
+          "action": "navigate",
+          "value": "https://demo.playwright.dev/todomvc"
+        },
+        {
+          "action": "assert_title",
+          "value": "TodoMVC"
+        },
+        {
+          "action": "fill",
+          "selector": ".new-todo",
+          "value": "Write test cases for TestGenie"
+        },
+        {
+          "action": "click",
+          "selector": ".new-todo"
+        },
+        {
+          "action": "screenshot"
+        }
+      ]
+    }
+  }
+}
