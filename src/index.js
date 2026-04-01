@@ -20,6 +20,7 @@ const executeRoutes = require('./routes/execute');
 const reportsRoutes = require('./routes/reports');
 const collectionsRoutes = require('./routes/collections');
 const environmentsRoutes = require('./routes/environments');
+const schedulesRoutes = require('./routes/schedules');
 
 const app = express();
 
@@ -69,6 +70,7 @@ app.use('/api', executeRoutes);
 app.use('/api/reports', reportsRoutes);
 app.use('/api/collections', collectionsRoutes);
 app.use('/api/environments', environmentsRoutes);
+app.use('/api/schedules', schedulesRoutes);
 
 // 404 catch-all
 app.use((_req, res) => {

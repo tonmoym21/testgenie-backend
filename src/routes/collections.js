@@ -13,6 +13,11 @@ const createCollectionSchema = z.object({
   description: z.string().max(2000).optional(),
 });
 
+const updateCollectionSchema = z.object({
+  name: z.string().min(1).max(200).optional(),
+  description: z.string().max(2000).optional(),
+});
+
 const addTestSchema = z.object({
   name: z.string().min(1).max(200),
   testType: z.enum(['ui', 'api']),
@@ -37,6 +42,26 @@ router.post('/', validate(createCollectionSchema), async (req, res, next) => {
       [req.user.id, req.body.name, req.body.description || null]
     );
     res.status(201).json({ ...result.rows[0], testCount: 0 });
+  } catch (err) { next(err); }
+});
+
+// PATCH /api/collections/:id - update title/description
+router.patch('/:id', validate(updateCollectionSchema), async (req, res, next) => {
+  try {
+    const existing = await db.query('SELECT id FROM collections WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
+    if (existing.rows.length === 0) throw new NotFoundError('Collection');
+
+    const sets = []; const params = [];
+    if (req.body.name) { params.push(req.body.name); sets.push('name = $' + params.length); }
+    if (req.body.description !== undefined) { params.push(req.body.description); sets.push('description = $' + params.length); }
+    if (sets.length === 0) return res.json({ message: 'Nothing to update' });
+
+    params.push(req.params.id, req.user.id);
+    const result = await db.query(
+      'UPDATE collections SET ' + sets.join(', ') + ' WHERE id = $' + (params.length - 1) + ' AND user_id = $' + params.length + ' RETURNING id, name, description, created_at AS "createdAt"',
+      params
+    );
+    res.json(result.rows[0]);
   } catch (err) { next(err); }
 });
 
@@ -72,6 +97,20 @@ router.post('/:id/tests', validate(addTestSchema), async (req, res, next) => {
       [req.params.id, req.body.name, req.body.testType, JSON.stringify(req.body.testDefinition), req.body.sortOrder || 0]
     );
     res.status(201).json(result.rows[0]);
+  } catch (err) { next(err); }
+});
+
+// PATCH /api/collections/:colId/tests/:testId - update test name
+router.patch('/:colId/tests/:testId', async (req, res, next) => {
+  try {
+    const col = await db.query('SELECT id FROM collections WHERE id = $1 AND user_id = $2', [req.params.colId, req.user.id]);
+    if (col.rows.length === 0) throw new NotFoundError('Collection');
+    const result = await db.query(
+      'UPDATE collection_tests SET name = $1 WHERE id = $2 AND collection_id = $3 RETURNING id, name',
+      [req.body.name, req.params.testId, req.params.colId]
+    );
+    if (result.rows.length === 0) throw new NotFoundError('Test');
+    res.json(result.rows[0]);
   } catch (err) { next(err); }
 });
 

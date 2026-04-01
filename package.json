@@ -28,6 +28,7 @@
     "express-rate-limit": "^7.4.1",
     "helmet": "^8.0.0",
     "jsonwebtoken": "^9.0.2",
+    "node-cron": "^4.2.1",
     "openai": "^4.73.0",
     "pg": "^8.13.1",
     "pino": "^9.5.0",
