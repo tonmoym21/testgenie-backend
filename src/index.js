@@ -18,7 +18,8 @@ const testcaseRoutes = require('./routes/testcases');
 const analyzeRoutes = require('./routes/analyze');
 const executeRoutes = require('./routes/execute');
 const reportsRoutes = require('./routes/reports');
-const screenshotsRoutes = require('./routes/screenshots');
+const collectionsRoutes = require('./routes/collections');
+const environmentsRoutes = require('./routes/environments');
 
 const app = express();
 
@@ -66,7 +67,8 @@ app.use('/api/projects/:projectId/testcases', testcaseRoutes);
 app.use('/api/projects/:projectId/analyze', analyzeRoutes);
 app.use('/api', executeRoutes);
 app.use('/api/reports', reportsRoutes);
-app.use('/api/screenshots', screenshotsRoutes);
+app.use('/api/collections', collectionsRoutes);
+app.use('/api/environments', environmentsRoutes);
 
 // 404 catch-all
 app.use((_req, res) => {
