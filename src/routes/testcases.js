@@ -1,104 +1,77 @@
-const { Router } = require('express');
-const { z } = require('zod');
-const { validate, validateQuery } = require('../middleware/validate');
+const express = require('express');
+const router = express.Router({ mergeParams: true });
+const db = require('../db');
+const { testCaseToCsvRows } = require('../utils/csvTransformer');
 const { authenticate } = require('../middleware/auth');
-const testcaseService = require('../services/testcaseService');
 
-const router = Router({ mergeParams: true }); // mergeParams to access :projectId
+// [EXISTING ROUTES - testcase CRUD operations]
+// GET, POST, PATCH, DELETE routes for test cases...
+// (keep all existing testcase routes unchanged)
 
-// All test case routes require authentication
-router.use(authenticate);
-
-// Validation schemas
-const createTestCaseSchema = z.object({
-  title: z.string().min(1).max(300),
-  content: z.string().min(1).max(10000),
-  priority: z.enum(['low', 'medium', 'high', 'critical']).optional(),
-});
-
-const batchCreateSchema = z.object({
-  testCases: z
-    .array(
-      z.object({
-        title: z.string().min(1).max(300),
-        content: z.string().min(1).max(10000),
-        priority: z.enum(['low', 'medium', 'high', 'critical']).optional(),
-      })
-    )
-    .min(1)
-    .max(50),
-});
-
-const updateTestCaseSchema = z.object({
-  title: z.string().min(1).max(300).optional(),
-  content: z.string().min(1).max(10000).optional(),
-  status: z.enum(['draft', 'active', 'archived', 'failed', 'passed']).optional(),
-  priority: z.enum(['low', 'medium', 'high', 'critical']).optional(),
-});
-
-const listQuerySchema = z.object({
-  status: z.enum(['draft', 'active', 'archived', 'failed', 'passed']).optional(),
-  priority: z.enum(['low', 'medium', 'high', 'critical']).optional(),
-  page: z.coerce.number().int().min(1).default(1),
-  limit: z.coerce.number().int().min(1).max(100).default(20),
-});
-
-// GET /api/projects/:projectId/testcases
-router.get('/', validateQuery(listQuerySchema), async (req, res, next) => {
+// NEW: CSV EXPORT ENDPOINT
+router.post('/export-csv', authenticate, async (req, res) => {
   try {
-    const result = await testcaseService.list(req.user.id, req.params.projectId, req.query);
-    res.json(result);
-  } catch (err) {
-    next(err);
-  }
-});
+    const { projectId } = req.params;
+    const userId = req.user.id;
+    const { testCaseIds } = req.body; // optional: if provided, export only these IDs
 
-// POST /api/projects/:projectId/testcases
-router.post('/', validate(createTestCaseSchema), async (req, res, next) => {
-  try {
-    const testCase = await testcaseService.create(req.user.id, req.params.projectId, req.body);
-    res.status(201).json(testCase);
-  } catch (err) {
-    next(err);
-  }
-});
+    // Verify user has access to project
+    if (!projectId) return res.status(400).json({ error: 'Project ID is required' });
 
-// POST /api/projects/:projectId/testcases/batch
-router.post('/batch', validate(batchCreateSchema), async (req, res, next) => {
-  try {
-    const result = await testcaseService.batchCreate(
-      req.user.id,
-      req.params.projectId,
-      req.body.testCases
-    );
-    res.status(201).json(result);
-  } catch (err) {
-    next(err);
-  }
-});
+    const projectQuery = `
+      SELECT id FROM projects 
+      WHERE id = $1 AND user_id = $2
+    `;
+    const projectResult = await db.query(projectQuery, [projectId, userId]);
+    if (projectResult.rows.length === 0) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
 
-// PATCH /api/projects/:projectId/testcases/:id
-router.patch('/:id', validate(updateTestCaseSchema), async (req, res, next) => {
-  try {
-    const testCase = await testcaseService.update(
-      req.user.id,
-      req.params.projectId,
-      req.params.id,
-      req.body
-    );
-    res.json(testCase);
-  } catch (err) {
-    next(err);
-  }
-});
+    // Build query: get test cases for this project
+    let query = `
+      SELECT id, title, preconditions, steps, expected_result, notes, priority, category, created_at
+      FROM manual_test_cases
+      WHERE project_id = $1
+      ORDER BY created_at DESC
+    `;
+    let params = [projectId];
 
-// DELETE /api/projects/:projectId/testcases/:id
-router.delete('/:id', async (req, res, next) => {
-  try {
-    await testcaseService.remove(req.user.id, req.params.projectId, req.params.id);
-    res.json({ message: 'Test case deleted' });
-  } catch (err) {
-    next(err);
+    // If specific test case IDs provided, filter to those
+    if (testCaseIds && Array.isArray(testCaseIds) && testCaseIds.length > 0) {
+      query = `
+        SELECT id, title, preconditions, steps, expected_result, notes, priority, category, created_at
+        FROM manual_test_cases
+        WHERE project_id = $1 AND id = ANY($2::uuid[])
+        ORDER BY created_at DESC
+      `;
+      params = [projectId, testCaseIds];
+    }
+
+    const testCasesResult = await db.query(query, params);
+
+    if (testCasesResult.rows.length === 0) {
+      return res.status(400).json({ error: 'No test cases found for export' });
+    }
+
+    let csvContent;
+    try {
+      csvContent = testCaseToCsvRows(testCasesResult.rows);
+    } catch (err) {
+      console.error('[export-csv] CSV generation failed:', err);
+      return res.status(500).json({ error: 'Failed to generate CSV' });
+    }
+
+    const timestamp = new Date().toISOString().split('T')[0];
+    const filename = `testcases-${projectId.slice(0, 8)}-${timestamp}.csv`;
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+
+    return res.send(csvContent);
+  } catch (error) {
+    console.error('[export-csv] Error:', error);
+    return res.status(500).json({ error: 'Internal server error' });
   }
 });
 

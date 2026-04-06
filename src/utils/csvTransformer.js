@@ -150,4 +150,83 @@ function scenarioToCsvRows(scenarios, storyTitle) {
   return rows.join('\n') + '\n';
 }
 
-module.exports = { scenarioToCsvRows };
+function testCaseToCsvRows(testCases) {
+  if (!Array.isArray(testCases) || testCases.length === 0) {
+    throw new Error('No test cases provided for CSV export');
+  }
+
+  const rows = [];
+
+  // CSV Header
+  rows.push(
+    'TestCaseID,Title,Category,Preconditions,Step1,Step2,Step3,ExpectedResult,Priority,Tags,Notes'
+  );
+
+  // Data rows
+  testCases.forEach((tc, index) => {
+    const testCaseId = `TC${String(index + 1).padStart(3, '0')}`;
+
+    // Parse preconditions (array of strings or JSON)
+    let preconditionsText = '';
+    if (Array.isArray(tc.preconditions)) {
+      preconditionsText = tc.preconditions.filter(p => p).join(' | ');
+    } else if (typeof tc.preconditions === 'object') {
+      preconditionsText = JSON.stringify(tc.preconditions);
+    } else {
+      preconditionsText = tc.preconditions || '';
+    }
+
+    // Parse steps (array of objects: {step, action, expectedResult})
+    let step1 = '', step2 = '', step3 = '';
+    if (Array.isArray(tc.steps)) {
+      tc.steps.forEach((stepObj, idx) => {
+        const stepText = `${stepObj.step || idx + 1}. ${stepObj.action || ''}`;
+        if (idx === 0) step1 = stepText;
+        else if (idx === 1) step2 = stepText;
+        else if (idx === 2) step3 = stepText;
+      });
+    }
+
+    // Expected result
+    const expectedResult = tc.expected_result || '';
+
+    // Priority mapping
+    const priority = priorityToCsv(tc.priority);
+
+    // Tags based on category
+    const tags = tagsFromCategory(tc.category).join(', ');
+
+    // Notes
+    const notes = tc.notes || '';
+
+    // Category
+    const category = tc.category || 'general';
+
+    const row = [
+      testCaseId,
+      tc.title,
+      category,
+      preconditionsText,
+      step1,
+      step2,
+      step3,
+      expectedResult,
+      priority,
+      tags,
+      notes,
+    ]
+      .map(escapeCsvField)
+      .join(',');
+
+    rows.push(row);
+  });
+
+  // Add metadata footer
+  rows.push('');
+  rows.push(`# Exported: ${new Date().toISOString()}`);
+  rows.push(`# Total Test Cases: ${testCases.length}`);
+
+  return rows.join('\n') + '\n';
+}
+
+module.exports = { scenarioToCsvRows, testCaseToCsvRows };

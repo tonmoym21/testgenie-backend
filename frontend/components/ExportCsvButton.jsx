@@ -3,19 +3,22 @@ import './ExportCsvButton.css';
 
 /**
  * ExportCsvButton Component
- * Triggers CSV export of approved scenarios and initiates browser download
+ * Triggers CSV export of test cases and initiates browser download
  * 
  * Usage:
- *   <ExportCsvButton storyId={storyId} />
- *   <ExportCsvButton storyId={storyId} disabled={!hasApprovedScenarios} />
+ *   <ExportCsvButton projectId={projectId} />
+ *   <ExportCsvButton projectId={projectId} selectedTestCaseIds={[id1, id2]} />
+ *   <ExportCsvButton projectId={projectId} disabled={!hasTestCases} />
  */
-export function ExportCsvButton({ storyId, disabled = false }) {
+export function ExportCsvButton({ projectId, selectedTestCaseIds = null, disabled = false }) {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [success, setSuccess] = useState(false);
 
   const handleExport = async () => {
     setIsLoading(true);
     setError(null);
+    setSuccess(false);
 
     try {
       // Get auth token from localStorage or sessionStorage
@@ -26,19 +29,25 @@ export function ExportCsvButton({ storyId, disabled = false }) {
         return;
       }
 
-      if (!storyId) {
-        setError('Invalid story ID.');
+      if (!projectId) {
+        setError('Invalid project ID.');
         setIsLoading(false);
         return;
       }
 
+      // Build request body
+      const body = selectedTestCaseIds && selectedTestCaseIds.length > 0
+        ? { testCaseIds: selectedTestCaseIds }
+        : {};
+
       // Call backend export route
-      const response = await fetch(`/api/stories/${encodeURIComponent(storyId)}/export-csv`, {
+      const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/testcases/export-csv`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${token}`,
         },
+        body: Object.keys(body).length > 0 ? JSON.stringify(body) : undefined,
       });
 
       // Handle errors
@@ -92,10 +101,11 @@ export function ExportCsvButton({ storyId, disabled = false }) {
       }, 100);
 
       setError(null);
+      setSuccess(true);
       setIsLoading(false);
 
-      // Success notification
-      alert(`✅ Downloaded ${filename}`);
+      // Auto-dismiss success message
+      setTimeout(() => setSuccess(false), 3000);
     } catch (err) {
       let errorMessage = 'An unexpected error occurred during export';
 
@@ -111,18 +121,24 @@ export function ExportCsvButton({ storyId, disabled = false }) {
     }
   };
 
+  const buttonLabel = selectedTestCaseIds && selectedTestCaseIds.length > 0
+    ? `Export Selected (${selectedTestCaseIds.length})`
+    : 'Export All to CSV';
+
+  const tooltipText = disabled
+    ? 'No test cases available to export'
+    : selectedTestCaseIds && selectedTestCaseIds.length > 0
+      ? `Export ${selectedTestCaseIds.length} selected test cases as CSV file`
+      : 'Export all test cases as CSV file';
+
   return (
     <div className="export-csv-button-container">
       <button
         onClick={handleExport}
         disabled={disabled || isLoading}
         className="export-csv-button"
-        aria-label="Export test cases to CSV"
-        title={
-          disabled
-            ? 'No approved scenarios to export'
-            : 'Export approved scenarios as CSV file'
-        }
+        aria-label={buttonLabel}
+        title={tooltipText}
       >
         {isLoading ? (
           <>
@@ -132,7 +148,7 @@ export function ExportCsvButton({ storyId, disabled = false }) {
         ) : (
           <>
             <span className="icon">⬇️</span>
-            <span>Export to CSV</span>
+            <span>{buttonLabel}</span>
           </>
         )}
       </button>
@@ -146,6 +162,18 @@ export function ExportCsvButton({ storyId, disabled = false }) {
           ⚠️ {error}
         </div>
       )}
+
+      {success && (
+        <div
+          className="success-message"
+          role="status"
+          aria-live="polite"
+        >
+          ✅ Test cases exported successfully!
+        </div>
+      )}
     </div>
   );
 }
+
+export default ExportCsvButton;
