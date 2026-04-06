@@ -133,12 +133,12 @@ router.post('/export-csv', async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    let query = `SELECT id, title, preconditions, steps, expected_result, notes, priority, category, created_at FROM manual_test_cases WHERE project_id = $1 ORDER BY created_at DESC`;
-    let params = [projectId];
+  let query = `SELECT id, title, content, status, priority, created_at FROM test_cases WHERE project_id = $1 AND user_id = $2 ORDER BY created_at DESC`;
+    let params = [projectId, userId];
 
     if (testCaseIds && Array.isArray(testCaseIds) && testCaseIds.length > 0) {
-      query = `SELECT id, title, preconditions, steps, expected_result, notes, priority, category, created_at FROM manual_test_cases WHERE project_id = $1 AND id = ANY($2::uuid[]) ORDER BY created_at DESC`;
-      params = [projectId, testCaseIds];
+      query = `SELECT id, title, content, status, priority, created_at FROM test_cases WHERE project_id = $1 AND user_id = $2 AND id = ANY($3::uuid[]) ORDER BY created_at DESC`;
+      params = [projectId, userId, testCaseIds];
     }
 
     const testCasesResult = await db.query(query, params);
@@ -149,7 +149,20 @@ router.post('/export-csv', async (req, res) => {
 
     let csvContent;
     try {
-      csvContent = testCaseToCsvRows(testCasesResult.rows);
+      // Simple CSV generation from test_cases table
+      const header = 'Test ID,Title,Content,Status,Priority,Created At';
+      const rows = testCasesResult.rows.map(tc => {
+        const escape = (val) => `"${String(val || '').replace(/"/g, '""')}"`;
+        return [
+          escape(tc.id),
+          escape(tc.title),
+          escape(tc.content),
+          escape(tc.status),
+          escape(tc.priority),
+          escape(tc.created_at),
+        ].join(',');
+      });
+      csvContent = header + '\n' + rows.join('\n');
     } catch (err) {
       console.error('[export-csv] CSV generation failed:', err);
       return res.status(500).json({ error: 'Failed to generate CSV' });
