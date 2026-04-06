@@ -106,7 +106,11 @@ export default function ProjectDetailPage() {
           <p className="text-gray-500 text-sm mt-1">Test Cases</p>
         </div>
         <div className="flex gap-3">
-          <ExportCsvButton projectId={projectId} selectedTestCaseIds={selectedIds.length > 0 ? selectedIds : null} />
+          <ExportCsvButton
+  projectId={projectId}
+  selectedTestCaseIds={selectedIds.length > 0 ? selectedIds : null}
+  disabled={testCases.length === 0}
+/>
           <button
             onClick={() => setShowAddForm(!showAddForm)}
             className="btn-primary flex items-center gap-2"
