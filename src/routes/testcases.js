@@ -6,12 +6,10 @@ const testcaseService = require('../services/testcaseService');
 const db = require('../db');
 const { testCaseToCsvRows } = require('../utils/csvTransformer');
 
-const router = Router({ mergeParams: true }); // mergeParams to access :projectId
+const router = Router({ mergeParams: true });
 
-// All test case routes require authentication
 router.use(authenticate);
 
-// Validation schemas
 const createTestCaseSchema = z.object({
   title: z.string().min(1).max(300),
   content: z.string().min(1).max(10000),
@@ -31,30 +29,29 @@ const batchCreateSchema = z.object({
     .max(50),
 });
 
-// ===== ORIGINAL TEST CASE ROUTES =====
-// GET all test cases for a project
-router.get('/', validateQuery(z.object({ page: z.string().optional(), limit: z.string().optional() })), async (req, res) => {
+router.get('/', validateQuery(z.object({ page: z.string().optional(), limit: z.string().optional(), status: z.string().optional(), priority: z.string().optional() })), async (req, res) => {
   try {
     const { projectId } = req.params;
     const userId = req.user.id;
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 20;
+    const status = req.query.status || null;
+    const priority = req.query.priority || null;
 
-    const result = await testcaseService.getTestCases(projectId, userId, page, limit);
+    const result = await testcaseService.list(userId, projectId, { status, priority, page, limit });
     res.status(200).json(result);
   } catch (error) {
     console.error('[GET /testcases] Error:', error);
-    res.status(500).json({ error: error.message || 'Failed to fetch test cases' });
+    res.status(error.statusCode || 500).json({ error: error.message || 'Failed to fetch test cases' });
   }
 });
 
-// GET single test case
 router.get('/:testCaseId', async (req, res) => {
   try {
     const { projectId, testCaseId } = req.params;
     const userId = req.user.id;
 
-    const result = await testcaseService.getTestCase(testCaseId, projectId, userId);
+    const result = await testcaseService.getById(userId, projectId, testCaseId);
     res.status(200).json(result);
   } catch (error) {
     console.error('[GET /testcases/:id] Error:', error);
@@ -62,14 +59,13 @@ router.get('/:testCaseId', async (req, res) => {
   }
 });
 
-// POST create test case
 router.post('/', validate(createTestCaseSchema), async (req, res) => {
   try {
     const { projectId } = req.params;
     const userId = req.user.id;
     const { title, content, priority } = req.body;
 
-    const result = await testcaseService.createTestCase(projectId, userId, {
+    const result = await testcaseService.create(userId, projectId, {
       title,
       content,
       priority: priority || 'medium',
@@ -82,14 +78,13 @@ router.post('/', validate(createTestCaseSchema), async (req, res) => {
   }
 });
 
-// POST batch create test cases
 router.post('/batch/create', validate(batchCreateSchema), async (req, res) => {
   try {
     const { projectId } = req.params;
     const userId = req.user.id;
     const { testCases } = req.body;
 
-    const result = await testcaseService.batchCreateTestCases(projectId, userId, testCases);
+    const result = await testcaseService.batchCreate(userId, projectId, testCases);
     res.status(201).json(result);
   } catch (error) {
     console.error('[POST /testcases/batch/create] Error:', error);
@@ -97,14 +92,13 @@ router.post('/batch/create', validate(batchCreateSchema), async (req, res) => {
   }
 });
 
-// PATCH update test case
 router.patch('/:testCaseId', async (req, res) => {
   try {
     const { projectId, testCaseId } = req.params;
     const userId = req.user.id;
     const updateData = req.body;
 
-    const result = await testcaseService.updateTestCase(testCaseId, projectId, userId, updateData);
+    const result = await testcaseService.update(userId, projectId, testCaseId, updateData);
     res.status(200).json(result);
   } catch (error) {
     console.error('[PATCH /testcases/:id] Error:', error);
@@ -112,13 +106,12 @@ router.patch('/:testCaseId', async (req, res) => {
   }
 });
 
-// DELETE test case
 router.delete('/:testCaseId', async (req, res) => {
   try {
     const { projectId, testCaseId } = req.params;
     const userId = req.user.id;
 
-    await testcaseService.deleteTestCase(testCaseId, projectId, userId);
+    await testcaseService.remove(userId, projectId, testCaseId);
     res.status(204).send();
   } catch (error) {
     console.error('[DELETE /testcases/:id] Error:', error);
@@ -126,42 +119,25 @@ router.delete('/:testCaseId', async (req, res) => {
   }
 });
 
-// ===== NEW: CSV EXPORT ENDPOINT =====
 router.post('/export-csv', async (req, res) => {
   try {
     const { projectId } = req.params;
     const userId = req.user.id;
-    const { testCaseIds } = req.body; // optional: if provided, export only these IDs
+    const { testCaseIds } = req.body;
 
-    // Verify user has access to project
     if (!projectId) return res.status(400).json({ error: 'Project ID is required' });
 
-    const projectQuery = `
-      SELECT id FROM projects 
-      WHERE id = $1 AND user_id = $2
-    `;
+    const projectQuery = `SELECT id FROM projects WHERE id = $1 AND user_id = $2`;
     const projectResult = await db.query(projectQuery, [projectId, userId]);
     if (projectResult.rows.length === 0) {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    // Build query: get test cases for this project
-    let query = `
-      SELECT id, title, preconditions, steps, expected_result, notes, priority, category, created_at
-      FROM manual_test_cases
-      WHERE project_id = $1
-      ORDER BY created_at DESC
-    `;
+    let query = `SELECT id, title, preconditions, steps, expected_result, notes, priority, category, created_at FROM manual_test_cases WHERE project_id = $1 ORDER BY created_at DESC`;
     let params = [projectId];
 
-    // If specific test case IDs provided, filter to those
     if (testCaseIds && Array.isArray(testCaseIds) && testCaseIds.length > 0) {
-      query = `
-        SELECT id, title, preconditions, steps, expected_result, notes, priority, category, created_at
-        FROM manual_test_cases
-        WHERE project_id = $1 AND id = ANY($2::uuid[])
-        ORDER BY created_at DESC
-      `;
+      query = `SELECT id, title, preconditions, steps, expected_result, notes, priority, category, created_at FROM manual_test_cases WHERE project_id = $1 AND id = ANY($2::uuid[]) ORDER BY created_at DESC`;
       params = [projectId, testCaseIds];
     }
 
