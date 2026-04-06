@@ -1,15 +1,133 @@
-const express = require('express');
-const router = express.Router({ mergeParams: true });
+const { Router } = require('express');
+const { z } = require('zod');
+const { validate, validateQuery } = require('../middleware/validate');
+const { authenticate } = require('../middleware/auth');
+const testcaseService = require('../services/testcaseService');
 const db = require('../db');
 const { testCaseToCsvRows } = require('../utils/csvTransformer');
-const { authenticate } = require('../middleware/auth');
 
-// [EXISTING ROUTES - testcase CRUD operations]
-// GET, POST, PATCH, DELETE routes for test cases...
-// (keep all existing testcase routes unchanged)
+const router = Router({ mergeParams: true }); // mergeParams to access :projectId
 
-// NEW: CSV EXPORT ENDPOINT
-router.post('/export-csv', authenticate, async (req, res) => {
+// All test case routes require authentication
+router.use(authenticate);
+
+// Validation schemas
+const createTestCaseSchema = z.object({
+  title: z.string().min(1).max(300),
+  content: z.string().min(1).max(10000),
+  priority: z.enum(['low', 'medium', 'high', 'critical']).optional(),
+});
+
+const batchCreateSchema = z.object({
+  testCases: z
+    .array(
+      z.object({
+        title: z.string().min(1).max(300),
+        content: z.string().min(1).max(10000),
+        priority: z.enum(['low', 'medium', 'high', 'critical']).optional(),
+      })
+    )
+    .min(1)
+    .max(50),
+});
+
+// ===== ORIGINAL TEST CASE ROUTES =====
+// GET all test cases for a project
+router.get('/', validateQuery(z.object({ page: z.string().optional(), limit: z.string().optional() })), async (req, res) => {
+  try {
+    const { projectId } = req.params;
+    const userId = req.user.id;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+
+    const result = await testcaseService.getTestCases(projectId, userId, page, limit);
+    res.status(200).json(result);
+  } catch (error) {
+    console.error('[GET /testcases] Error:', error);
+    res.status(500).json({ error: error.message || 'Failed to fetch test cases' });
+  }
+});
+
+// GET single test case
+router.get('/:testCaseId', async (req, res) => {
+  try {
+    const { projectId, testCaseId } = req.params;
+    const userId = req.user.id;
+
+    const result = await testcaseService.getTestCase(testCaseId, projectId, userId);
+    res.status(200).json(result);
+  } catch (error) {
+    console.error('[GET /testcases/:id] Error:', error);
+    res.status(error.statusCode || 500).json({ error: error.message });
+  }
+});
+
+// POST create test case
+router.post('/', validate(createTestCaseSchema), async (req, res) => {
+  try {
+    const { projectId } = req.params;
+    const userId = req.user.id;
+    const { title, content, priority } = req.body;
+
+    const result = await testcaseService.createTestCase(projectId, userId, {
+      title,
+      content,
+      priority: priority || 'medium',
+    });
+
+    res.status(201).json(result);
+  } catch (error) {
+    console.error('[POST /testcases] Error:', error);
+    res.status(error.statusCode || 500).json({ error: error.message });
+  }
+});
+
+// POST batch create test cases
+router.post('/batch/create', validate(batchCreateSchema), async (req, res) => {
+  try {
+    const { projectId } = req.params;
+    const userId = req.user.id;
+    const { testCases } = req.body;
+
+    const result = await testcaseService.batchCreateTestCases(projectId, userId, testCases);
+    res.status(201).json(result);
+  } catch (error) {
+    console.error('[POST /testcases/batch/create] Error:', error);
+    res.status(error.statusCode || 500).json({ error: error.message });
+  }
+});
+
+// PATCH update test case
+router.patch('/:testCaseId', async (req, res) => {
+  try {
+    const { projectId, testCaseId } = req.params;
+    const userId = req.user.id;
+    const updateData = req.body;
+
+    const result = await testcaseService.updateTestCase(testCaseId, projectId, userId, updateData);
+    res.status(200).json(result);
+  } catch (error) {
+    console.error('[PATCH /testcases/:id] Error:', error);
+    res.status(error.statusCode || 500).json({ error: error.message });
+  }
+});
+
+// DELETE test case
+router.delete('/:testCaseId', async (req, res) => {
+  try {
+    const { projectId, testCaseId } = req.params;
+    const userId = req.user.id;
+
+    await testcaseService.deleteTestCase(testCaseId, projectId, userId);
+    res.status(204).send();
+  } catch (error) {
+    console.error('[DELETE /testcases/:id] Error:', error);
+    res.status(error.statusCode || 500).json({ error: error.message });
+  }
+});
+
+// ===== NEW: CSV EXPORT ENDPOINT =====
+router.post('/export-csv', async (req, res) => {
   try {
     const { projectId } = req.params;
     const userId = req.user.id;
