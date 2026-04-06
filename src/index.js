@@ -14,6 +14,7 @@ const { errorHandler } = require('./middleware/errorHandler');
 const healthRoutes = require('./routes/health');
 const authRoutes = require('./routes/auth');
 const projectRoutes = require('./routes/projects');
+const storyRoutes = require('./routes/stories');
 const testcaseRoutes = require('./routes/testcases');
 const analyzeRoutes = require('./routes/analyze');
 const executeRoutes = require('./routes/execute');
@@ -61,9 +62,11 @@ app.use(generalLimiter);
 // Routes
 // ---------------------------------------------------------------------------
 
+app.use('/api/stories', storyRoutes);
 app.use(healthRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/projects', projectRoutes);
+app.use('/api/stories', storyRoutes);
 app.use('/api/projects/:projectId/testcases', testcaseRoutes);
 app.use('/api/projects/:projectId/analyze', analyzeRoutes);
 app.use('/api', executeRoutes);
