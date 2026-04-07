@@ -4,7 +4,7 @@ const { validate, validateQuery } = require('../middleware/validate');
 const { authenticate } = require('../middleware/auth');
 const testcaseService = require('../services/testcaseService');
 const db = require('../db');
-const { testCaseToCsvRows } = require('../utils/csvTransformer');
+const logger = require('../utils/logger');
 
 const router = Router({ mergeParams: true });
 
@@ -119,57 +119,97 @@ router.delete('/:testCaseId', async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// POST /export-csv — Export test cases for a project as CSV download
+// ---------------------------------------------------------------------------
 router.post('/export-csv', async (req, res) => {
+  const { projectId } = req.params;
+  const userId = req.user.id;
+
+  logger.info({ projectId, userId }, '[export-csv] Export request received');
+
   try {
-    const { projectId } = req.params;
-    const userId = req.user.id;
-    const { testCaseIds } = req.body;
+    // ---- Safely read optional body (may be undefined for "Export All") ----
+    const testCaseIds =
+      req.body && Array.isArray(req.body.testCaseIds) ? req.body.testCaseIds : null;
 
-    if (!projectId) return res.status(400).json({ error: 'Project ID is required' });
+    if (!projectId) {
+      return res.status(400).json({ error: 'Project ID is required' });
+    }
 
-    const projectQuery = `SELECT id FROM projects WHERE id = $1 AND user_id = $2`;
-    const projectResult = await db.query(projectQuery, [projectId, userId]);
+    // ---- Verify project ownership ----
+    const projectResult = await db.query(
+      'SELECT id FROM projects WHERE id = $1 AND user_id = $2',
+      [projectId, userId]
+    );
+
     if (projectResult.rows.length === 0) {
+      logger.warn({ projectId, userId }, '[export-csv] Access denied — project not found or not owned');
       return res.status(403).json({ error: 'Access denied' });
     }
 
-  let query = `SELECT id, title, content, status, priority, created_at FROM test_cases WHERE project_id = $1 AND user_id = $2 ORDER BY created_at DESC`;
-    let params = [projectId, userId];
+    // ---- Fetch test cases (IDs are INTEGER, not UUID) ----
+    let query;
+    let params;
 
-    if (testCaseIds && Array.isArray(testCaseIds) && testCaseIds.length > 0) {
-      query = `SELECT id, title, content, status, priority, created_at FROM test_cases WHERE project_id = $1 AND user_id = $2 AND id = ANY($3::uuid[]) ORDER BY created_at DESC`;
-      params = [projectId, userId, testCaseIds];
+    if (testCaseIds && testCaseIds.length > 0) {
+      // Validate that all provided IDs are numeric integers
+      const numericIds = testCaseIds
+        .map((id) => parseInt(id, 10))
+        .filter((id) => Number.isFinite(id));
+
+      if (numericIds.length === 0) {
+        return res.status(400).json({ error: 'Invalid test case IDs' });
+      }
+
+      query = `
+        SELECT id, title, content, status, priority, created_at
+        FROM test_cases
+        WHERE project_id = $1 AND user_id = $2 AND id = ANY($3::int[])
+        ORDER BY created_at DESC`;
+      params = [projectId, userId, numericIds];
+    } else {
+      query = `
+        SELECT id, title, content, status, priority, created_at
+        FROM test_cases
+        WHERE project_id = $1 AND user_id = $2
+        ORDER BY created_at DESC`;
+      params = [projectId, userId];
     }
 
     const testCasesResult = await db.query(query, params);
+
+    logger.info(
+      { projectId, userId, count: testCasesResult.rowCount },
+      '[export-csv] Test cases fetched'
+    );
 
     if (testCasesResult.rows.length === 0) {
       return res.status(400).json({ error: 'No test cases found for export' });
     }
 
-    let csvContent;
-    try {
-      // Simple CSV generation from test_cases table
-      const header = 'Test ID,Title,Content,Status,Priority,Created At';
-      const rows = testCasesResult.rows.map(tc => {
-        const escape = (val) => `"${String(val || '').replace(/"/g, '""')}"`;
-        return [
-          escape(tc.id),
-          escape(tc.title),
-          escape(tc.content),
-          escape(tc.status),
-          escape(tc.priority),
-          escape(tc.created_at),
-        ].join(',');
-      });
-      csvContent = header + '\n' + rows.join('\n');
-    } catch (err) {
-      console.error('[export-csv] CSV generation failed:', err);
-      return res.status(500).json({ error: 'Failed to generate CSV' });
-    }
+    // ---- Generate CSV ----
+    const escape = (val) => {
+      const s = String(val == null ? '' : val).replace(/"/g, '""');
+      return `"${s}"`;
+    };
+
+    const header = 'Test ID,Title,Content,Status,Priority,Created At';
+    const rows = testCasesResult.rows.map((tc) =>
+      [
+        escape(tc.id),
+        escape(tc.title),
+        escape(tc.content),
+        escape(tc.status),
+        escape(tc.priority),
+        escape(tc.created_at),
+      ].join(',')
+    );
+
+    const csvContent = header + '\n' + rows.join('\n') + '\n';
 
     const timestamp = new Date().toISOString().split('T')[0];
-    const filename = `testcases-${projectId.slice(0, 8)}-${timestamp}.csv`;
+    const filename = `testcases-project-${projectId}-${timestamp}.csv`;
 
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
@@ -177,8 +217,8 @@ router.post('/export-csv', async (req, res) => {
 
     return res.send(csvContent);
   } catch (error) {
-    console.error('[export-csv] Error:', error);
-    return res.status(500).json({ error: 'Internal server error' });
+    logger.error({ err: error, projectId, userId }, '[export-csv] Unexpected error');
+    return res.status(500).json({ error: 'Failed to export test cases' });
   }
 });
 

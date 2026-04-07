@@ -1,15 +1,6 @@
 import React, { useState } from 'react';
 import { Loader2, Download } from 'lucide-react';
 
-/**
- * ExportCsvButton Component
- * Triggers CSV export of test cases and initiates browser download
- *
- * Usage:
- *   <ExportCsvButton projectId={projectId} />
- *   <ExportCsvButton projectId={projectId} selectedTestCaseIds={[id1, id2]} />
- *   <ExportCsvButton projectId={projectId} disabled={!hasTestCases} />
- */
 export function ExportCsvButton({ projectId, selectedTestCaseIds = null, disabled = false }) {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -21,7 +12,7 @@ export function ExportCsvButton({ projectId, selectedTestCaseIds = null, disable
     setSuccess(false);
 
     try {
-      const token = localStorage.getItem('authToken') || sessionStorage.getItem('authToken');
+      const token = localStorage.getItem('accessToken');
       if (!token) {
         setError('Authentication required. Please log in.');
         setIsLoading(false);
@@ -39,15 +30,19 @@ export function ExportCsvButton({ projectId, selectedTestCaseIds = null, disable
           ? { testCaseIds: selectedTestCaseIds }
           : {};
 
+      const API_BASE = window.location.hostname === 'localhost'
+        ? '/api'
+        : 'https://testgenie-backend-production.up.railway.app/api';
+
       const response = await fetch(
-        `/api/projects/${encodeURIComponent(projectId)}/testcases/export-csv`,
+        `${API_BASE}/projects/${encodeURIComponent(projectId)}/testcases/export-csv`,
         {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${token}`,
           },
-          body: Object.keys(body).length > 0 ? JSON.stringify(body) : undefined,
+          body: JSON.stringify(body),   // <-- ALWAYS send a JSON body
         }
       );
 

@@ -26,10 +26,9 @@ const schedulesRoutes = require('./routes/schedules');
 const app = express();
 
 // ---------------------------------------------------------------------------
-// Middleware stack (applied in order per spec)
+// Middleware stack
 // ---------------------------------------------------------------------------
 
-// 1. CORS
 app.use(
   cors({
     origin: config.CORS_ORIGIN,
@@ -39,13 +38,9 @@ app.use(
   })
 );
 
-// 2. Security headers
 app.use(helmet());
-
-// 3. Body parsing (1MB limit)
 app.use(express.json({ limit: '1mb' }));
 
-// 4. Request logging
 app.use(
   pinoHttp({
     logger,
@@ -55,14 +50,12 @@ app.use(
   })
 );
 
-// 5. General rate limiter
 app.use(generalLimiter);
 
 // ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
 
-app.use('/api/stories', storyRoutes);
 app.use(healthRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/projects', projectRoutes);
@@ -102,7 +95,6 @@ if (require.main === module) {
     );
   });
 
-  // Graceful shutdown
   const shutdown = async (signal) => {
     logger.info({ signal }, 'Shutdown signal received');
 
@@ -111,7 +103,6 @@ if (require.main === module) {
       process.exit(0);
     });
 
-    // Force exit after 10s
     setTimeout(() => {
       logger.error('Forced shutdown after timeout');
       process.exit(1);
