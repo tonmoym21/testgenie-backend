@@ -3,7 +3,7 @@ import { useParams } from 'react-router-dom';
 import { api } from '../services/api';
 import { Loader2, Plus, Trash2, AlertCircle, BookOpen } from 'lucide-react';
 import ExportCsvButton from '../components/ExportCsvButton';
-import { useNavigate } from 'react-router-dom';
+import { useParams, useNavigate } from 'react-router-dom';
 
 export default function ProjectDetailPage() {
   const { projectId } = useParams();
