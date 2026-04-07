@@ -25,10 +25,7 @@ const schedulesRoutes = require('./routes/schedules');
 
 const app = express();
 
-// ---------------------------------------------------------------------------
 // Middleware stack
-// ---------------------------------------------------------------------------
-
 app.use(
   cors({
     origin: config.CORS_ORIGIN,
@@ -37,10 +34,8 @@ app.use(
     credentials: true,
   })
 );
-
 app.use(helmet());
 app.use(express.json({ limit: '1mb' }));
-
 app.use(
   pinoHttp({
     logger,
@@ -49,17 +44,13 @@ app.use(
     },
   })
 );
-
 app.use(generalLimiter);
 
-// ---------------------------------------------------------------------------
 // Routes
-// ---------------------------------------------------------------------------
-
 app.use(healthRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/projects', projectRoutes);
-app.use('/api/stories', storyRoutes);
+app.use('/api/projects/:projectId/stories', storyRoutes);
 app.use('/api/projects/:projectId/testcases', testcaseRoutes);
 app.use('/api/projects/:projectId/analyze', analyzeRoutes);
 app.use('/api', executeRoutes);
@@ -71,38 +62,25 @@ app.use('/api/schedules', schedulesRoutes);
 // 404 catch-all
 app.use((_req, res) => {
   res.status(404).json({
-    error: {
-      code: 'NOT_FOUND',
-      message: 'Route not found',
-    },
+    error: { code: 'NOT_FOUND', message: 'Route not found' },
   });
 });
 
-// ---------------------------------------------------------------------------
-// Centralized error handler (must be last)
-// ---------------------------------------------------------------------------
+// Centralized error handler
 app.use(errorHandler);
 
-// ---------------------------------------------------------------------------
-// Start server (skip when imported by tests)
-// ---------------------------------------------------------------------------
-
+// Start server
 if (require.main === module) {
   const server = app.listen(config.PORT, () => {
-    logger.info(
-      { port: config.PORT, env: config.NODE_ENV },
-      'TestGenie API server started'
-    );
+    logger.info({ port: config.PORT, env: config.NODE_ENV }, 'TestGenie API server started');
   });
 
   const shutdown = async (signal) => {
     logger.info({ signal }, 'Shutdown signal received');
-
     server.close(() => {
       logger.info('HTTP server closed');
       process.exit(0);
     });
-
     setTimeout(() => {
       logger.error('Forced shutdown after timeout');
       process.exit(1);

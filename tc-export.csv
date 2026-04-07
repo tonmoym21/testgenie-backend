@@ -1,0 +1,4 @@
+Test ID,Title,Content,Status,Priority,Created At
+"1","Valid card checkout","Step 1: Add item. Step 2: Enter valid Visa. Step 3: Submit. Expected: Order confirmed.","draft","high","Tue Mar 31 2026 06:00:23 GMT+0000 (Coordinated Universal Time)"
+"2","Empty cart checkout","Step 1: Go to checkout with empty cart. Expected: Error message shown.","draft","medium","Tue Mar 31 2026 06:00:23 GMT+0000 (Coordinated Universal Time)"
+"3","Expired card rejection","Step 1: Add item. Step 2: Enter expired card. Step 3: Submit. Expected: Payment declined message.","draft","high","Tue Mar 31 2026 06:00:23 GMT+0000 (Coordinated Universal Time)"

@@ -1,83 +1,330 @@
-const express = require('express');
-const router = express.Router();
+const { Router } = require('express');
 const db = require('../db');
-const { scenarioToCsvRows } = require('../utils/csvTransformer');
 const { authenticate } = require('../middleware/auth');
+const { scenarioToCsvRows } = require('../utils/csvTransformer');
 
-/**
- * POST /api/stories/:id/export-csv
- * Export approved scenarios as CSV
- */
-router.post('/:id/export-csv', authenticate, async (req, res) => {
+const router = Router({ mergeParams: true });
+
+// Helper: verify project ownership
+async function verifyProjectOwnership(projectId, userId) {
+  const result = await db.query(
+    'SELECT id FROM projects WHERE id = $1 AND user_id = $2',
+    [projectId, userId]
+  );
+  return result.rows.length > 0;
+}
+
+// POST /api/projects/:projectId/stories
+router.post('/', authenticate, async (req, res, next) => {
   try {
-    const { id: storyId } = req.params;
+    const { projectId } = req.params;
     const userId = req.user.id;
 
-    if (!storyId) {
-      return res.status(400).json({ error: 'Story ID is required' });
+    if (!(await verifyProjectOwnership(projectId, userId))) {
+      return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Not your project' } });
     }
 
-    const storyQuery = `
-      SELECT id, title, project_id 
-      FROM story_ingestions 
-      WHERE id = $1 AND user_id = $2
-    `;
-    const storyResult = await db.query(storyQuery, [storyId, userId]);
+    const { title, description, sourceType, sourceUrl } = req.body;
 
+    if (!title || !title.trim()) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: 'Title is required' } });
+    }
+    if (!description || description.trim().length < 20) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: 'Description must be at least 20 characters' } });
+    }
+
+    const result = await db.query(
+      `INSERT INTO stories (project_id, user_id, title, description, source_type, source_url)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING *`,
+      [projectId, userId, title.trim(), description.trim(), sourceType || 'text', sourceUrl || null]
+    );
+
+    const story = result.rows[0];
+
+    // Auto-generate draft scenarios
+    const scenarios = generateDraftScenarios(story);
+    if (scenarios.length > 0) {
+      const values = [];
+      const placeholders = [];
+      let idx = 1;
+      for (const s of scenarios) {
+        placeholders.push(
+          `($${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++}, $${idx++})`
+        );
+        values.push(
+          story.id, projectId, userId,
+          s.category, s.title, s.summary,
+          JSON.stringify(s.preconditions), s.test_intent,
+          s.expected_outcome, s.priority
+        );
+      }
+      await db.query(
+        `INSERT INTO scenarios (story_id, project_id, user_id, category, title, summary, preconditions, test_intent, expected_outcome, priority)
+         VALUES ${placeholders.join(', ')}`,
+        values
+      );
+      await db.query(
+        `UPDATE stories SET status = 'extracted', updated_at = NOW() WHERE id = $1`,
+        [story.id]
+      );
+      story.status = 'extracted';
+    }
+
+    res.status(201).json(story);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/projects/:projectId/stories
+router.get('/', authenticate, async (req, res, next) => {
+  try {
+    const { projectId } = req.params;
+    const userId = req.user.id;
+
+    if (!(await verifyProjectOwnership(projectId, userId))) {
+      return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Not your project' } });
+    }
+
+    const result = await db.query(
+      `SELECT s.*,
+        (SELECT count(*) FROM scenarios sc WHERE sc.story_id = s.id)::int AS scenario_count,
+        (SELECT count(*) FROM scenarios sc WHERE sc.story_id = s.id AND sc.status = 'approved')::int AS approved_count
+       FROM stories s
+       WHERE s.project_id = $1 AND s.user_id = $2
+       ORDER BY s.created_at DESC`,
+      [projectId, userId]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/projects/:projectId/stories/:storyId
+router.get('/:storyId', authenticate, async (req, res, next) => {
+  try {
+    const { projectId, storyId } = req.params;
+    const userId = req.user.id;
+
+    const result = await db.query(
+      'SELECT * FROM stories WHERE id = $1 AND project_id = $2 AND user_id = $3',
+      [storyId, projectId, userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Story not found' } });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /api/projects/:projectId/stories/:storyId
+router.delete('/:storyId', authenticate, async (req, res, next) => {
+  try {
+    const { projectId, storyId } = req.params;
+    const userId = req.user.id;
+
+    const result = await db.query(
+      'DELETE FROM stories WHERE id = $1 AND project_id = $2 AND user_id = $3 RETURNING id',
+      [storyId, projectId, userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Story not found' } });
+    }
+
+    res.json({ message: 'Story deleted' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/projects/:projectId/stories/:storyId/scenarios
+router.get('/:storyId/scenarios', authenticate, async (req, res, next) => {
+  try {
+    const { projectId, storyId } = req.params;
+    const userId = req.user.id;
+
+    const storyCheck = await db.query(
+      'SELECT id FROM stories WHERE id = $1 AND project_id = $2 AND user_id = $3',
+      [storyId, projectId, userId]
+    );
+    if (storyCheck.rows.length === 0) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Story not found' } });
+    }
+
+    const result = await db.query(
+      `SELECT * FROM scenarios WHERE story_id = $1 ORDER BY
+        CASE category
+          WHEN 'happy_path' THEN 1 WHEN 'negative' THEN 2
+          WHEN 'edge' THEN 3 WHEN 'validation' THEN 4
+          WHEN 'role_permission' THEN 5 WHEN 'state_transition' THEN 6
+          WHEN 'api_impact' THEN 7 WHEN 'non_functional' THEN 8
+        END, created_at`,
+      [storyId]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /api/projects/:projectId/stories/:storyId/scenarios/:scenarioId
+router.patch('/:storyId/scenarios/:scenarioId', authenticate, async (req, res, next) => {
+  try {
+    const { projectId, storyId, scenarioId } = req.params;
+    const userId = req.user.id;
+    const { status, reviewNote } = req.body;
+
+    if (!status || !['approved', 'rejected', 'pending'].includes(status)) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: 'Status must be approved, rejected, or pending' } });
+    }
+
+    const storyCheck = await db.query(
+      'SELECT id FROM stories WHERE id = $1 AND project_id = $2 AND user_id = $3',
+      [storyId, projectId, userId]
+    );
+    if (storyCheck.rows.length === 0) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Story not found' } });
+    }
+
+    const result = await db.query(
+      `UPDATE scenarios SET status = $1, review_note = $2, updated_at = NOW()
+       WHERE id = $3 AND story_id = $4 RETURNING *`,
+      [status, reviewNote || null, scenarioId, storyId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Scenario not found' } });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/projects/:projectId/stories/:storyId/export-csv
+router.post('/:storyId/export-csv', authenticate, async (req, res, next) => {
+  try {
+    const { projectId, storyId } = req.params;
+    const userId = req.user.id;
+
+    const storyResult = await db.query(
+      'SELECT id, title FROM stories WHERE id = $1 AND project_id = $2 AND user_id = $3',
+      [storyId, projectId, userId]
+    );
     if (storyResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Story not found' });
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Story not found' } });
     }
 
     const story = storyResult.rows[0];
 
-    const reqQuery = `
-      SELECT id FROM story_requirements 
-      WHERE story_ingestion_id = $1
-    `;
-    const reqResult = await db.query(reqQuery, [storyId]);
-
-    if (reqResult.rows.length === 0) {
-      return res.status(400).json({ error: 'Story has no requirements extracted' });
-    }
-
-    const requirementsId = reqResult.rows[0].id;
-
-    const scenariosQuery = `
-      SELECT 
-        id, category, title, summary, preconditions, test_intent, 
-        inputs, expected_outcome, priority, dependencies, assumptions
-      FROM coverage_scenarios
-      WHERE story_requirements_id = $1 AND status = 'approved'
-      ORDER BY category, created_at
-    `;
-    const scenariosResult = await db.query(scenariosQuery, [requirementsId]);
+    const scenariosResult = await db.query(
+      `SELECT id, category, title, summary, preconditions, test_intent,
+              inputs, expected_outcome, priority
+       FROM scenarios
+       WHERE story_id = $1 AND status = 'approved'
+       ORDER BY
+         CASE category
+           WHEN 'happy_path' THEN 1 WHEN 'negative' THEN 2
+           WHEN 'edge' THEN 3 WHEN 'validation' THEN 4
+           WHEN 'role_permission' THEN 5 WHEN 'state_transition' THEN 6
+           WHEN 'api_impact' THEN 7 WHEN 'non_functional' THEN 8
+         END, created_at`,
+      [storyId]
+    );
 
     if (scenariosResult.rows.length === 0) {
-      return res.status(400).json({ 
-        error: 'No approved scenarios found. Please approve scenarios before exporting.' 
+      return res.status(400).json({
+        error: { code: 'NO_DATA', message: 'No approved scenarios to export. Approve at least one scenario first.' }
       });
     }
 
-    let csvContent;
-    try {
-      csvContent = scenarioToCsvRows(scenariosResult.rows, story.title);
-    } catch (err) {
-      console.error('CSV generation error:', err);
-      return res.status(500).json({ error: 'Failed to generate CSV' });
-    }
-
+    const csvContent = scenarioToCsvRows(scenariosResult.rows, story.title);
     const timestamp = new Date().toISOString().split('T')[0];
-    const filename = `testcases-${storyId.slice(0, 8)}-${timestamp}.csv`;
+    const safeTitle = story.title.replace(/[^a-zA-Z0-9]/g, '-').substring(0, 30);
+    const filename = safeTitle + '-' + timestamp + '.csv';
 
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.setHeader('Content-Disposition', 'attachment; filename="' + filename + '"');
+    res.setHeader('Cache-Control', 'no-store');
 
     return res.send(csvContent);
-  } catch (error) {
-    console.error('[export-csv] Error:', error);
-    return res.status(500).json({ error: 'Internal server error' });
+  } catch (err) {
+    next(err);
   }
 });
+
+// GET /api/projects/:projectId/stories/:storyId/coverage
+router.get('/:storyId/coverage', authenticate, async (req, res, next) => {
+  try {
+    const { projectId, storyId } = req.params;
+    const userId = req.user.id;
+
+    const storyCheck = await db.query(
+      'SELECT id FROM stories WHERE id = $1 AND project_id = $2 AND user_id = $3',
+      [storyId, projectId, userId]
+    );
+    if (storyCheck.rows.length === 0) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Story not found' } });
+    }
+
+    const result = await db.query(
+      `SELECT category, status, count(*)::int AS count
+       FROM scenarios WHERE story_id = $1
+       GROUP BY category, status`,
+      [storyId]
+    );
+
+    const allCategories = [
+      'happy_path', 'negative', 'edge', 'validation',
+      'role_permission', 'state_transition', 'api_impact', 'non_functional'
+    ];
+
+    const byCategory = {};
+    let total = 0, approved = 0, rejected = 0, pending = 0;
+
+    for (const row of result.rows) {
+      if (!byCategory[row.category]) byCategory[row.category] = { total: 0, approved: 0, rejected: 0, pending: 0 };
+      byCategory[row.category][row.status] = (byCategory[row.category][row.status] || 0) + row.count;
+      byCategory[row.category].total += row.count;
+      total += row.count;
+      if (row.status === 'approved') approved += row.count;
+      else if (row.status === 'rejected') rejected += row.count;
+      else pending += row.count;
+    }
+
+    const missingCategories = allCategories.filter(c => !byCategory[c]);
+    const coveredCount = allCategories.length - missingCategories.length;
+    const qualityScore = Math.round((coveredCount / allCategories.length) * 100);
+
+    res.json({ total, approved, rejected, pending, byCategory, missingCategories, qualityScore, readyForExport: approved > 0 && pending === 0 });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Draft scenario generator (rule-based V1 placeholder)
+function generateDraftScenarios(story) {
+  const title = story.title || 'Feature';
+  return [
+    { category: 'happy_path', title: title + ' - successful primary flow', summary: 'Verify the main success path for: ' + title, preconditions: ['User is logged in', 'Required data is available'], test_intent: 'Validate the core happy path works as described', expected_outcome: 'Feature completes successfully as per acceptance criteria', priority: 'P0' },
+    { category: 'happy_path', title: title + ' - successful with all optional fields', summary: 'Verify feature works when all optional inputs are provided', preconditions: ['User is logged in'], test_intent: 'Validate full input acceptance', expected_outcome: 'Feature handles all optional fields correctly', priority: 'P1' },
+    { category: 'negative', title: title + ' - missing required input', summary: 'Verify error handling when required fields are empty', preconditions: ['User is logged in'], test_intent: 'Validate proper error messages for missing data', expected_outcome: 'System shows validation error, does not proceed', priority: 'P0' },
+    { category: 'negative', title: title + ' - unauthorized access attempt', summary: 'Verify feature blocks unauthenticated users', preconditions: ['User is NOT logged in'], test_intent: 'Validate auth guard prevents unauthorized access', expected_outcome: 'System redirects to login or shows 401 error', priority: 'P1' },
+    { category: 'validation', title: title + ' - invalid input format', summary: 'Verify system rejects malformed or out-of-range input', preconditions: ['User is logged in'], test_intent: 'Validate input sanitization and format checking', expected_outcome: 'System shows field-level validation errors', priority: 'P1' },
+    { category: 'edge', title: title + ' - boundary value handling', summary: 'Verify behavior at min/max boundaries of inputs', preconditions: ['User is logged in'], test_intent: 'Validate edge cases at input boundaries', expected_outcome: 'System handles boundary values correctly without errors', priority: 'P2' },
+    { category: 'role_permission', title: title + ' - role-based access control', summary: 'Verify different user roles have correct access levels', preconditions: ['Multiple user roles exist'], test_intent: 'Validate permissions are enforced per role', expected_outcome: 'Unauthorized roles are blocked, authorized roles succeed', priority: 'P1' },
+    { category: 'api_impact', title: title + ' - API response handling', summary: 'Verify correct handling of API success and failure responses', preconditions: ['Backend API is available'], test_intent: 'Validate frontend handles API states (loading, success, error)', expected_outcome: 'UI reflects API state correctly', priority: 'P2' },
+  ];
+}
 
 module.exports = router;

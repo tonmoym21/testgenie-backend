@@ -1,153 +1,61 @@
-/**
- * Transform approved CoverageScenario records into Jira/TestRail-compatible CSV
- * CSV Format: TestCaseID,Title,Preconditions,Step1,Step2,Step3,ExpectedResult,Priority,Tags
- */
+// src/utils/csvTransformer.js
+const PRIORITY_MAP = { P0: 'critical', P1: 'high', P2: 'medium', P3: 'low' };
 
-function priorityToCsv(priority) {
-  const map = { P0: 'critical', P1: 'high', P2: 'medium', P3: 'low' };
-  return map[priority] || 'medium';
-}
+const CATEGORY_TAGS = {
+  happy_path: ['smoke', 'regression'],
+  negative: ['regression', 'error-handling'],
+  edge: ['regression', 'boundary'],
+  validation: ['regression', 'data-validation'],
+  role_permission: ['regression', 'security', 'access-control'],
+  state_transition: ['regression', 'state-management'],
+  api_impact: ['regression', 'api', 'integration'],
+  non_functional: ['regression', 'performance'],
+};
 
-function tagsFromCategory(category) {
-  const categoryTags = {
-    happy_path: ['smoke', 'regression'],
-    negative: ['regression', 'error-handling'],
-    edge: ['regression', 'boundary'],
-    validation: ['regression', 'data-validation'],
-    role_permission: ['regression', 'security', 'access-control'],
-    state_transition: ['regression', 'state-management'],
-    api_impact: ['regression', 'api', 'integration'],
-    non_functional: ['regression', 'performance'],
-  };
-  return categoryTags[category] || ['regression'];
-}
-
-function generateSteps(scenario) {
-  const { test_intent, inputs, expected_outcome, preconditions } = scenario;
-  const step1 = deriveSetupStep(test_intent, preconditions);
-  const step2 = deriveMainStep(test_intent, inputs);
-  const step3 = deriveVerificationStep(expected_outcome);
-  return [step1, step2, step3];
-}
-
-function deriveSetupStep(testIntent, preconditions) {
-  if (preconditions && preconditions.length > 0) {
-    return preconditions[0].substring(0, 200);
-  }
-  const lowerIntent = testIntent.toLowerCase();
-  if (lowerIntent.includes('login')) return 'Navigate to login page';
-  if (lowerIntent.includes('create')) return 'Open create form';
-  if (lowerIntent.includes('delete')) return 'Locate item to delete';
-  if (lowerIntent.includes('edit')) return 'Open edit dialog';
-  return 'Perform initial setup';
-}
-
-function deriveMainStep(testIntent, inputs) {
-  if (inputs && Object.keys(inputs).length > 0) {
-    const entries = Object.entries(inputs)
-      .filter(([, value]) => value !== null && value !== undefined)
-      .slice(0, 2)
-      .map(([key, value]) => `${key}: "${value}"`);
-    if (entries.length > 0) {
-      return `Enter test data (${entries.join(', ')})`;
-    }
-  }
-  const lowerIntent = testIntent.toLowerCase();
-  if (lowerIntent.includes('submit')) return 'Click Submit button';
-  if (lowerIntent.includes('save')) return 'Click Save button';
-  if (lowerIntent.includes('login')) return 'Enter credentials and click Login';
-  return 'Perform primary action';
-}
-
-function deriveVerificationStep(expectedOutcome) {
-  if (!expectedOutcome) return 'Verify action completed';
-  const outcome = expectedOutcome.substring(0, 150);
-  return `Verify: ${outcome}`;
-}
-
-function escapeCsvField(field) {
-  if (field === null || field === undefined) return '""';
-  const stringField = String(field).trim();
-  if (stringField === '') return '""';
-  const escaped = stringField.replace(/"/g, '""');
-  return `"${escaped}"`;
-}
-
-function isValidScenario(scenario) {
-  return !!(
-    scenario.id &&
-    scenario.title &&
-    scenario.category &&
-    scenario.expected_outcome &&
-    scenario.test_intent &&
-    scenario.priority
-  );
+function escapeCsvField(value) {
+  if (value === null || value === undefined) return '""';
+  const str = String(value).trim();
+  if (str === '') return '""';
+  const escaped = str.replace(/"/g, '""');
+  return '"' + escaped + '"';
 }
 
 function scenarioToCsvRows(scenarios, storyTitle) {
-  if (!scenarios || scenarios.length === 0) {
+  if (!Array.isArray(scenarios) || scenarios.length === 0) {
     throw new Error('No scenarios provided for CSV export');
   }
 
-  const validScenarios = scenarios.filter(s => {
-    try {
-      return isValidScenario(s);
-    } catch {
-      console.warn(`[csv-transformer] Skipping invalid scenario: ${s?.id}`);
-      return false;
+  const header = 'TestCaseID,Title,Preconditions,Step1,Step2,Step3,ExpectedResult,Priority,Tags';
+  const lines = [header];
+
+  scenarios.forEach((s, index) => {
+    const tcId = 'TC' + String(index + 1).padStart(3, '0');
+    const priority = PRIORITY_MAP[s.priority] || 'medium';
+    const tags = (CATEGORY_TAGS[s.category] || ['regression']).join(', ');
+
+    let preconditions = '';
+    if (Array.isArray(s.preconditions)) {
+      preconditions = s.preconditions.filter(Boolean).join(' | ');
+    } else if (typeof s.preconditions === 'string') {
+      try {
+        const parsed = JSON.parse(s.preconditions);
+        preconditions = Array.isArray(parsed) ? parsed.filter(Boolean).join(' | ') : s.preconditions;
+      } catch (e) {
+        preconditions = s.preconditions;
+      }
     }
+
+    const step1 = deriveSetupStep(s);
+    const step2 = deriveActionStep(s);
+    const step3 = deriveVerifyStep(s);
+    const expectedResult = s.expected_outcome || s.expectedOutcome || '';
+
+    const row = [tcId, s.title || '', preconditions, step1, step2, step3, expectedResult, priority, tags]
+      .map(escapeCsvField).join(',');
+    lines.push(row);
   });
 
-  if (validScenarios.length === 0) {
-    throw new Error('No valid scenarios to export');
-  }
-
-  const rows = [];
-
-  // CSV Header
-  rows.push(
-    'TestCaseID,Title,Preconditions,Step1,Step2,Step3,ExpectedResult,Priority,Tags'
-  );
-
-  // Data rows
-  validScenarios.forEach((scenario, index) => {
-    const testCaseId = `TC${String(index + 1).padStart(3, '0')}`;
-    const [step1, step2, step3] = generateSteps(scenario);
-
-    const preconditionsText =
-      scenario.preconditions && scenario.preconditions.length > 0
-        ? scenario.preconditions[0]
-        : 'Standard test environment';
-
-    const priority = priorityToCsv(scenario.priority);
-    const tags = tagsFromCategory(scenario.category).join(', ');
-
-    const row = [
-      testCaseId,
-      scenario.title,
-      preconditionsText,
-      step1,
-      step2,
-      step3,
-      scenario.expected_outcome,
-      priority,
-      tags,
-    ]
-      .map(escapeCsvField)
-      .join(',');
-
-    rows.push(row);
-  });
-
-  // Add metadata footer
-  rows.push('');
-  rows.push(`# Story: ${escapeCsvField(storyTitle)}`);
-  rows.push(`# Exported: ${new Date().toISOString()}`);
-  rows.push(
-    `# Total Test Cases: ${validScenarios.length}, All scenarios are APPROVED`
-  );
-
-  return rows.join('\n') + '\n';
+  return lines.join('\n');
 }
 
 function testCaseToCsvRows(testCases) {
@@ -155,78 +63,75 @@ function testCaseToCsvRows(testCases) {
     throw new Error('No test cases provided for CSV export');
   }
 
-  const rows = [];
+  const header = 'TestCaseID,Title,Category,Preconditions,Step1,Step2,Step3,ExpectedResult,Priority,Tags,Notes';
+  const lines = [header];
 
-  // CSV Header
-  rows.push(
-    'TestCaseID,Title,Category,Preconditions,Step1,Step2,Step3,ExpectedResult,Priority,Tags,Notes'
-  );
-
-  // Data rows
   testCases.forEach((tc, index) => {
-    const testCaseId = `TC${String(index + 1).padStart(3, '0')}`;
+    const tcId = 'TC' + String(index + 1).padStart(3, '0');
+    const priority = PRIORITY_MAP[tc.priority] || tc.priority || 'high';
+    const tags = (CATEGORY_TAGS[tc.category] || ['regression']).join(', ');
 
-    // Parse preconditions (array of strings or JSON)
-    let preconditionsText = '';
+    let preconditions = '';
     if (Array.isArray(tc.preconditions)) {
-      preconditionsText = tc.preconditions.filter(p => p).join(' | ');
-    } else if (typeof tc.preconditions === 'object') {
-      preconditionsText = JSON.stringify(tc.preconditions);
-    } else {
-      preconditionsText = tc.preconditions || '';
+      preconditions = tc.preconditions.filter(Boolean).join(' | ');
+    } else if (typeof tc.preconditions === 'string') {
+      preconditions = tc.preconditions;
     }
 
-    // Parse steps (array of objects: {step, action, expectedResult})
     let step1 = '', step2 = '', step3 = '';
     if (Array.isArray(tc.steps)) {
       tc.steps.forEach((stepObj, idx) => {
-        const stepText = `${stepObj.step || idx + 1}. ${stepObj.action || ''}`;
-        if (idx === 0) step1 = stepText;
-        else if (idx === 1) step2 = stepText;
-        else if (idx === 2) step3 = stepText;
+        const text = (stepObj.step || idx + 1) + '. ' + (stepObj.action || '');
+        if (idx === 0) step1 = text;
+        else if (idx === 1) step2 = text;
+        else if (idx === 2) step3 = text;
       });
     }
 
-    // Expected result
-    const expectedResult = tc.expected_result || '';
-
-    // Priority mapping
-    const priority = priorityToCsv(tc.priority);
-
-    // Tags based on category
-    const tags = tagsFromCategory(tc.category).join(', ');
-
-    // Notes
-    const notes = tc.notes || '';
-
-    // Category
-    const category = tc.category || 'general';
-
-    const row = [
-      testCaseId,
-      tc.title,
-      category,
-      preconditionsText,
-      step1,
-      step2,
-      step3,
-      expectedResult,
-      priority,
-      tags,
-      notes,
-    ]
-      .map(escapeCsvField)
-      .join(',');
-
-    rows.push(row);
+    const row = [tcId, tc.title || '', tc.category || 'general', preconditions, step1, step2, step3, tc.expected_result || '', priority, tags, tc.notes || '']
+      .map(escapeCsvField).join(',');
+    lines.push(row);
   });
 
-  // Add metadata footer
-  rows.push('');
-  rows.push(`# Exported: ${new Date().toISOString()}`);
-  rows.push(`# Total Test Cases: ${testCases.length}`);
-
-  return rows.join('\n') + '\n';
+  return lines.join('\n');
 }
 
-module.exports = { scenarioToCsvRows, testCaseToCsvRows };
+function deriveSetupStep(scenario) {
+  const pre = scenario.preconditions;
+  if (Array.isArray(pre) && pre.length > 0 && pre[0]) return String(pre[0]).substring(0, 200);
+  if (typeof pre === 'string') {
+    try {
+      const parsed = JSON.parse(pre);
+      if (Array.isArray(parsed) && parsed[0]) return String(parsed[0]).substring(0, 200);
+    } catch (e) { /* fallback */ }
+  }
+  const intent = (scenario.test_intent || '').toLowerCase();
+  if (intent.includes('login')) return 'Navigate to login page';
+  if (intent.includes('create')) return 'Open create form';
+  if (intent.includes('delete')) return 'Locate item to delete';
+  return 'Perform initial setup';
+}
+
+function deriveActionStep(scenario) {
+  const inputs = scenario.inputs;
+  if (inputs && typeof inputs === 'object' && !Array.isArray(inputs)) {
+    const entries = Object.entries(inputs)
+      .filter(function(e) { return e[1] !== null && e[1] !== undefined; })
+      .slice(0, 2)
+      .map(function(e) { return e[0] + ': "' + e[1] + '"'; });
+    if (entries.length > 0) return 'Enter test data (' + entries.join(', ') + ')';
+  }
+  const intent = (scenario.test_intent || '').toLowerCase();
+  if (intent.includes('submit')) return 'Click Submit button';
+  if (intent.includes('save')) return 'Click Save button';
+  if (intent.includes('login')) return 'Enter credentials and click Login';
+  return 'Execute the primary action under test';
+}
+
+function deriveVerifyStep(scenario) {
+  const outcome = scenario.expected_outcome || '';
+  if (!outcome) return 'Verify action completed successfully';
+  return 'Verify: ' + outcome.substring(0, 150);
+}
+
+module.exports = { scenarioToCsvRows, testCaseToCsvRows, escapeCsvField, PRIORITY_MAP, CATEGORY_TAGS };

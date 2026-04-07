@@ -1,0 +1,3 @@
+TestCaseID,Title,Preconditions,Step1,Step2,Step3,ExpectedResult,Priority,Tags
+"TC001","User Login with Email - successful primary flow","User is logged in | Required data is available","User is logged in","Execute the primary action under test","Verify: Feature completes successfully as per acceptance criteria","Feature completes successfully as per acceptance criteria","critical","smoke, regression"
+"TC002","User Login with Email - missing required input","User is logged in","User is logged in","Execute the primary action under test","Verify: System shows validation error, does not proceed","System shows validation error, does not proceed","critical","regression, error-handling"
