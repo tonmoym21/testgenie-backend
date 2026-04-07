@@ -1,6 +1,6 @@
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
-import { Beaker, FolderOpen, LogOut, Play, BarChart3 } from 'lucide-react';
+import { Beaker, FolderOpen, LogOut, Play, BarChart3, BookOpen } from 'lucide-react';
 
 export default function Layout({ children }) {
   const { user, logout } = useAuth();
@@ -16,6 +16,7 @@ export default function Layout({ children }) {
     { path: '/dashboard', label: 'Dashboard', icon: BarChart3 },
     { path: '/projects', label: 'Projects', icon: FolderOpen },
     { path: '/executions', label: 'Executions', icon: Play },
+    { path: '/stories', label: 'Stories', icon: BookOpen },
   ];
 
   return (

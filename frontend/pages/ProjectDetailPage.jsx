@@ -1,11 +1,13 @@
 import { useState, useEffect } from 'react';
 import { useParams } from 'react-router-dom';
 import { api } from '../services/api';
-import { Loader2, Plus, Trash2, AlertCircle } from 'lucide-react';
+import { Loader2, Plus, Trash2, AlertCircle, BookOpen } from 'lucide-react';
 import ExportCsvButton from '../components/ExportCsvButton';
+import { useNavigate } from 'react-router-dom';
 
 export default function ProjectDetailPage() {
   const { projectId } = useParams();
+  const navigate = useNavigate();
   const [project, setProject] = useState(null);
   const [testCases, setTestCases] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -106,6 +108,12 @@ export default function ProjectDetailPage() {
           <p className="text-gray-500 text-sm mt-1">Test Cases</p>
         </div>
         <div className="flex gap-3">
+          <button
+            onClick={() => navigate('/projects/' + projectId + '/stories')}
+            className="btn-secondary flex items-center gap-2"
+          >
+            <BookOpen size={16} /> Stories
+          </button>
           <ExportCsvButton
   projectId={projectId}
   selectedTestCaseIds={selectedIds.length > 0 ? selectedIds : null}
