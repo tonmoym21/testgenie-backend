@@ -96,7 +96,7 @@ router.post('/generate', authenticate, async (req, res, next) => {
       scenarioCount: scenarios.length,
       testFileCount: testFiles.length,
       zipSizeBytes: zipBuffer.length,
-      zipFileName: `playwright-tests-${storyIngestionId.slice(0, 8)}.zip`,
+      zipFileName: `playwright-tests-${String(storyIngestionId).slice(0, 8)}.zip`,
       categories,
       files: testFiles.map((f) => f.fileName),
     });
@@ -155,7 +155,7 @@ router.get('/:testId/download', authenticate, async (req, res, next) => {
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader(
       'Content-Disposition',
-      `attachment; filename="playwright-tests-${storyId.slice(0, 8)}.zip"`
+      `attachment; filename="playwright-tests-${String(storyId).slice(0, 8)}.zip"`
     );
     res.send(zipBuffer);
   } catch (err) {
