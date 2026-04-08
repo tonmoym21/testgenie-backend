@@ -9,8 +9,10 @@ const config = require('./config');
 const logger = require('./utils/logger');
 const { generalLimiter } = require('./middleware/rateLimiter');
 const { errorHandler } = require('./middleware/errorHandler');
+const { authenticate } = require('./middleware/auth');
 
 // Route imports
+const playwrightRoutes = require('./routes/playwright');
 const healthRoutes = require('./routes/health');
 const authRoutes = require('./routes/auth');
 const projectRoutes = require('./routes/projects');
@@ -51,6 +53,7 @@ app.use(healthRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/projects', projectRoutes);
 app.use('/api/projects/:projectId/stories', storyRoutes);
+app.use('/api/projects/:projectId/playwright', authenticate, playwrightRoutes);
 app.use('/api/projects/:projectId/testcases', testcaseRoutes);
 app.use('/api/projects/:projectId/analyze', analyzeRoutes);
 app.use('/api', executeRoutes);
