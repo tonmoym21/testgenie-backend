@@ -53,7 +53,7 @@ app.use(healthRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/projects', projectRoutes);
 app.use('/api/projects/:projectId/stories', storyRoutes);
-app.use('/api/projects/:projectId/playwright', authenticate, playwrightRoutes);
+app.use('/api/projects/:projectId/playwright', playwrightRoutes);
 app.use('/api/projects/:projectId/testcases', testcaseRoutes);
 app.use('/api/projects/:projectId/analyze', analyzeRoutes);
 app.use('/api', executeRoutes);

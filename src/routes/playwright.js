@@ -1,199 +1,248 @@
 // src/routes/playwright.js
-// Routes for Playwright test generation (V1.5 Drop 1)
-//
+// Routes for Playwright test generation and download
 // Mounted at: /api/projects/:projectId/playwright
-// Requires: verifyToken middleware (from index.js or inline)
 
-const express = require('express');
-const router = express.Router({ mergeParams: true }); // access :projectId
+const { Router } = require('express');
+const { authenticate } = require('../middleware/auth');
 const db = require('../db');
-const { generatePlaywrightFiles, generateReadme } = require('../services/playwrightGenerator');
-const { buildPlaywrightZip } = require('../utils/zipGenerator');
+const archiver = require('archiver');
+const { Readable } = require('stream');
+const { generateAllPlaywrightTests } = require('../utils/playwrightGenerator');
+
+const router = Router({ mergeParams: true }); // mergeParams to get :projectId
 
 // ---------------------------------------------------------------------------
 // POST /api/projects/:projectId/playwright/generate
-// Generate Playwright ZIP from a story's approved scenarios
+// Generate Playwright tests from approved scenarios in a story
+// Body: { storyIngestionId: uuid, categories: string[] }
 // ---------------------------------------------------------------------------
-router.post('/generate', async (req, res) => {
-  const { projectId } = req.params;
-  const userId = req.user.id;
-  const { storyIngestionId, categories = [] } = req.body;
-
-  // --- Validate input ---
-  if (!storyIngestionId) {
-    return res.status(400).json({ error: 'storyIngestionId is required' });
-  }
-
-  if (!Array.isArray(categories)) {
-    return res.status(400).json({ error: 'categories must be an array' });
-  }
-
-  const allowedCategories = ['smoke', 'regression', 'sanity', 'critical_path', 'e2e'];
-  const invalid = categories.filter((c) => !allowedCategories.includes(c));
-  if (invalid.length > 0) {
-    return res.status(400).json({ error: `Invalid categories: ${invalid.join(', ')}` });
-  }
-
+router.post('/generate', authenticate, async (req, res, next) => {
   try {
-    // --- Verify story belongs to project + user ---
-    const storyRes = await db.query(
-      `SELECT id, title FROM stories
-      WHERE id = $1 AND project_id = $2 AND user_id = $3`,
-      [storyIngestionId, projectId, userId]
-    );
-    if (storyRes.rows.length === 0) {
-      return res.status(404).json({ error: 'Story not found in this project' });
-    }
-    const storyTitle = storyRes.rows[0].title || 'Untitled Story';
+    const { projectId } = req.params;
+    const userId = req.user.id;
+    const { storyIngestionId, categories = ['regression'] } = req.body;
 
-// --- Fetch approved scenarios directly ---
-    const scenRes = await db.query(
-      `SELECT id, category, title, summary, preconditions, test_intent,
-              inputs, expected_outcome, priority
-       FROM scenarios
+    if (!storyIngestionId) {
+      return res.status(400).json({
+        error: { code: 'BAD_REQUEST', message: 'storyIngestionId is required' },
+      });
+    }
+
+    // Verify project ownership
+    const projResult = await db.query(
+      'SELECT id FROM projects WHERE id = $1 AND user_id = $2',
+      [projectId, userId]
+    );
+    if (projResult.rows.length === 0) {
+      return res.status(404).json({
+        error: { code: 'NOT_FOUND', message: 'Project not found' },
+      });
+    }
+
+    // Fetch approved scenarios for this story
+    const scenariosResult = await db.query(
+      `SELECT * FROM scenarios
        WHERE story_id = $1 AND status = 'approved'
        ORDER BY category, created_at`,
       [storyIngestionId]
     );
-    if (scenRes.rows.length === 0) {
+
+    if (scenariosResult.rows.length === 0) {
       return res.status(400).json({
-        error: 'No approved scenarios. Approve scenarios before generating Playwright tests.',
+        error: {
+          code: 'NO_APPROVED_SCENARIOS',
+          message: 'No approved scenarios found. Approve scenarios before generating.',
+        },
       });
     }
-    const scenarios = scenRes.rows;
 
-    // --- Create DB record (status=generating) ---
-    const insertRes = await db.query(
-      `INSERT INTO generated_tests
-         (project_id, user_id, story_ingestion_id, scenario_ids, categories, status)
-       VALUES ($1, $2, $3, $4, $5, 'generating')
-       RETURNING id`,
-      [
-        projectId,
-        userId,
-        storyIngestionId,
-        JSON.stringify(scenarios.map((s) => s.id)),
-        JSON.stringify(categories),
-      ]
-    );
-    const genTestId = insertRes.rows[0].id;
+    const scenarios = scenariosResult.rows;
 
-    // --- Call OpenAI to generate Playwright code ---
-    let generated;
-    try {
-      generated = await generatePlaywrightFiles(scenarios, categories);
-    } catch (aiErr) {
-      await db.query(
-        `UPDATE generated_tests SET status = 'failed', error_message = $1, completed_at = now()
-         WHERE id = $2`,
-        [aiErr.message, genTestId]
+    // Generate Playwright test files
+    const testFiles = generateAllPlaywrightTests(scenarios, categories);
+
+    // Also generate a playwright.config.ts
+    const configCode = generatePlaywrightConfig();
+
+    // Store generated tests in DB
+    const insertedIds = [];
+    for (const tf of testFiles) {
+      const insertResult = await db.query(
+        `INSERT INTO playwright_tests
+           (project_id, scenario_id, story_id, test_name, file_name, code, categories)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING id`,
+        [
+          projectId,
+          tf.scenarioId,
+          storyIngestionId,
+          tf.testName,
+          tf.fileName,
+          tf.code,
+          categories,
+        ]
       );
-      return res.status(502).json({ error: 'Playwright generation failed', detail: aiErr.message });
+      insertedIds.push(insertResult.rows[0].id);
     }
 
-    // --- Build ZIP ---
-    const readme = generateReadme(storyTitle, scenarios.length, categories);
-    const zipBuffer = await buildPlaywrightZip(generated, readme);
-    const zipBase64 = zipBuffer.toString('base64');
-    const zipFileName = `playwright-${storyIngestionId.slice(0, 8)}-${Date.now()}.zip`;
+    // Build ZIP in memory
+    const zipBuffer = await buildZipBuffer(testFiles, configCode);
 
-    const fileCount =
-      (generated.specs?.length || 0) +
-      (generated.pages?.length || 0) +
-      (generated.testData ? 1 : 0) +
-      (generated.config ? 1 : 0) +
-      2; // README + package.json
+    // Store ZIP metadata (we send it directly, but record the job)
+    const jobId = insertedIds[0]; // use first test ID as job reference
 
-    // --- Update DB record ---
-    await db.query(
-      `UPDATE generated_tests
-       SET status = 'completed',
-           zip_base64 = $1,
-           zip_file_name = $2,
-           zip_size_bytes = $3,
-           test_file_count = $4,
-           completed_at = now()
-       WHERE id = $5`,
-      [zipBase64, zipFileName, zipBuffer.length, fileCount, genTestId]
-    );
-
-    return res.status(201).json({
-      id: genTestId,
-      status: 'completed',
-      zipFileName,
-      zipSizeBytes: zipBuffer.length,
-      testFileCount: fileCount,
+    res.json({
+      id: jobId,
       scenarioCount: scenarios.length,
+      testFileCount: testFiles.length,
+      zipSizeBytes: zipBuffer.length,
+      zipFileName: `playwright-tests-${storyIngestionId.slice(0, 8)}.zip`,
       categories,
+      files: testFiles.map((f) => f.fileName),
     });
   } catch (err) {
-    req.log?.error(err, 'Playwright generation error');
-    return res.status(500).json({ error: 'Internal server error' });
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/projects/:projectId/playwright/:testId/download
+// Download ZIP of generated Playwright tests for a story
+// ---------------------------------------------------------------------------
+router.get('/:testId/download', authenticate, async (req, res, next) => {
+  try {
+    const { projectId, testId } = req.params;
+    const userId = req.user.id;
+
+    // Verify ownership
+    const projResult = await db.query(
+      'SELECT id FROM projects WHERE id = $1 AND user_id = $2',
+      [projectId, userId]
+    );
+    if (projResult.rows.length === 0) {
+      return res.status(404).json({
+        error: { code: 'NOT_FOUND', message: 'Project not found' },
+      });
+    }
+
+    // Get the test record to find the story_id
+    const testResult = await db.query(
+      'SELECT story_id FROM playwright_tests WHERE id = $1 AND project_id = $2',
+      [testId, projectId]
+    );
+    if (testResult.rows.length === 0) {
+      return res.status(404).json({
+        error: { code: 'NOT_FOUND', message: 'Playwright test not found' },
+      });
+    }
+
+    const storyId = testResult.rows[0].story_id;
+
+    // Fetch ALL generated tests for this story
+    const allTests = await db.query(
+      'SELECT file_name, code, categories FROM playwright_tests WHERE story_id = $1 AND project_id = $2 ORDER BY created_at',
+      [storyId, projectId]
+    );
+
+    const testFiles = allTests.rows.map((r) => ({
+      fileName: r.file_name,
+      code: r.code,
+    }));
+
+    const configCode = generatePlaywrightConfig();
+    const zipBuffer = await buildZipBuffer(testFiles, configCode);
+
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="playwright-tests-${storyId.slice(0, 8)}.zip"`
+    );
+    res.send(zipBuffer);
+  } catch (err) {
+    next(err);
   }
 });
 
 // ---------------------------------------------------------------------------
 // GET /api/projects/:projectId/playwright
-// List generated test sets for this project
+// List all generated Playwright tests for a project
 // ---------------------------------------------------------------------------
-router.get('/', async (req, res) => {
-  const { projectId } = req.params;
-  const userId = req.user.id;
-
+router.get('/', authenticate, async (req, res, next) => {
   try {
-    const result = await db.query(
-      `SELECT id, story_ingestion_id, scenario_ids, categories, status,
-              test_file_count, zip_file_name, zip_size_bytes, error_message,
-              created_at, completed_at
-       FROM generated_tests
-       WHERE project_id = $1 AND user_id = $2
-       ORDER BY created_at DESC
-       LIMIT 50`,
+    const { projectId } = req.params;
+    const userId = req.user.id;
+
+    const projResult = await db.query(
+      'SELECT id FROM projects WHERE id = $1 AND user_id = $2',
       [projectId, userId]
     );
+    if (projResult.rows.length === 0) {
+      return res.status(404).json({
+        error: { code: 'NOT_FOUND', message: 'Project not found' },
+      });
+    }
 
-    return res.json({ tests: result.rows });
-  } catch (err) {
-    req.log?.error(err, 'List generated tests error');
-    return res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// ---------------------------------------------------------------------------
-// GET /api/projects/:projectId/playwright/:id/download
-// Download the ZIP file
-// ---------------------------------------------------------------------------
-router.get('/:id/download', async (req, res) => {
-  const { projectId, id } = req.params;
-  const userId = req.user.id;
-
-  try {
     const result = await db.query(
-      `SELECT zip_base64, zip_file_name, zip_size_bytes, status
-       FROM generated_tests
-       WHERE id = $1 AND project_id = $2 AND user_id = $3`,
-      [id, projectId, userId]
+      `SELECT pt.id, pt.test_name, pt.file_name, pt.categories, pt.status,
+              pt.created_at, pt.scenario_id, s.title as scenario_title, s.category as scenario_category
+       FROM playwright_tests pt
+       LEFT JOIN scenarios s ON s.id = pt.scenario_id
+       WHERE pt.project_id = $1
+       ORDER BY pt.created_at DESC`,
+      [projectId]
     );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Generated test not found' });
-    }
-
-    const row = result.rows[0];
-    if (row.status !== 'completed' || !row.zip_base64) {
-      return res.status(400).json({ error: 'ZIP not available (status: ' + row.status + ')' });
-    }
-
-    const zipBuffer = Buffer.from(row.zip_base64, 'base64');
-
-    res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Disposition', `attachment; filename="${row.zip_file_name}"`);
-    res.setHeader('Content-Length', zipBuffer.length);
-    return res.send(zipBuffer);
+    res.json(result.rows);
   } catch (err) {
-    req.log?.error(err, 'Download ZIP error');
-    return res.status(500).json({ error: 'Internal server error' });
+    next(err);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function buildZipBuffer(testFiles, configCode) {
+  return new Promise((resolve, reject) => {
+    const archive = archiver('zip', { zlib: { level: 9 } });
+    const chunks = [];
+
+    archive.on('data', (chunk) => chunks.push(chunk));
+    archive.on('end', () => resolve(Buffer.concat(chunks)));
+    archive.on('error', reject);
+
+    // Add config
+    archive.append(configCode, { name: 'playwright.config.ts' });
+
+    // Add test files in tests/ directory
+    for (const tf of testFiles) {
+      archive.append(tf.code, { name: `tests/${tf.fileName}` });
+    }
+
+    archive.finalize();
+  });
+}
+
+function generatePlaywrightConfig() {
+  return `import { defineConfig, devices } from '@playwright/test';
+
+export default defineConfig({
+  testDir: './tests',
+  fullyParallel: true,
+  forbidOnly: !!process.env.CI,
+  retries: process.env.CI ? 2 : 0,
+  workers: process.env.CI ? 1 : undefined,
+  reporter: 'html',
+  use: {
+    baseURL: process.env.BASE_URL || 'http://localhost:3000',
+    trace: 'on-first-retry',
+    screenshot: 'only-on-failure',
+  },
+  projects: [
+    { name: 'chromium', use: { ...devices['Desktop Chrome'] } },
+  ],
+});
+`;
+}
 
 module.exports = router;
