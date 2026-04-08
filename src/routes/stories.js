@@ -2,6 +2,8 @@ const { Router } = require('express');
 const db = require('../db');
 const { authenticate } = require('../middleware/auth');
 const { scenarioToCsvRows } = require('../utils/csvTransformer');
+const { generateScenarios } = require('../services/scenarioGenerator');
+const logger = require('../utils/logger');
 
 const router = Router({ mergeParams: true });
 
@@ -42,8 +44,15 @@ router.post('/', authenticate, async (req, res, next) => {
 
     const story = result.rows[0];
 
-    // Auto-generate draft scenarios
-    const scenarios = generateDraftScenarios(story);
+    // Generate scenarios using OpenAI (with rule-based fallback)
+    let scenarios;
+    try {
+      scenarios = await generateScenarios({ title: story.title, description: story.description });
+    } catch (genErr) {
+      logger.error({ err: genErr.message, storyId: story.id }, 'Scenario generation failed completely');
+      scenarios = [];
+    }
+
     if (scenarios.length > 0) {
       const values = [];
       const placeholders = [];
@@ -54,9 +63,9 @@ router.post('/', authenticate, async (req, res, next) => {
         );
         values.push(
           story.id, projectId, userId,
-          s.category, s.title, s.summary,
-          JSON.stringify(s.preconditions), s.test_intent,
-          s.expected_outcome, s.priority
+          s.category, s.title, s.summary || '',
+          JSON.stringify(s.preconditions || []), s.test_intent || '',
+          s.expected_outcome || '', s.priority || 'P1'
         );
       }
       await db.query(
@@ -69,6 +78,8 @@ router.post('/', authenticate, async (req, res, next) => {
         [story.id]
       );
       story.status = 'extracted';
+
+      logger.info({ storyId: story.id, scenarioCount: scenarios.length }, 'Scenarios generated for story');
     }
 
     res.status(201).json(story);
@@ -311,20 +322,5 @@ router.get('/:storyId/coverage', authenticate, async (req, res, next) => {
     next(err);
   }
 });
-
-// Draft scenario generator (rule-based V1 placeholder)
-function generateDraftScenarios(story) {
-  const title = story.title || 'Feature';
-  return [
-    { category: 'happy_path', title: title + ' - successful primary flow', summary: 'Verify the main success path for: ' + title, preconditions: ['User is logged in', 'Required data is available'], test_intent: 'Validate the core happy path works as described', expected_outcome: 'Feature completes successfully as per acceptance criteria', priority: 'P0' },
-    { category: 'happy_path', title: title + ' - successful with all optional fields', summary: 'Verify feature works when all optional inputs are provided', preconditions: ['User is logged in'], test_intent: 'Validate full input acceptance', expected_outcome: 'Feature handles all optional fields correctly', priority: 'P1' },
-    { category: 'negative', title: title + ' - missing required input', summary: 'Verify error handling when required fields are empty', preconditions: ['User is logged in'], test_intent: 'Validate proper error messages for missing data', expected_outcome: 'System shows validation error, does not proceed', priority: 'P0' },
-    { category: 'negative', title: title + ' - unauthorized access attempt', summary: 'Verify feature blocks unauthenticated users', preconditions: ['User is NOT logged in'], test_intent: 'Validate auth guard prevents unauthorized access', expected_outcome: 'System redirects to login or shows 401 error', priority: 'P1' },
-    { category: 'validation', title: title + ' - invalid input format', summary: 'Verify system rejects malformed or out-of-range input', preconditions: ['User is logged in'], test_intent: 'Validate input sanitization and format checking', expected_outcome: 'System shows field-level validation errors', priority: 'P1' },
-    { category: 'edge', title: title + ' - boundary value handling', summary: 'Verify behavior at min/max boundaries of inputs', preconditions: ['User is logged in'], test_intent: 'Validate edge cases at input boundaries', expected_outcome: 'System handles boundary values correctly without errors', priority: 'P2' },
-    { category: 'role_permission', title: title + ' - role-based access control', summary: 'Verify different user roles have correct access levels', preconditions: ['Multiple user roles exist'], test_intent: 'Validate permissions are enforced per role', expected_outcome: 'Unauthorized roles are blocked, authorized roles succeed', priority: 'P1' },
-    { category: 'api_impact', title: title + ' - API response handling', summary: 'Verify correct handling of API success and failure responses', preconditions: ['Backend API is available'], test_intent: 'Validate frontend handles API states (loading, success, error)', expected_outcome: 'UI reflects API state correctly', priority: 'P2' },
-  ];
-}
 
 module.exports = router;

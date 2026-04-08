@@ -1,7 +1,6 @@
 const { Router } = require('express');
 const { z } = require('zod');
 const { validate } = require('../middleware/validate');
-const { authenticate } = require('../middleware/auth');
 const { authLimiter } = require('../middleware/rateLimiter');
 const authService = require('../services/authService');
 
@@ -65,7 +64,9 @@ router.post('/refresh', validate(refreshSchema), async (req, res, next) => {
 });
 
 // POST /api/auth/logout
-router.post('/logout', authenticate, validate(logoutSchema), async (req, res, next) => {
+// NOTE: No `authenticate` middleware — users must be able to log out even with expired access tokens.
+// The refresh token in the body is sufficient to identify the session to invalidate.
+router.post('/logout', validate(logoutSchema), async (req, res, next) => {
   try {
     await authService.logout(req.body.refreshToken);
     res.json({ message: 'Logged out' });
