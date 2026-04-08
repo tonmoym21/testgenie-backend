@@ -13,6 +13,7 @@ const { authenticate } = require('./middleware/auth');
 
 // Route imports
 const playwrightRoutes = require('./routes/playwright');
+const automationAssetRoutes = require('./routes/automationAssets');
 const healthRoutes = require('./routes/health');
 const authRoutes = require('./routes/auth');
 const projectRoutes = require('./routes/projects');
@@ -54,6 +55,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/projects', projectRoutes);
 app.use('/api/projects/:projectId/stories', storyRoutes);
 app.use('/api/projects/:projectId/playwright', playwrightRoutes);
+app.use('/api/projects/:projectId/automation', automationAssetRoutes);
 app.use('/api/projects/:projectId/testcases', testcaseRoutes);
 app.use('/api/projects/:projectId/analyze', analyzeRoutes);
 app.use('/api', executeRoutes);
