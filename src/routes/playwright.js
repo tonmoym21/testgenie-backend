@@ -211,6 +211,14 @@ function buildZipBuffer(testFiles, configCode) {
     archive.on('end', () => resolve(Buffer.concat(chunks)));
     archive.on('error', reject);
 
+    // Add package.json so @playwright/test resolves in temp run dirs
+    const packageJson = JSON.stringify({
+      name: 'testforge-pw-run',
+      private: true,
+      dependencies: { '@playwright/test': '1.52.0' },
+    }, null, 2);
+    archive.append(packageJson, { name: 'package.json' });
+
     // Add config
     archive.append(configCode, { name: 'playwright.config.ts' });
 

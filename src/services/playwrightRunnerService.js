@@ -1,7 +1,7 @@
 // src/services/playwrightRunnerService.js
 // Runs Playwright spec files and captures results
 
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -99,6 +99,9 @@ async function executePlaywright(run, asset) {
       throw new Error('No test files found for this asset');
     }
 
+    // Bootstrap: ensure package.json + npm install so @playwright/test resolves
+    await bootstrapRunDir(runDir, run.id);
+
     logger.info({ runId: run.id, fileCount: writtenFiles.length, dir: runDir }, 'Running Playwright');
 
     // Execute Playwright via npx
@@ -159,17 +162,81 @@ async function executePlaywright(run, asset) {
   }
 }
 
+/**
+ * Bootstrap the temp run directory: write package.json if missing and install deps.
+ */
+async function bootstrapRunDir(runDir, runId) {
+  const pkgPath = path.join(runDir, 'package.json');
+
+  // Write package.json if not already present (older assets / manual runs)
+  if (!fs.existsSync(pkgPath)) {
+    const pkg = {
+      name: 'testforge-pw-run',
+      private: true,
+      dependencies: { '@playwright/test': '1.52.0' },
+    };
+    fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
+    logger.info({ runId }, 'Wrote package.json to run dir');
+  }
+
+  // Install dependencies
+  try {
+    const lockExists = fs.existsSync(path.join(runDir, 'package-lock.json'));
+    const installCmd = lockExists ? 'npm ci --omit=dev' : 'npm install --omit=dev';
+    execSync(installCmd, {
+      cwd: runDir,
+      timeout: 90000,
+      stdio: 'pipe',
+      env: { ...process.env, npm_config_loglevel: 'error' },
+    });
+    logger.info({ runId }, 'Dependencies installed in run dir');
+  } catch (err) {
+    const msg = err.stderr ? err.stderr.toString().slice(0, 500) : err.message;
+    logger.error({ runId, detail: msg }, 'Failed to install dependencies in run dir');
+    throw new Error(`Dependency install failed: ${msg}`);
+  }
+
+  // Ensure browsers are available (use shared cache if set, else install chromium)
+  try {
+    const browserCachePath = process.env.PLAYWRIGHT_BROWSERS_PATH;
+    if (!browserCachePath) {
+      execSync('npx playwright install chromium', {
+        cwd: runDir,
+        timeout: 120000,
+        stdio: 'pipe',
+      });
+      logger.info({ runId }, 'Chromium browser installed for run');
+    } else {
+      logger.info({ runId, cache: browserCachePath }, 'Using shared browser cache');
+    }
+  } catch (err) {
+    const msg = err.stderr ? err.stderr.toString().slice(0, 500) : err.message;
+    logger.error({ runId, detail: msg }, 'Browser install failed');
+    throw new Error(`Browser install failed: ${msg}`);
+  }
+}
+
 function spawnPlaywright(cwd, browser = 'chromium') {
   return new Promise((resolve) => {
     const args = [
       'playwright', 'test',
+      '--config=playwright.config.ts',
       '--reporter=line',
       `--project=${browser === 'chromium' ? 'chromium' : browser}`,
     ];
 
+    const env = {
+      ...process.env,
+      CI: 'true',
+    };
+    // Share browser cache across runs if configured
+    if (process.env.PLAYWRIGHT_BROWSERS_PATH) {
+      env.PLAYWRIGHT_BROWSERS_PATH = process.env.PLAYWRIGHT_BROWSERS_PATH;
+    }
+
     const proc = spawn('npx', args, {
       cwd,
-      env: { ...process.env, CI: 'true' },
+      env,
       shell: true,
       timeout: 120000, // 2 min max
     });
