@@ -203,7 +203,7 @@ async function bootstrapRunDir(runDir, runId) {
     if (process.env.PLAYWRIGHT_BROWSERS_PATH) {
       browserEnv.PLAYWRIGHT_BROWSERS_PATH = process.env.PLAYWRIGHT_BROWSERS_PATH;
     }
-    execSync('npx playwright install --with-deps chromium', {
+    execSync('npx playwright install chromium', {
       cwd: runDir,
       timeout: 180000,
       stdio: 'pipe',
