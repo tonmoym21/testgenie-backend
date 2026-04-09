@@ -215,7 +215,7 @@ function buildZipBuffer(testFiles, configCode) {
     const packageJson = JSON.stringify({
       name: 'testforge-pw-run',
       private: true,
-      dependencies: { '@playwright/test': '1.52.0' },
+      dependencies: { '@playwright/test': '1.58.2' },
     }, null, 2);
     archive.append(packageJson, { name: 'package.json' });
 

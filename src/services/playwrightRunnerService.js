@@ -173,7 +173,7 @@ async function bootstrapRunDir(runDir, runId) {
     const pkg = {
       name: 'testforge-pw-run',
       private: true,
-      dependencies: { '@playwright/test': '1.52.0' },
+      dependencies: { '@playwright/test': '1.58.2' },
     };
     fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
     logger.info({ runId }, 'Wrote package.json to run dir');
