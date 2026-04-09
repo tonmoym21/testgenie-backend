@@ -196,19 +196,20 @@ async function bootstrapRunDir(runDir, runId) {
     throw new Error(`Dependency install failed: ${msg}`);
   }
 
-  // Ensure browsers are available (use shared cache if set, else install chromium)
+  // Always install browsers from the run dir's own @playwright/test version
+  // This ensures the correct browser revision is present regardless of host packages
   try {
-    const browserCachePath = process.env.PLAYWRIGHT_BROWSERS_PATH;
-    if (!browserCachePath) {
-      execSync('npx playwright install chromium', {
-        cwd: runDir,
-        timeout: 120000,
-        stdio: 'pipe',
-      });
-      logger.info({ runId }, 'Chromium browser installed for run');
-    } else {
-      logger.info({ runId, cache: browserCachePath }, 'Using shared browser cache');
+    const browserEnv = { ...process.env };
+    if (process.env.PLAYWRIGHT_BROWSERS_PATH) {
+      browserEnv.PLAYWRIGHT_BROWSERS_PATH = process.env.PLAYWRIGHT_BROWSERS_PATH;
     }
+    execSync('npx playwright install --with-deps chromium', {
+      cwd: runDir,
+      timeout: 180000,
+      stdio: 'pipe',
+      env: browserEnv,
+    });
+    logger.info({ runId }, 'Chromium browser installed for run');
   } catch (err) {
     const msg = err.stderr ? err.stderr.toString().slice(0, 500) : err.message;
     logger.error({ runId, detail: msg }, 'Browser install failed');
