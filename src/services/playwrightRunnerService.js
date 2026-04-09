@@ -106,7 +106,7 @@ async function executePlaywright(run, asset) {
 
     // Execute Playwright via npx
     const startMs = Date.now();
-    const { stdout, stderr, exitCode } = await spawnPlaywright(runDir, run.browser);
+    const { stdout, stderr, exitCode } = await spawnPlaywright(runDir, run.browser, run.base_url);
     const durationMs = Date.now() - startMs;
 
     // Try to parse JSON report
@@ -217,7 +217,7 @@ async function bootstrapRunDir(runDir, runId) {
   }
 }
 
-function spawnPlaywright(cwd, browser = 'chromium') {
+function spawnPlaywright(cwd, browser = 'chromium', baseUrl) {
   return new Promise((resolve) => {
     const args = [
       'playwright', 'test',
@@ -230,6 +230,10 @@ function spawnPlaywright(cwd, browser = 'chromium') {
       ...process.env,
       CI: 'true',
     };
+    // Pass base URL so generated configs can read process.env.BASE_URL
+    if (baseUrl) {
+      env.BASE_URL = baseUrl;
+    }
     // Share browser cache across runs if configured
     if (process.env.PLAYWRIGHT_BROWSERS_PATH) {
       env.PLAYWRIGHT_BROWSERS_PATH = process.env.PLAYWRIGHT_BROWSERS_PATH;
