@@ -1,10 +1,16 @@
 // src/utils/playwrightGenerator.js
 // Generates Playwright test files from approved scenarios
+// V2: Grounded in target app config — no blind placeholder selectors
 
 /**
- * Generate a single Playwright test file from a scenario
+ * Generate a single Playwright test file from a scenario.
+ *
+ * @param {Object} scenario - Approved coverage scenario from DB
+ * @param {string[]} categories - Tags to apply
+ * @param {Object|null} targetConfig - Target app config (from target_app_configs table)
+ *   If null, generates a DRAFT scaffold with TODO markers instead of fake selectors.
  */
-function generatePlaywrightTest(scenario, categories = []) {
+function generatePlaywrightTest(scenario, categories = [], targetConfig = null) {
   const safeName = (scenario.title || 'untitled')
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
@@ -13,33 +19,22 @@ function generatePlaywrightTest(scenario, categories = []) {
   const fileName = `${safeName}.spec.ts`;
   const tags = categories.map((c) => `@${c}`).join(' ');
 
-  // Parse preconditions
-  let preconditions = [];
-  if (Array.isArray(scenario.preconditions)) {
-    preconditions = scenario.preconditions;
-  } else if (typeof scenario.preconditions === 'string') {
-    try {
-      preconditions = JSON.parse(scenario.preconditions);
-    } catch {
-      preconditions = scenario.preconditions ? [scenario.preconditions] : [];
-    }
-  }
+  const preconditions = parsePreconditions(scenario);
+  const inputs = parseInputs(scenario);
+  const selectorMap = targetConfig ? (targetConfig.selector_map || {}) : {};
+  const strategy = targetConfig ? (targetConfig.selector_strategy || 'role_first') : 'role_first';
+  const baseUrl = targetConfig ? targetConfig.base_url : "process.env.BASE_URL || 'http://localhost:3000'";
+  const isDraft = !targetConfig;
 
-  // Parse inputs
-  let inputs = {};
-  if (typeof scenario.input_data === 'object' && scenario.input_data !== null) {
-    inputs = scenario.input_data;
-  } else if (typeof scenario.inputs === 'object' && scenario.inputs !== null) {
-    inputs = scenario.inputs;
-  } else if (typeof scenario.input_data === 'string') {
-    try { inputs = JSON.parse(scenario.input_data); } catch { inputs = {}; }
-  }
+  const steps = buildTestSteps(scenario, inputs, selectorMap, strategy, isDraft);
+  const authSetup = buildAuthSetup(targetConfig);
 
-  // Build test steps from scenario fields
-  const steps = buildTestSteps(scenario, inputs);
+  const draftBanner = isDraft
+    ? `\n// ⚠️  DRAFT — generated without target app config. Selectors need mapping before execution.\n`
+    : '';
 
   const code = `import { test, expect } from '@playwright/test';
-
+${draftBanner}
 /**
  * ${scenario.title}
  * Category: ${scenario.category || 'general'}
@@ -51,38 +46,81 @@ function generatePlaywrightTest(scenario, categories = []) {
  * Expected: ${scenario.expected_outcome || ''}
  */
 test.describe('${escapeStr(scenario.title)}', () => {
-  ${preconditions.length > 0 ? `test.beforeEach(async ({ page }) => {
-    // Preconditions: ${preconditions.join(', ')}
-    await page.goto('/');
+  test.beforeEach(async ({ page }) => {
+${authSetup}
   });
 
-  ` : ''}test('${escapeStr(scenario.test_intent || scenario.title)}', { tag: [${categories.map((c) => `'@${c}'`).join(', ')}] }, async ({ page }) => {
+  test('${escapeStr(scenario.test_intent || scenario.title)}', { tag: [${categories.map((c) => `'@${c}'`).join(', ')}] }, async ({ page }) => {
 ${steps.map((s) => `    ${s}`).join('\n')}
   });
 });
 `;
 
-  return { fileName, code, testName: scenario.title };
+  return {
+    fileName,
+    code,
+    testName: scenario.title,
+    isDraft,
+  };
 }
 
-function buildTestSteps(scenario, inputs) {
-  const steps = [];
+// ---------------------------------------------------------------------------
+// Auth setup based on target config
+// ---------------------------------------------------------------------------
+function buildAuthSetup(targetConfig) {
+  if (!targetConfig || targetConfig.auth_type === 'none') {
+    return `    // No auth configured\n    await page.goto('/');`;
+  }
 
-  // Navigate
-  steps.push(`// Arrange`);
+  switch (targetConfig.auth_type) {
+    case 'form_login': {
+      const loginUrl = targetConfig.login_url || '/login';
+      const sm = targetConfig.selector_map || {};
+      const userSelector = sm.usernameInput || "getByLabel('Email')";
+      const passSelector = sm.passwordInput || "getByLabel('Password')";
+      const submitSelector = sm.loginButton || "getByRole('button', { name: /sign in|log in/i })";
+      return `    // Form login
+    await page.goto('${loginUrl}');
+    await page.${userSelector}.fill(process.env.${targetConfig.auth_username_env || 'TEST_USERNAME'} || 'test@example.com');
+    await page.${passSelector}.fill(process.env.${targetConfig.auth_password_env || 'TEST_PASSWORD'} || 'password');
+    await page.${submitSelector}.click();
+    await page.waitForURL('**/*', { timeout: 10000 });`;
+    }
+
+    case 'token':
+      return `    // Token auth — inject via extraHTTPHeaders or storageState
+    await page.goto('/');
+    // Token sourced from env: ${targetConfig.auth_token_env || 'TEST_AUTH_TOKEN'}`;
+
+    case 'storage_state':
+      return `    // storageState auth — pre-authenticated context
+    // Configured in playwright.config.ts via storageState
+    await page.goto('/');`;
+
+    default:
+      return `    await page.goto('/');`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Test step builder — grounded in target config selectors
+// ---------------------------------------------------------------------------
+function buildTestSteps(scenario, inputs, selectorMap, strategy, isDraft) {
+  const steps = [];
+  const inputEntries = Object.entries(inputs);
+
+  steps.push('// Arrange — navigate to the page under test');
   steps.push(`await page.goto('/');`);
 
-  // Fill inputs if present
-  const inputEntries = Object.entries(inputs);
   if (inputEntries.length > 0) {
     steps.push('');
     steps.push('// Act — fill form inputs');
     for (const [field, value] of inputEntries) {
-      const selector = `[data-testid="${field}"]`;
+      const locator = resolveSelector(field, selectorMap, strategy, isDraft);
       if (typeof value === 'boolean') {
-        steps.push(`await page.locator('${selector}').${value ? 'check' : 'uncheck'}();`);
+        steps.push(`await page.${locator}.${value ? 'check' : 'uncheck'}();`);
       } else {
-        steps.push(`await page.locator('${selector}').fill('${escapeStr(String(value))}');`);
+        steps.push(`await page.${locator}.fill('${escapeStr(String(value))}');`);
       }
     }
   }
@@ -90,20 +128,22 @@ function buildTestSteps(scenario, inputs) {
   // Submit / trigger action
   steps.push('');
   steps.push('// Act — trigger action');
-  steps.push(`await page.locator('[data-testid="submit"]').click();`);
+  const submitLocator = resolveSelector('submit', selectorMap, strategy, isDraft);
+  steps.push(`await page.${submitLocator}.click();`);
 
   // Assert expected outcome
   steps.push('');
   steps.push('// Assert');
   if (scenario.expected_outcome) {
     const outcome = scenario.expected_outcome.toLowerCase();
-    if (outcome.includes('error') || outcome.includes('fail') || outcome.includes('reject')) {
-      steps.push(`await expect(page.locator('[data-testid="error-message"]')).toBeVisible();`);
-      steps.push(`await expect(page.locator('[data-testid="error-message"]')).toContainText('error');`);
-    } else if (outcome.includes('redirect') || outcome.includes('navigate')) {
+    if (outcome.includes('error') || outcome.includes('fail') || outcome.includes('reject') || outcome.includes('denied') || outcome.includes('401') || outcome.includes('403')) {
+      const errorLocator = resolveSelector('errorMessage', selectorMap, strategy, isDraft);
+      steps.push(`await expect(page.${errorLocator}).toBeVisible();`);
+    } else if (outcome.includes('redirect') || outcome.includes('navigate') || outcome.includes('url')) {
       steps.push(`await expect(page).not.toHaveURL('/');`);
     } else {
-      steps.push(`await expect(page.locator('[data-testid="success-message"]')).toBeVisible();`);
+      const successLocator = resolveSelector('successMessage', selectorMap, strategy, isDraft);
+      steps.push(`await expect(page.${successLocator}).toBeVisible();`);
     }
   } else {
     steps.push(`// TODO: Add assertions for expected outcome`);
@@ -112,17 +152,114 @@ function buildTestSteps(scenario, inputs) {
   return steps;
 }
 
+// ---------------------------------------------------------------------------
+// Selector resolution — uses selector map if available, otherwise role-first
+// ---------------------------------------------------------------------------
+function resolveSelector(logicalName, selectorMap, strategy, isDraft) {
+  // 1. Check explicit selector map first (user-provided or DOM-discovered)
+  if (selectorMap[logicalName]) {
+    return selectorMap[logicalName];
+  }
+
+  // 2. If draft (no target config), emit a clear TODO instead of fake selectors
+  if (isDraft) {
+    return `locator('/* TODO: Map selector for "${logicalName}" */')`;
+  }
+
+  // 3. Fallback: generate a resilient selector based on strategy
+  switch (strategy) {
+    case 'testid_first':
+      return `getByTestId('${logicalName}')`;
+
+    case 'label_first':
+      return `getByLabel('${humanize(logicalName)}')`;
+
+    case 'css_fallback':
+      return `locator('[data-testid="${logicalName}"], [name="${logicalName}"], #${logicalName}')`;
+
+    case 'role_first':
+    default:
+      return selectorForRole(logicalName);
+  }
+}
+
+/**
+ * Generate role-first Playwright locator for common logical names.
+ */
+function selectorForRole(logicalName) {
+  const lower = logicalName.toLowerCase();
+
+  // Common mappings
+  if (lower === 'submit' || lower === 'loginbutton') {
+    return "getByRole('button', { name: /submit|save|sign in|log in|continue/i })";
+  }
+  if (lower.includes('email') || lower.includes('username')) {
+    return "getByRole('textbox', { name: /email|username/i })";
+  }
+  if (lower.includes('password')) {
+    return "getByLabel(/password/i)";
+  }
+  if (lower === 'errormessage' || lower === 'error') {
+    return "getByRole('alert')";
+  }
+  if (lower === 'successmessage' || lower === 'success') {
+    return "getByRole('status')";
+  }
+  if (lower.includes('search')) {
+    return "getByRole('searchbox')";
+  }
+  if (lower.includes('cancel')) {
+    return "getByRole('button', { name: /cancel/i })";
+  }
+
+  // Generic: try label match on humanized name
+  return `getByLabel('${humanize(logicalName)}')`;
+}
+
+function humanize(str) {
+  return str
+    .replace(/([A-Z])/g, ' $1')
+    .replace(/[_-]+/g, ' ')
+    .replace(/^\s+/, '')
+    .replace(/\b\w/g, (c) => c.toUpperCase())
+    .trim();
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function parsePreconditions(scenario) {
+  if (Array.isArray(scenario.preconditions)) return scenario.preconditions;
+  if (typeof scenario.preconditions === 'string') {
+    try { return JSON.parse(scenario.preconditions); } catch { return scenario.preconditions ? [scenario.preconditions] : []; }
+  }
+  return [];
+}
+
+function parseInputs(scenario) {
+  if (typeof scenario.input_data === 'object' && scenario.input_data !== null) return scenario.input_data;
+  if (typeof scenario.inputs === 'object' && scenario.inputs !== null) return scenario.inputs;
+  if (typeof scenario.input_data === 'string') {
+    try { return JSON.parse(scenario.input_data); } catch { return {}; }
+  }
+  return {};
+}
+
 function escapeStr(s) {
   return s.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, ' ');
 }
 
 /**
- * Generate all Playwright tests for a list of scenarios
- * Returns array of { fileName, code, testName, scenarioId }
+ * Generate all Playwright tests for a list of scenarios.
+ *
+ * @param {Object[]} scenarios
+ * @param {string[]} categories
+ * @param {Object|null} targetConfig - Target app config. null = draft mode.
  */
-function generateAllPlaywrightTests(scenarios, categories = []) {
+function generateAllPlaywrightTests(scenarios, categories = [], targetConfig = null) {
   return scenarios.map((scenario) => {
-    const result = generatePlaywrightTest(scenario, categories);
+    const result = generatePlaywrightTest(scenario, categories, targetConfig);
     return { ...result, scenarioId: scenario.id };
   });
 }
