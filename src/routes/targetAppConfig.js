@@ -11,19 +11,31 @@ const targetAppConfigService = require('../services/targetAppConfigService');
 const router = Router({ mergeParams: true });
 router.use(authenticate);
 
+// Env var name: UPPER_SNAKE_CASE, 2-128 chars
+const envVarName = z.string().min(2).max(128).regex(
+  /^[A-Z][A-Z0-9_]{1,127}$/,
+  'Must be an environment variable name in UPPER_SNAKE_CASE (e.g. TEST_USERNAME), not a raw credential value'
+).optional();
+
+// Selector map: logical name → Playwright locator string
+const selectorMapSchema = z.record(
+  z.string().min(1).max(64),   // key: logical name like "loginButton"
+  z.string().min(1).max(512)   // value: locator like "getByRole('button', { name: 'Sign in' })"
+).optional();
+
 const createSchema = z.object({
   name: z.string().min(1).max(128).default('Default'),
   baseUrl: z.string().url(),
   environment: z.enum(['local', 'staging', 'production', 'test']).default('staging'),
   authType: z.enum(['none', 'form_login', 'token', 'cookie', 'storage_state', 'basic_auth']).default('none'),
-  loginUrl: z.string().url().optional(),
-  authUsernameEnv: z.string().max(128).optional(),
-  authPasswordEnv: z.string().max(128).optional(),
-  authTokenEnv: z.string().max(128).optional(),
+  loginUrl: z.string().max(512).optional(),
+  authUsernameEnv: envVarName,
+  authPasswordEnv: envVarName,
+  authTokenEnv: envVarName,
   storageStatePath: z.string().max(512).optional(),
   selectorStrategy: z.enum(['role_first', 'testid_first', 'label_first', 'css_fallback']).default('role_first'),
-  selectorMap: z.record(z.string()).optional(),
-  knownTestids: z.array(z.string()).optional(),
+  selectorMap: selectorMapSchema,
+  knownTestids: z.array(z.string().max(128)).optional(),
   isDefault: z.boolean().default(true),
 });
 
@@ -58,13 +70,13 @@ const updateSchema = z.object({
   base_url: z.string().url().optional(),
   environment: z.enum(['local', 'staging', 'production', 'test']).optional(),
   auth_type: z.enum(['none', 'form_login', 'token', 'cookie', 'storage_state', 'basic_auth']).optional(),
-  login_url: z.string().url().nullable().optional(),
-  auth_username_env: z.string().max(128).nullable().optional(),
-  auth_password_env: z.string().max(128).nullable().optional(),
-  auth_token_env: z.string().max(128).nullable().optional(),
+  login_url: z.string().max(512).nullable().optional(),
+  auth_username_env: z.string().max(128).regex(/^[A-Z][A-Z0-9_]{1,127}$/, 'Must be UPPER_SNAKE_CASE env var name').nullable().optional(),
+  auth_password_env: z.string().max(128).regex(/^[A-Z][A-Z0-9_]{1,127}$/, 'Must be UPPER_SNAKE_CASE env var name').nullable().optional(),
+  auth_token_env: z.string().max(128).regex(/^[A-Z][A-Z0-9_]{1,127}$/, 'Must be UPPER_SNAKE_CASE env var name').nullable().optional(),
   selector_strategy: z.enum(['role_first', 'testid_first', 'label_first', 'css_fallback']).optional(),
-  selector_map: z.record(z.string()).optional(),
-  known_testids: z.array(z.string()).optional(),
+  selector_map: z.record(z.string().min(1).max(64), z.string().min(1).max(512)).optional(),
+  known_testids: z.array(z.string().max(128)).optional(),
   page_inventory: z.array(z.any()).optional(),
   is_default: z.boolean().optional(),
 });

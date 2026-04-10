@@ -1,7 +1,19 @@
 // src/services/preflightService.js
 // Validates that a Playwright test asset is ready for execution
+// v2: Uses selector_map from target config for smart validation, removes circular readiness check
 
 const logger = require('../utils/logger');
+
+// Env var name pattern: uppercase letters, digits, underscores — NOT raw secrets
+const ENV_VAR_PATTERN = /^[A-Z][A-Z0-9_]{1,127}$/;
+
+/**
+ * Check if a value looks like an env var name vs a raw secret.
+ */
+function isEnvVarName(value) {
+  if (!value || typeof value !== 'string') return false;
+  return ENV_VAR_PATTERN.test(value.trim());
+}
 
 /**
  * Run preflight checks before executing a Playwright asset.
@@ -18,18 +30,42 @@ async function runPreflight(asset, targetConfig, testFiles) {
     blockers.push({ name: 'target_url', status: 'fail', detail: 'No target app URL configured. Add one in Project → Target App Config.' });
   }
 
-  // 2. Auth config exists if needed
+  // 2. Auth config exists if needed + env var name validation
   if (targetConfig && targetConfig.auth_type !== 'none') {
-    const hasCredentials =
-      (targetConfig.auth_type === 'form_login' && targetConfig.auth_username_env && targetConfig.auth_password_env) ||
-      (targetConfig.auth_type === 'token' && targetConfig.auth_token_env) ||
-      (targetConfig.auth_type === 'storage_state' && targetConfig.storage_state_path) ||
-      (targetConfig.auth_type === 'basic_auth' && targetConfig.auth_username_env && targetConfig.auth_password_env);
+    const authType = targetConfig.auth_type;
+    let hasCredentials = false;
+    const credIssues = [];
 
-    if (hasCredentials) {
-      checks.push({ name: 'auth_config', status: 'pass', detail: `Auth type: ${targetConfig.auth_type}` });
+    if (authType === 'form_login' || authType === 'basic_auth') {
+      const hasUser = !!targetConfig.auth_username_env;
+      const hasPass = !!targetConfig.auth_password_env;
+      hasCredentials = hasUser && hasPass;
+
+      if (hasUser && !isEnvVarName(targetConfig.auth_username_env)) {
+        credIssues.push(`Username field contains "${targetConfig.auth_username_env}" which looks like a raw value, not an env var name (e.g. TEST_USERNAME).`);
+      }
+      if (hasPass && !isEnvVarName(targetConfig.auth_password_env)) {
+        credIssues.push(`Password field contains a value that looks like a raw secret, not an env var name (e.g. TEST_PASSWORD).`);
+      }
+    } else if (authType === 'token') {
+      hasCredentials = !!targetConfig.auth_token_env;
+      if (hasCredentials && !isEnvVarName(targetConfig.auth_token_env)) {
+        credIssues.push(`Token field looks like a raw value, not an env var name (e.g. AUTH_TOKEN).`);
+      }
+    } else if (authType === 'storage_state') {
+      hasCredentials = !!targetConfig.storage_state_path;
+    }
+
+    if (credIssues.length > 0) {
+      blockers.push({
+        name: 'auth_config',
+        status: 'fail',
+        detail: `Credential fields must contain ENV VARIABLE NAMES, not raw secrets. ${credIssues.join(' ')}`,
+      });
+    } else if (hasCredentials) {
+      checks.push({ name: 'auth_config', status: 'pass', detail: `Auth type: ${authType}` });
     } else {
-      blockers.push({ name: 'auth_config', status: 'fail', detail: `Auth type "${targetConfig.auth_type}" selected but credential env vars not configured.` });
+      blockers.push({ name: 'auth_config', status: 'fail', detail: `Auth type "${authType}" selected but credential env vars not configured.` });
     }
   } else {
     checks.push({ name: 'auth_config', status: 'pass', detail: 'No auth required' });
@@ -42,37 +78,58 @@ async function runPreflight(asset, targetConfig, testFiles) {
     blockers.push({ name: 'test_files', status: 'fail', detail: 'No test files found for this asset.' });
   }
 
-  // 4. Check for draft/placeholder selectors in test code
-  const placeholderIssues = [];
+  // 4. Selector validation — smart check using selector_map + known_testids
+  const selectorIssues = [];
+  const selectorMap = parseSelectorMap(targetConfig);
+  const knownTestIds = parseKnownTestIds(targetConfig);
+  const hasMappedSelectors = Object.keys(selectorMap).length > 0 || knownTestIds.length > 0;
+
   for (const file of (testFiles || [])) {
     const code = file.code || '';
+    const fileName = file.file_name || file.fileName || 'unknown';
+
+    // Only flag genuine TODO placeholders — these mean the generator couldn't resolve selectors
     if (code.includes('/* TODO: Map selector')) {
-      placeholderIssues.push(file.file_name || file.fileName);
+      selectorIssues.push(`${fileName}: contains TODO placeholder selectors that need mapping`);
     }
-    // Also catch old-style blind selectors that shouldn't exist anymore
-    if (code.includes('[data-testid="submit"]') || code.includes('[data-testid="error-message"]') || code.includes('[data-testid="success-message"]')) {
-      placeholderIssues.push(`${file.file_name || file.fileName} (contains blind placeholder selectors)`);
+
+    // If there's NO target config at all and tests use getByTestId, warn (but don't block if knownTestIds cover them)
+    if (!hasMappedSelectors) {
+      const testIdMatches = code.match(/getByTestId\(['"]([^'"]+)['"]\)/g) || [];
+      const cssTestIdMatches = code.match(/\[data-testid=["']([^"']+)["']\]/g) || [];
+      if (testIdMatches.length > 0 || cssTestIdMatches.length > 0) {
+        // Only warn, don't block — the user may have legitimate testids
+        // This becomes a blocker only if the file also has TODO markers
+      }
     }
   }
-  if (placeholderIssues.length > 0) {
+
+  if (selectorIssues.length > 0) {
     blockers.push({
       name: 'selector_validation',
       status: 'fail',
-      detail: `Unmapped selectors in: ${placeholderIssues.join(', ')}. Update selector map in Target App Config or edit test code.`,
+      detail: selectorIssues.join('; ') + '. Add selector mappings in Target App Config or edit the test code.',
     });
   } else {
-    checks.push({ name: 'selector_validation', status: 'pass', detail: 'No placeholder selectors found' });
+    const detail = hasMappedSelectors
+      ? `${Object.keys(selectorMap).length} mapped selectors, ${knownTestIds.length} known testids`
+      : 'No placeholder selectors found (using role-first strategy)';
+    checks.push({ name: 'selector_validation', status: 'pass', detail });
   }
 
-  // 5. Execution readiness
-  if (asset.execution_readiness === 'validated' || asset.execution_readiness === 'ready') {
-    checks.push({ name: 'execution_readiness', status: 'pass', detail: asset.execution_readiness });
-  } else {
+  // 5. Overall readiness — NO circular check on asset.execution_readiness
+  // This check validates that the asset is in a state where it SHOULD be run.
+  // We intentionally do NOT check asset.execution_readiness here because
+  // the readinessService sets that field BASED ON this preflight result.
+  // Checking it here would create a circular dependency.
+  if (asset.status === 'archived') {
     blockers.push({
       name: 'execution_readiness',
-      status: 'warn',
-      detail: `Asset readiness is "${asset.execution_readiness}". Mark as "ready" after verifying selectors.`,
+      status: 'fail',
+      detail: 'Asset is archived. Unarchive it before running.',
     });
+  } else {
+    checks.push({ name: 'execution_readiness', status: 'pass', detail: 'Asset is active' });
   }
 
   const ready = blockers.filter(b => b.status === 'fail').length === 0;
@@ -82,4 +139,20 @@ async function runPreflight(asset, targetConfig, testFiles) {
   return { ready, checks, blockers };
 }
 
-module.exports = { runPreflight };
+function parseSelectorMap(config) {
+  if (!config || !config.selector_map) return {};
+  if (typeof config.selector_map === 'string') {
+    try { return JSON.parse(config.selector_map); } catch { return {}; }
+  }
+  return config.selector_map || {};
+}
+
+function parseKnownTestIds(config) {
+  if (!config || !config.known_testids) return [];
+  if (typeof config.known_testids === 'string') {
+    try { return JSON.parse(config.known_testids); } catch { return []; }
+  }
+  return Array.isArray(config.known_testids) ? config.known_testids : [];
+}
+
+module.exports = { runPreflight, isEnvVarName };

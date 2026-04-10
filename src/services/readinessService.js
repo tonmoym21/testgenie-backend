@@ -67,11 +67,24 @@ async function verifyReadiness(assetId, userId, projectId) {
     ]
   );
 
-  // Update asset execution_readiness
-  const newReadiness = preflight.ready ? 'validated' : 'needs_selector_mapping';
+  // Update asset execution_readiness based on preflight result
+  // Determine the right state based on what actually failed
+  let newReadiness;
+  if (preflight.ready) {
+    newReadiness = 'validated';
+  } else {
+    const failedNames = failReasons.filter(b => b.status === 'fail').map(b => b.name);
+    if (failedNames.includes('selector_validation')) {
+      newReadiness = 'needs_selector_mapping';
+    } else if (failedNames.includes('target_url') || failedNames.includes('auth_config')) {
+      newReadiness = 'draft'; // needs basic config
+    } else {
+      newReadiness = 'draft';
+    }
+  }
   await db.query('UPDATE automation_assets SET execution_readiness = $2 WHERE id = $1', [assetId, newReadiness]);
 
-  logger.info({ assetId, validationStatus, checkCount: checks.length }, 'Readiness validation persisted');
+  logger.info({ assetId, validationStatus, newReadiness, checkCount: checks.length }, 'Readiness validation persisted');
 
   return {
     validation: result.rows[0],
