@@ -1,14 +1,9 @@
 // src/utils/playwrightGenerator.js
 // Generates Playwright test files from approved scenarios
-// V2: Grounded in target app config — no blind placeholder selectors
+// V3: Aligned selector_map keys with frontend UI
 
 /**
  * Generate a single Playwright test file from a scenario.
- *
- * @param {Object} scenario - Approved coverage scenario from DB
- * @param {string[]} categories - Tags to apply
- * @param {Object|null} targetConfig - Target app config (from target_app_configs table)
- *   If null, generates a DRAFT scaffold with TODO markers instead of fake selectors.
  */
 function generatePlaywrightTest(scenario, categories = [], targetConfig = null) {
   const safeName = (scenario.title || 'untitled')
@@ -21,9 +16,8 @@ function generatePlaywrightTest(scenario, categories = [], targetConfig = null) 
 
   const preconditions = parsePreconditions(scenario);
   const inputs = parseInputs(scenario);
-  const selectorMap = targetConfig ? (targetConfig.selector_map || {}) : {};
+  const selectorMap = targetConfig ? parseSelectorMap(targetConfig) : {};
   const strategy = targetConfig ? (targetConfig.selector_strategy || 'role_first') : 'role_first';
-  const baseUrl = targetConfig ? targetConfig.base_url : "process.env.BASE_URL || 'http://localhost:3000'";
   const isDraft = !targetConfig;
 
   const steps = buildTestSteps(scenario, inputs, selectorMap, strategy, isDraft);
@@ -66,25 +60,37 @@ ${steps.map((s) => `    ${s}`).join('\n')}
 
 // ---------------------------------------------------------------------------
 // Auth setup based on target config
+// Selector map keys aligned with frontend: usernameField, passwordField,
+// loginButton, successIndicator, errorIndicator
 // ---------------------------------------------------------------------------
 function buildAuthSetup(targetConfig) {
   if (!targetConfig || targetConfig.auth_type === 'none') {
     return `    // No auth configured\n    await page.goto('/');`;
   }
 
+  const sm = parseSelectorMap(targetConfig);
+
   switch (targetConfig.auth_type) {
     case 'form_login': {
       const loginUrl = targetConfig.login_url || '/login';
-      const sm = targetConfig.selector_map || {};
-      const userSelector = sm.usernameInput || "getByLabel('Email')";
-      const passSelector = sm.passwordInput || "getByLabel('Password')";
-      const submitSelector = sm.loginButton || "getByRole('button', { name: /sign in|log in/i })";
-      return `    // Form login
+      // Check multiple key variants for backwards compatibility
+      const userSelector = sm.usernameField || sm.usernameInput || sm.emailField || "getByLabel('Email')";
+      const passSelector = sm.passwordField || sm.passwordInput || "getByLabel('Password')";
+      const submitSelector = sm.loginButton || sm.submitButton || "getByRole('button', { name: /sign in|log in/i })";
+      const successSelector = sm.successIndicator || sm.postLoginSuccess || null;
+
+      let setup = `    // Form login
     await page.goto('${loginUrl}');
     await page.${userSelector}.fill(process.env.${targetConfig.auth_username_env || 'TEST_USERNAME'} || 'test@example.com');
     await page.${passSelector}.fill(process.env.${targetConfig.auth_password_env || 'TEST_PASSWORD'} || 'password');
-    await page.${submitSelector}.click();
-    await page.waitForURL('**/*', { timeout: 10000 });`;
+    await page.${submitSelector}.click();`;
+
+      if (successSelector) {
+        setup += `\n    await expect(page.${successSelector}).toBeVisible({ timeout: 15000 });`;
+      } else {
+        setup += `\n    await page.waitForURL('**/*', { timeout: 10000 });`;
+      }
+      return setup;
     }
 
     case 'token':
@@ -153,43 +159,50 @@ function buildTestSteps(scenario, inputs, selectorMap, strategy, isDraft) {
 }
 
 // ---------------------------------------------------------------------------
-// Selector resolution — uses selector map if available, otherwise role-first
+// Selector resolution
 // ---------------------------------------------------------------------------
 function resolveSelector(logicalName, selectorMap, strategy, isDraft) {
-  // 1. Check explicit selector map first (user-provided or DOM-discovered)
-  if (selectorMap[logicalName]) {
-    return selectorMap[logicalName];
+  // 1. Check selector map with multiple key variants
+  const keyVariants = [
+    logicalName,
+    logicalName + 'Field',
+    logicalName + 'Input',
+    logicalName + 'Button',
+    logicalName + 'Indicator',
+  ];
+
+  // Also check aliases
+  const aliases = {
+    submit: ['loginButton', 'submitButton'],
+    errorMessage: ['errorIndicator', 'error'],
+    successMessage: ['successIndicator', 'success'],
+    username: ['usernameField', 'emailField'],
+    password: ['passwordField'],
+    email: ['usernameField', 'emailField'],
+  };
+
+  const allKeys = [...keyVariants, ...(aliases[logicalName] || aliases[logicalName.toLowerCase()] || [])];
+
+  for (const key of allKeys) {
+    if (selectorMap[key]) {
+      const val = selectorMap[key];
+      if (val.startsWith('getBy') || val.startsWith('locator(')) return val;
+      return `getByLabel('${val}')`;
+    }
   }
 
-  // 2. If draft (no target config), emit a clear TODO instead of fake selectors
+  // 2. Draft mode: TODO placeholder
   if (isDraft) {
     return `locator('/* TODO: Map selector for "${logicalName}" */')`;
   }
 
-  // 3. Fallback: generate a resilient selector based on strategy
-  switch (strategy) {
-    case 'testid_first':
-      return `getByTestId('${logicalName}')`;
-
-    case 'label_first':
-      return `getByLabel('${humanize(logicalName)}')`;
-
-    case 'css_fallback':
-      return `locator('[data-testid="${logicalName}"], [name="${logicalName}"], #${logicalName}')`;
-
-    case 'role_first':
-    default:
-      return selectorForRole(logicalName);
-  }
+  // 3. Fallback: role-first
+  return selectorForRole(logicalName);
 }
 
-/**
- * Generate role-first Playwright locator for common logical names.
- */
 function selectorForRole(logicalName) {
   const lower = logicalName.toLowerCase();
 
-  // Common mappings
   if (lower === 'submit' || lower === 'loginbutton') {
     return "getByRole('button', { name: /submit|save|sign in|log in|continue/i })";
   }
@@ -205,29 +218,24 @@ function selectorForRole(logicalName) {
   if (lower === 'successmessage' || lower === 'success') {
     return "getByRole('status')";
   }
-  if (lower.includes('search')) {
-    return "getByRole('searchbox')";
-  }
-  if (lower.includes('cancel')) {
-    return "getByRole('button', { name: /cancel/i })";
-  }
-
-  // Generic: try label match on humanized name
   return `getByLabel('${humanize(logicalName)}')`;
 }
 
 function humanize(str) {
-  return str
-    .replace(/([A-Z])/g, ' $1')
-    .replace(/[_-]+/g, ' ')
-    .replace(/^\s+/, '')
-    .replace(/\b\w/g, (c) => c.toUpperCase())
-    .trim();
+  return str.replace(/([A-Z])/g, ' $1').replace(/[_-]+/g, ' ').replace(/^\s+/, '').replace(/\b\w/g, c => c.toUpperCase()).trim();
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+function parseSelectorMap(config) {
+  if (!config || !config.selector_map) return {};
+  if (typeof config.selector_map === 'string') {
+    try { return JSON.parse(config.selector_map); } catch { return {}; }
+  }
+  return config.selector_map || {};
+}
 
 function parsePreconditions(scenario) {
   if (Array.isArray(scenario.preconditions)) return scenario.preconditions;
@@ -252,10 +260,6 @@ function escapeStr(s) {
 
 /**
  * Generate all Playwright tests for a list of scenarios.
- *
- * @param {Object[]} scenarios
- * @param {string[]} categories
- * @param {Object|null} targetConfig - Target app config. null = draft mode.
  */
 function generateAllPlaywrightTests(scenarios, categories = [], targetConfig = null) {
   return scenarios.map((scenario) => {

@@ -1,5 +1,6 @@
 // src/services/playwrightRunnerService.js
 // Runs Playwright spec files and captures results
+// v2: Applies selector_map sanitization at runtime before execution
 
 const { spawn, execSync } = require('child_process');
 const path = require('path');
@@ -8,8 +9,160 @@ const os = require('os');
 const db = require('../db');
 const logger = require('../utils/logger');
 const automationAssetService = require('./automationAssetService');
+const targetAppConfigService = require('./targetAppConfigService');
 
 const RUNS_BASE_DIR = path.join(os.tmpdir(), 'testforge-pw-runs');
+
+// ---------------------------------------------------------------------------
+// Runtime selector sanitizer — replaces TODO placeholders with real locators
+// ---------------------------------------------------------------------------
+
+/**
+ * Replace /* TODO: Map selector for "xxx" * / placeholders with real locators
+ * from the target config's selector_map, or with role-first fallbacks.
+ */
+function sanitizeTestCode(code, targetConfig) {
+  if (!code) return code;
+
+  const selectorMap = parseSelectorMap(targetConfig);
+  const strategy = targetConfig?.selector_strategy || 'role_first';
+
+  // Match: page.locator('/* TODO: Map selector for "logicalName" */')
+  // and: page.locator("/* TODO: Map selector for \"logicalName\" */")
+  const todoPattern = /\.locator\(['"]\/\*\s*TODO:\s*Map selector for\s*\\?"([^"\\]+)\\?"\s*\*\/['"]\)/g;
+
+  return code.replace(todoPattern, (match, logicalName) => {
+    const resolved = resolveSelector(logicalName, selectorMap, strategy);
+    return `.${resolved}`;
+  });
+}
+
+/**
+ * Resolve a logical selector name to a Playwright locator.
+ * Checks selector_map first, then uses role-first fallbacks.
+ */
+function resolveSelector(logicalName, selectorMap, strategy) {
+  // Check selector_map with multiple key variants
+  const keyVariants = [
+    logicalName,
+    logicalName + 'Field',
+    logicalName + 'Input',
+    logicalName + 'Button',
+    logicalName + 'Indicator',
+    camelCase(logicalName),
+  ];
+
+  for (const key of keyVariants) {
+    if (selectorMap[key]) {
+      const val = selectorMap[key];
+      // If the value already starts with getBy/locator, use as-is
+      if (val.startsWith('getBy') || val.startsWith('locator(')) {
+        return val;
+      }
+      // Otherwise wrap in getByLabel as the most common case
+      return `getByLabel('${val}')`;
+    }
+  }
+
+  // Also check reverse: if logicalName is "submit", check for "loginButton"
+  const aliases = {
+    submit: ['loginButton', 'submitButton'],
+    errorMessage: ['errorIndicator', 'error'],
+    successMessage: ['successIndicator', 'success', 'postLoginSuccess'],
+    username: ['usernameField', 'emailField'],
+    password: ['passwordField'],
+    email: ['usernameField', 'emailField'],
+  };
+
+  const aliasList = aliases[logicalName] || aliases[logicalName.toLowerCase()] || [];
+  for (const alias of aliasList) {
+    if (selectorMap[alias]) {
+      const val = selectorMap[alias];
+      if (val.startsWith('getBy') || val.startsWith('locator(')) return val;
+      return `getByLabel('${val}')`;
+    }
+  }
+
+  // Fallback: role-first strategy
+  return selectorForRole(logicalName, strategy);
+}
+
+function selectorForRole(logicalName, strategy) {
+  const lower = logicalName.toLowerCase();
+
+  if (strategy === 'testid_first') return `getByTestId('${logicalName}')`;
+  if (strategy === 'label_first') return `getByLabel('${humanize(logicalName)}')`;
+
+  // role_first (default)
+  if (lower === 'submit' || lower === 'loginbutton' || lower === 'login') {
+    return "getByRole('button', { name: /submit|save|sign in|log in|continue/i })";
+  }
+  if (lower.includes('email') || lower.includes('username')) {
+    return "getByRole('textbox', { name: /email|username/i })";
+  }
+  if (lower.includes('password')) {
+    return "getByLabel(/password/i)";
+  }
+  if (lower === 'errormessage' || lower === 'error') {
+    return "getByRole('alert')";
+  }
+  if (lower === 'successmessage' || lower === 'success') {
+    return "getByRole('status')";
+  }
+  return `getByLabel('${humanize(logicalName)}')`;
+}
+
+function humanize(str) {
+  return str.replace(/([A-Z])/g, ' $1').replace(/[_-]+/g, ' ').replace(/^\s+/, '').replace(/\b\w/g, c => c.toUpperCase()).trim();
+}
+
+function camelCase(str) {
+  return str.replace(/[-_](\w)/g, (_, c) => c.toUpperCase());
+}
+
+function parseSelectorMap(config) {
+  if (!config || !config.selector_map) return {};
+  if (typeof config.selector_map === 'string') {
+    try { return JSON.parse(config.selector_map); } catch { return {}; }
+  }
+  return config.selector_map || {};
+}
+
+// ---------------------------------------------------------------------------
+// Also sanitize the auth setup TODO comments
+// ---------------------------------------------------------------------------
+
+function sanitizeAuthSetup(code, targetConfig) {
+  if (!code || !targetConfig) return code;
+
+  // Fix auth_username_env / auth_password_env references
+  if (targetConfig.auth_username_env) {
+    code = code.replace(/process\.env\.TEST_USERNAME/g, `process.env.${targetConfig.auth_username_env}`);
+  }
+  if (targetConfig.auth_password_env) {
+    code = code.replace(/process\.env\.TEST_PASSWORD/g, `process.env.${targetConfig.auth_password_env}`);
+  }
+  if (targetConfig.auth_token_env) {
+    code = code.replace(/process\.env\.TEST_AUTH_TOKEN/g, `process.env.${targetConfig.auth_token_env}`);
+  }
+
+  return code;
+}
+
+// ---------------------------------------------------------------------------
+// Full sanitization pipeline
+// ---------------------------------------------------------------------------
+
+function sanitize(code, targetConfig) {
+  if (!code) return code;
+  let result = sanitizeTestCode(code, targetConfig);
+  result = sanitizeAuthSetup(result, targetConfig);
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Runner
+// ---------------------------------------------------------------------------
 
 /**
  * Create a run record and execute Playwright tests for an automation asset.
@@ -18,18 +171,29 @@ async function runAsset(assetId, userId, { baseUrl, browser = 'chromium', catego
   const asset = await automationAssetService.getAsset(assetId, userId);
   if (!asset) throw Object.assign(new Error('Asset not found'), { status: 404 });
 
+  // Resolve target config for sanitization
+  let targetConfig = null;
+  if (asset.target_app_config_id) {
+    targetConfig = await targetAppConfigService.get(asset.target_app_config_id, userId);
+  }
+  if (!targetConfig) {
+    targetConfig = await targetAppConfigService.getDefault(asset.project_id, userId);
+  }
+
+  const effectiveBaseUrl = baseUrl || (targetConfig && targetConfig.base_url) || null;
+
   const runResult = await db.query(
     `INSERT INTO playwright_runs
        (automation_asset_id, project_id, triggered_by, run_type, category_filter, status, browser, base_url, readiness_validation_id, started_at)
      VALUES ($1, $2, $3, $4, $5, 'running', $6, $7, $8, NOW())
      RETURNING *`,
-    [assetId, asset.project_id, userId, runType, categoryFilter || null, browser, baseUrl || null, readinessValidationId || null]
+    [assetId, asset.project_id, userId, runType, categoryFilter || null, browser, effectiveBaseUrl || null, readinessValidationId || null]
   );
   const run = runResult.rows[0];
 
   await automationAssetService.updateLastRun(assetId, 'running', new Date().toISOString());
 
-  executePlaywright(run, asset).catch((err) => {
+  executePlaywright(run, asset, targetConfig).catch((err) => {
     logger.error({ err, runId: run.id }, 'Playwright execution failed unexpectedly');
     db.query(
       `UPDATE playwright_runs SET status = 'failed', finished_at = NOW(), error_summary = $2 WHERE id = $1`,
@@ -44,7 +208,7 @@ async function runAsset(assetId, userId, { baseUrl, browser = 'chromium', catego
 /**
  * Actually run Playwright in a temp dir.
  */
-async function executePlaywright(run, asset) {
+async function executePlaywright(run, asset, targetConfig) {
   const runDir = path.join(RUNS_BASE_DIR, `run-${run.id}`);
   const testsDir = path.join(runDir, 'tests');
   const resultsDir = path.join(runDir, 'results');
@@ -53,7 +217,7 @@ async function executePlaywright(run, asset) {
     fs.mkdirSync(testsDir, { recursive: true });
     fs.mkdirSync(resultsDir, { recursive: true });
 
-    const configCode = asset.config_code || generateDefaultConfig(run.base_url, run.browser);
+    const configCode = asset.config_code || generateDefaultConfig(run.base_url || (targetConfig && targetConfig.base_url), run.browser);
     fs.writeFileSync(path.join(runDir, 'playwright.config.ts'), configCode);
 
     const sourceIds = typeof asset.source_test_ids === 'string'
@@ -61,10 +225,18 @@ async function executePlaywright(run, asset) {
 
     if (sourceIds.length > 0) {
       const testRows = await db.query('SELECT file_name, code FROM playwright_tests WHERE id = ANY($1::int[])', [sourceIds]);
-      for (const row of testRows.rows) fs.writeFileSync(path.join(testsDir, row.file_name), row.code);
+      for (const row of testRows.rows) {
+        // SANITIZE: replace TODO selectors with real locators from target config
+        const cleanCode = sanitize(row.code, targetConfig);
+        fs.writeFileSync(path.join(testsDir, row.file_name), cleanCode);
+      }
     } else if (asset.story_id) {
       const testRows = await db.query('SELECT file_name, code FROM playwright_tests WHERE story_id = $1 AND project_id = $2', [asset.story_id, asset.project_id]);
-      for (const row of testRows.rows) fs.writeFileSync(path.join(testsDir, row.file_name), row.code);
+      for (const row of testRows.rows) {
+        // SANITIZE: replace TODO selectors with real locators from target config
+        const cleanCode = sanitize(row.code, targetConfig);
+        fs.writeFileSync(path.join(testsDir, row.file_name), cleanCode);
+      }
     }
 
     const writtenFiles = fs.readdirSync(testsDir).filter((f) => f.endsWith('.spec.ts'));
@@ -72,10 +244,19 @@ async function executePlaywright(run, asset) {
 
     await bootstrapRunDir(runDir, run.id);
 
-    logger.info({ runId: run.id, fileCount: writtenFiles.length, dir: runDir }, 'Running Playwright');
+    logger.info({ runId: run.id, fileCount: writtenFiles.length, dir: runDir, hasSanitization: !!targetConfig }, 'Running Playwright');
 
     const startMs = Date.now();
-    const { stdout, stderr, exitCode } = await spawnPlaywright(runDir, run.browser, run.base_url);
+
+    // Build env with credential env vars if configured
+    const extraEnv = {};
+    if (targetConfig) {
+      if (run.base_url || targetConfig.base_url) {
+        extraEnv.BASE_URL = run.base_url || targetConfig.base_url;
+      }
+    }
+
+    const { stdout, stderr, exitCode } = await spawnPlaywright(runDir, run.browser, run.base_url, extraEnv);
     const durationMs = Date.now() - startMs;
 
     let parsed = { total: writtenFiles.length, passed: 0, failed: 0, skipped: 0 };
@@ -115,7 +296,6 @@ async function executePlaywright(run, asset) {
 
     await automationAssetService.updateLastRun(run.automation_asset_id, finalStatus, new Date().toISOString());
 
-    // Update execution_run_items if this was part of a bulk run
     await db.query(
       `UPDATE execution_run_items SET
          item_status = $2, duration_ms = $3, output_log = $4, finished_at = NOW()
@@ -135,7 +315,6 @@ async function executePlaywright(run, asset) {
 async function bulkRunWithItems(assetIds, userId, options = {}) {
   const { projectId, readinessResults = [], baseUrl, browser = 'chromium' } = options;
 
-  // Create a parent bulk run record
   const parentRun = await db.query(
     `INSERT INTO playwright_runs
        (automation_asset_id, project_id, triggered_by, run_type, status, browser, base_url, started_at)
@@ -145,10 +324,7 @@ async function bulkRunWithItems(assetIds, userId, options = {}) {
   );
   const bulkRun = parentRun.rows[0];
 
-  // Create execution_run_items for each asset
   for (const assetId of assetIds) {
-    const readiness = readinessResults.find(r => r.assetId === assetId);
-    const validationId = readiness?.validation?.id || null;
     await db.query(
       `INSERT INTO execution_run_items (execution_run_id, automation_asset_id, item_status)
        VALUES ($1, $2, 'queued')`,
@@ -156,7 +332,6 @@ async function bulkRunWithItems(assetIds, userId, options = {}) {
     );
   }
 
-  // Execute each asset
   const runs = [];
   let passed = 0, failed = 0;
   for (const id of assetIds) {
@@ -180,7 +355,6 @@ async function bulkRunWithItems(assetIds, userId, options = {}) {
     }
   }
 
-  // Update parent run status after all items queued (actual completion is async)
   const finalStatus = failed === assetIds.length ? 'failed' : 'running';
   await db.query('UPDATE playwright_runs SET status = $2, total_tests = $3 WHERE id = $1', [bulkRun.id, finalStatus, assetIds.length]);
 
@@ -212,10 +386,10 @@ async function bootstrapRunDir(runDir, runId) {
   }
 }
 
-function spawnPlaywright(cwd, browser = 'chromium', baseUrl) {
+function spawnPlaywright(cwd, browser = 'chromium', baseUrl, extraEnv = {}) {
   return new Promise((resolve) => {
     const args = ['playwright', 'test', '--config=playwright.config.ts', '--reporter=line', `--project=${browser}`];
-    const env = { ...process.env, CI: 'true' };
+    const env = { ...process.env, CI: 'true', ...extraEnv };
     if (baseUrl) env.BASE_URL = baseUrl;
     if (process.env.PLAYWRIGHT_BROWSERS_PATH) env.PLAYWRIGHT_BROWSERS_PATH = process.env.PLAYWRIGHT_BROWSERS_PATH;
 
