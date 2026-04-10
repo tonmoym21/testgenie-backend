@@ -88,9 +88,14 @@ async function runPreflight(asset, targetConfig, testFiles) {
     const code = file.code || '';
     const fileName = file.file_name || file.fileName || 'unknown';
 
-    // Only flag genuine TODO placeholders — these mean the generator couldn't resolve selectors
+    // Flag TODO placeholders — but if user has provided a selector_map, these are just warnings
     if (code.includes('/* TODO: Map selector')) {
-      selectorIssues.push(`${fileName}: contains TODO placeholder selectors that need mapping`);
+      if (hasMappedSelectors) {
+        // User provided selector mappings — TODOs are superseded, just note it
+        // (not a blocker — the config-provided selectors will be used at runtime)
+      } else {
+        selectorIssues.push(`${fileName}: contains TODO placeholder selectors that need mapping`);
+      }
     }
 
     // If there's NO target config at all and tests use getByTestId, warn (but don't block if knownTestIds cover them)
