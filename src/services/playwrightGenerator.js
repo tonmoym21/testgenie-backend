@@ -26,6 +26,7 @@ You follow these rules strictly:
 - Max 10 steps per test
 - Include clear assertions with expect()
 - No hardcoded waits — use Playwright auto-waiting
+- For post-login success assertions, NEVER use getByRole('status') — instead assert URL changed (e.g., await expect(page).not.toHaveURL('/login')) or check for a known dashboard element
 - Source auth credentials from process.env, never hardcode them`;
 
 function buildGenerationPrompt(scenarios, categories, targetConfig) {

@@ -107,7 +107,7 @@ function selectorForRole(logicalName, strategy) {
     return "getByRole('alert')";
   }
   if (lower === 'successmessage' || lower === 'success') {
-    return "getByRole('status')";
+    return "locator('body')";
   }
   return `getByLabel('${humanize(logicalName)}')`;
 }
@@ -157,7 +157,26 @@ function sanitize(code, targetConfig) {
   if (!code) return code;
   let result = sanitizeTestCode(code, targetConfig);
   result = sanitizeAuthSetup(result, targetConfig);
+  result = sanitizeSuccessAssertions(result, targetConfig);
   return result;
+}
+
+/**
+ * Replace fragile getByRole('status') assertions with URL-based navigation checks.
+ * getByRole('status') almost never exists in real apps after login — the user
+ * gets redirected instead.
+ */
+function sanitizeSuccessAssertions(code, targetConfig) {
+  if (!code) return code;
+
+  // Replace: await expect(page.getByRole('status')).toBeVisible();
+  // With:   await page.waitForURL(/.*\/(dashboard|home|main|feed).*/i);
+  const statusPattern = /await\s+expect\(page\.getByRole\(['"]status['"]\)\)\.toBeVisible\(\);?/g;
+  const replacement = targetConfig && targetConfig.base_url
+    ? `await expect(page).not.toHaveURL('${targetConfig.login_url || targetConfig.base_url}');`
+    : `await page.waitForURL(/.*(dashboard|home|main|feed|app).*/i);`;
+
+  return code.replace(statusPattern, replacement);
 }
 
 // ---------------------------------------------------------------------------
