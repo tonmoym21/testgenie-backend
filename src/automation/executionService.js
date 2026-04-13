@@ -9,7 +9,7 @@ const logger = require('../utils/logger');
  * @param {number} userId - The user running the test
  * @param {number|null} projectId - Optional project to associate with
  * @param {Object} testDef - The validated test definition
- * @returns {Object} - Execution result
+ * @returns {Object} - Execution result including rawResponse for API tests
  */
 async function executeTest(userId, projectId, testDef) {
   logger.info({ userId, testName: testDef.name, type: testDef.type }, 'Executing test');
@@ -29,11 +29,11 @@ async function executeTest(userId, projectId, testDef) {
       throw new Error(`Unknown test type: ${testDef.type}`);
   }
 
-  // Store execution result in database
+  // Store execution result in database (including raw_response for API tests)
   const stored = await db.query(
     `INSERT INTO test_executions
-       (user_id, project_id, test_name, test_type, test_definition, status, error, duration_ms, logs, screenshots, completed_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       (user_id, project_id, test_name, test_type, test_definition, status, error, duration_ms, logs, screenshots, raw_response, completed_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
      RETURNING id, test_name AS "testName", test_type AS "testType", status, duration_ms AS "durationMs", completed_at AS "completedAt"`,
     [
       userId,
@@ -46,6 +46,7 @@ async function executeTest(userId, projectId, testDef) {
       result.duration,
       JSON.stringify(result.logs),
       JSON.stringify(result.screenshots),
+      result.rawResponse ? JSON.stringify(result.rawResponse) : null,
       result.completedAt,
     ]
   );
@@ -106,7 +107,7 @@ async function getExecutions(userId, { projectId, status, page = 1, limit = 20 }
 }
 
 /**
- * Get a single execution with full logs.
+ * Get a single execution with full logs and raw_response.
  */
 async function getExecution(userId, executionId) {
   const result = await db.query(
@@ -120,6 +121,7 @@ async function getExecution(userId, executionId) {
         duration_ms AS "durationMs",
         logs,
         screenshots,
+        raw_response AS "rawResponse",
         completed_at AS "completedAt"
       FROM test_executions
       WHERE id = $1 AND user_id = $2`,
