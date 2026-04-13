@@ -2,6 +2,7 @@ const { Router } = require('express');
 const { z } = require('zod');
 const { validate } = require('../middleware/validate');
 const { authLimiter } = require('../middleware/rateLimiter');
+const { authenticate } = require('../middleware/auth');
 const authService = require('../services/authService');
 
 const router = Router();
@@ -15,6 +16,17 @@ const registerSchema = z.object({
     .max(128)
     .regex(/[a-zA-Z]/, 'Password must contain at least one letter')
     .regex(/[0-9]/, 'Password must contain at least one number'),
+});
+
+const registerWithInviteSchema = z.object({
+  email: z.string().email().max(255),
+  password: z
+    .string()
+    .min(8, 'Password must be at least 8 characters')
+    .max(128)
+    .regex(/[a-zA-Z]/, 'Password must contain at least one letter')
+    .regex(/[0-9]/, 'Password must contain at least one number'),
+  inviteToken: z.string().min(1),
 });
 
 const loginSchema = z.object({
@@ -36,7 +48,29 @@ router.post('/register', authLimiter, validate(registerSchema), async (req, res,
     const user = await authService.register(req.body.email, req.body.password);
     res.status(201).json({
       message: 'Registration successful',
-      user: { id: user.id, email: user.email },
+      user: { id: user.id, email: user.email, organizationId: user.organization_id },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/auth/register-with-invite - Register and accept invite in one step
+router.post('/register-with-invite', authLimiter, validate(registerWithInviteSchema), async (req, res, next) => {
+  try {
+    const result = await authService.registerWithInvite(
+      req.body.email,
+      req.body.password,
+      req.body.inviteToken
+    );
+    res.status(201).json({
+      message: 'Registration successful',
+      user: {
+        id: result.user.id,
+        email: result.user.email,
+        organizationId: result.user.organization_id,
+      },
+      organization: result.organization,
     });
   } catch (err) {
     next(err);
@@ -64,12 +98,24 @@ router.post('/refresh', validate(refreshSchema), async (req, res, next) => {
 });
 
 // POST /api/auth/logout
-// NOTE: No `authenticate` middleware — users must be able to log out even with expired access tokens.
-// The refresh token in the body is sufficient to identify the session to invalidate.
 router.post('/logout', validate(logoutSchema), async (req, res, next) => {
   try {
     await authService.logout(req.body.refreshToken);
     res.json({ message: 'Logged out' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/auth/me - Get current user info including org
+router.get('/me', authenticate, async (req, res, next) => {
+  try {
+    const orgInfo = await authService.getUserOrgInfo(req.user.id);
+    res.json({
+      id: req.user.id,
+      email: req.user.email,
+      organization: orgInfo,
+    });
   } catch (err) {
     next(err);
   }

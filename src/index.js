@@ -26,6 +26,7 @@ const reportsRoutes = require('./routes/reports');
 const collectionsRoutes = require('./routes/collections');
 const environmentsRoutes = require('./routes/environments');
 const schedulesRoutes = require('./routes/schedules');
+const teamRoutes = require('./routes/team');
 
 const app = express();
 
@@ -65,6 +66,7 @@ app.use('/api/reports', reportsRoutes);
 app.use('/api/collections', collectionsRoutes);
 app.use('/api/environments', environmentsRoutes);
 app.use('/api/schedules', schedulesRoutes);
+app.use('/api/team', teamRoutes);
 
 // 404 catch-all
 app.use((_req, res) => {
