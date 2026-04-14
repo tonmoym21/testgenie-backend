@@ -15,12 +15,18 @@ const RESEND_API_URL = 'https://api.resend.com/emails';
  */
 async function sendEmail({ to, subject, html, text }) {
   const apiKey = process.env.RESEND_API_KEY;
-  const fromEmail = process.env.EMAIL_FROM || 'TestForge <noreply@testforge.dev>';
+  const fromEmail = process.env.EMAIL_FROM || 'TestForge <onboarding@resend.dev>';
 
   if (!apiKey) {
-    logger.warn({ to, subject }, 'RESEND_API_KEY not configured, skipping email');
-    return { success: false, reason: 'Email not configured' };
+    console.log('[EMAIL] RESEND_API_KEY not configured - email skipped');
+    console.log('[EMAIL] Would send to:', to);
+    console.log('[EMAIL] Subject:', subject);
+    return { success: false, reason: 'RESEND_API_KEY not configured' };
   }
+
+  console.log('[EMAIL] Attempting to send email to:', to);
+  console.log('[EMAIL] From:', fromEmail);
+  console.log('[EMAIL] Subject:', subject);
 
   try {
     const response = await fetch(RESEND_API_URL, {
@@ -39,15 +45,19 @@ async function sendEmail({ to, subject, html, text }) {
     });
 
     const data = await response.json();
+    console.log('[EMAIL] Resend API response:', JSON.stringify(data));
 
     if (!response.ok) {
+      console.error('[EMAIL] Failed to send email:', data);
       logger.error({ to, subject, error: data }, 'Failed to send email');
-      return { success: false, reason: data.message || 'Failed to send email' };
+      return { success: false, reason: data.message || data.error?.message || 'Failed to send email' };
     }
 
+    console.log('[EMAIL] Email sent successfully, ID:', data.id);
     logger.info({ to, subject, id: data.id }, 'Email sent successfully');
     return { success: true, id: data.id };
   } catch (err) {
+    console.error('[EMAIL] Email service error:', err.message);
     logger.error({ err, to, subject }, 'Email service error');
     return { success: false, reason: err.message };
   }
@@ -59,6 +69,11 @@ async function sendEmail({ to, subject, html, text }) {
 async function sendInviteEmail({ email, inviteUrl, organizationName, role, inviterEmail }) {
   const appUrl = process.env.FRONTEND_URL || 'https://testforge-app.vercel.app';
   const fullInviteUrl = `${appUrl}${inviteUrl}`;
+
+  console.log('[EMAIL] Preparing invite email');
+  console.log('[EMAIL] To:', email);
+  console.log('[EMAIL] Org:', organizationName);
+  console.log('[EMAIL] Invite URL:', fullInviteUrl);
 
   const subject = `You're invited to join ${organizationName} on TestForge`;
 
