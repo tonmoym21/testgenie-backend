@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const db = require('../db');
 const { ConflictError, NotFoundError, ForbiddenError, ValidationError } = require('../utils/apiError');
 const logger = require('../utils/logger');
+const emailService = require('./emailService');
 
 // Role hierarchy for permission checks
 const ROLE_HIERARCHY = { owner: 4, admin: 3, member: 2, viewer: 1 };
@@ -292,8 +293,10 @@ async function createInvite(orgId, email, role, invitedBy) {
     throw new ValidationError([{ field: 'role', message: 'Invalid role' }]);
   }
 
-  // Check if domain restriction is enabled
+  // Get org info for email
   const org = await getOrganization(orgId);
+
+  // Check if domain restriction is enabled
   if (org.domain_restriction_enabled) {
     const emailDomain = email.split('@')[1];
     const allowedResult = await db.query(
@@ -344,10 +347,26 @@ async function createInvite(orgId, email, role, invitedBy) {
 
   await logAuditEvent(orgId, invitedBy, 'invite_sent', 'invite', result.rows[0].id, { email, role });
 
+  // Get inviter's email
+  const inviterResult = await db.query('SELECT email FROM users WHERE id = $1', [invitedBy]);
+  const inviterEmail = inviterResult.rows[0]?.email || 'A team member';
+
+  // Send invite email
+  const inviteUrl = `/accept-invite?token=${token}`;
+  const emailResult = await emailService.sendInviteEmail({
+    email,
+    inviteUrl,
+    organizationName: org.name,
+    role,
+    inviterEmail,
+  });
+
   return {
     ...result.rows[0],
-    token, // Return token for email sending
-    inviteUrl: `/accept-invite?token=${token}`,
+    token,
+    inviteUrl,
+    emailSent: emailResult.success,
+    emailError: emailResult.reason,
   };
 }
 
@@ -403,11 +422,30 @@ async function resendInvite(orgId, inviteId, actorId) {
 
   await logAuditEvent(orgId, actorId, 'invite_resent', 'invite', inviteId, { email: invite.rows[0].email });
 
+  // Get org info for email
+  const org = await getOrganization(orgId);
+  
+  // Get inviter's email
+  const inviterResult = await db.query('SELECT email FROM users WHERE id = $1', [actorId]);
+  const inviterEmail = inviterResult.rows[0]?.email || 'A team member';
+
+  // Send invite email again
+  const inviteUrl = `/accept-invite?token=${token}`;
+  const emailResult = await emailService.sendInviteEmail({
+    email: invite.rows[0].email,
+    inviteUrl,
+    organizationName: org.name,
+    role: invite.rows[0].role,
+    inviterEmail,
+  });
+
   return {
     id: inviteId,
     email: invite.rows[0].email,
     token,
-    inviteUrl: `/accept-invite?token=${token}`,
+    inviteUrl,
+    emailSent: emailResult.success,
+    emailError: emailResult.reason,
   };
 }
 
@@ -423,7 +461,7 @@ async function revokeInvite(orgId, inviteId, actorId) {
   }
 
   await db.query(
-    `UPDATE organization_invites SET status = 'revoked', revoked_at = NOW() WHERE id = $1`,
+    `UPDATE organization_invites SET status = 'revoked' WHERE id = $1`,
     [inviteId]
   );
 
@@ -486,6 +524,12 @@ async function acceptInvite(token, userId) {
     role: inv.role,
   });
 
+  // Send welcome email
+  emailService.sendWelcomeEmail({
+    email: inv.email,
+    organizationName: inv.org_name,
+  });
+
   return {
     organizationId: inv.organization_id,
     organizationName: inv.org_name,
@@ -521,11 +565,10 @@ async function getInviteByToken(token) {
 
 async function listAllowedDomains(orgId) {
   const result = await db.query(
-    `SELECT d.id, d.domain, d.created_at, u.email as created_by_email
-     FROM allowed_email_domains d
-     LEFT JOIN users u ON d.created_by = u.id
-     WHERE d.organization_id = $1
-     ORDER BY d.domain`,
+    `SELECT id, domain, created_at
+     FROM allowed_email_domains
+     WHERE organization_id = $1
+     ORDER BY domain`,
     [orgId]
   );
   return result.rows;
@@ -541,10 +584,10 @@ async function addAllowedDomain(orgId, domain, actorId) {
 
   try {
     const result = await db.query(
-      `INSERT INTO allowed_email_domains (organization_id, domain, created_by)
-       VALUES ($1, $2, $3)
+      `INSERT INTO allowed_email_domains (organization_id, domain)
+       VALUES ($1, $2)
        RETURNING id, domain, created_at`,
-      [orgId, domain, actorId]
+      [orgId, domain]
     );
 
     await logAuditEvent(orgId, actorId, 'domain_added', 'domain', result.rows[0].id, { domain });
@@ -579,8 +622,8 @@ async function removeAllowedDomain(orgId, domainId, actorId) {
 async function logAuditEvent(orgId, actorId, action, targetType, targetId, details, req = null) {
   try {
     await db.query(
-      `INSERT INTO team_audit_logs (organization_id, actor_id, action, target_type, target_id, details, ip_address, user_agent)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      `INSERT INTO team_audit_logs (organization_id, actor_id, action, target_type, target_id, details)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
       [
         orgId,
         actorId,
@@ -588,8 +631,6 @@ async function logAuditEvent(orgId, actorId, action, targetType, targetId, detai
         targetType,
         String(targetId),
         JSON.stringify(details),
-        req?.ip || null,
-        req?.get?.('user-agent') || null,
       ]
     );
   } catch (err) {

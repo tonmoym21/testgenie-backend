@@ -1,5 +1,5 @@
 /**
- * Fix schema - allow null domain in organizations
+ * Fix schema - add all missing columns
  * 
  * Usage: node fix-schema.js <DATABASE_URL>
  */
@@ -49,29 +49,37 @@ async function fixSchema() {
       `);
       console.log('  ✓ Created organizations table');
     } else {
-      // Make domain nullable if it has NOT NULL constraint
-      console.log('  Checking domain column constraints...');
-      await client.query(`
-        ALTER TABLE organizations ALTER COLUMN domain DROP NOT NULL;
-      `);
-      console.log('  ✓ Made domain column nullable');
+      // Make domain nullable
+      try {
+        await client.query(`ALTER TABLE organizations ALTER COLUMN domain DROP NOT NULL;`);
+        console.log('  ✓ Made domain column nullable');
+      } catch (e) {
+        console.log('  ✓ domain already nullable');
+      }
 
-      // Add missing column if needed
-      const colCheck = await client.query(`
-        SELECT EXISTS (
-          SELECT FROM information_schema.columns 
-          WHERE table_name = 'organizations' AND column_name = 'domain_restriction_enabled'
-        );
-      `);
-      
-      if (!colCheck.rows[0].exists) {
-        await client.query(`
-          ALTER TABLE organizations 
-          ADD COLUMN domain_restriction_enabled BOOLEAN DEFAULT false;
-        `);
-        console.log('  ✓ Added domain_restriction_enabled column');
-      } else {
-        console.log('  ✓ domain_restriction_enabled column exists');
+      // Add missing columns to organizations
+      const orgCols = [
+        { name: 'logo_url', sql: 'TEXT' },
+        { name: 'settings', sql: "JSONB DEFAULT '{}'" },
+        { name: 'domain_restriction_enabled', sql: 'BOOLEAN DEFAULT false' },
+        { name: 'created_at', sql: 'TIMESTAMPTZ DEFAULT NOW()' },
+        { name: 'updated_at', sql: 'TIMESTAMPTZ DEFAULT NOW()' }
+      ];
+
+      for (const col of orgCols) {
+        const colExists = await client.query(`
+          SELECT EXISTS (
+            SELECT FROM information_schema.columns 
+            WHERE table_name = 'organizations' AND column_name = $1
+          );
+        `, [col.name]);
+
+        if (!colExists.rows[0].exists) {
+          await client.query(`ALTER TABLE organizations ADD COLUMN ${col.name} ${col.sql};`);
+          console.log(`  ✓ Added organizations.${col.name}`);
+        } else {
+          console.log(`  ✓ organizations.${col.name} exists`);
+        }
       }
     }
 
@@ -198,10 +206,16 @@ async function fixSchema() {
           details JSONB DEFAULT '{}',
           created_at TIMESTAMPTZ DEFAULT NOW()
         );
-        CREATE INDEX idx_audit_org ON team_audit_logs(organization_id);
-        CREATE INDEX idx_audit_created ON team_audit_logs(created_at DESC);
       `);
       console.log('  ✓ Created team_audit_logs table');
+      
+      // Create indexes
+      try {
+        await client.query(`CREATE INDEX idx_audit_org ON team_audit_logs(organization_id);`);
+        await client.query(`CREATE INDEX idx_audit_created ON team_audit_logs(created_at DESC);`);
+      } catch (e) {
+        // Indexes might already exist
+      }
     } else {
       console.log('  ✓ team_audit_logs table exists');
     }
