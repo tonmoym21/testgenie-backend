@@ -1,240 +1,276 @@
-/**
- * Email Service using Resend
- * 
- * Free tier: 3,000 emails/month
- * Setup: https://resend.com → Create API key → Add to Railway env vars
- */
-
+const db = require('../db');
 const logger = require('../utils/logger');
 
-// Resend API endpoint
-const RESEND_API_URL = 'https://api.resend.com/emails';
+/**
+ * Email Service
+ * Handles email queuing and delivery for run reports
+ * Supports Nodemailer with configurable providers (SMTP, SendGrid, etc.)
+ */
+
+let transporter = null;
 
 /**
- * Send an email using Resend API
+ * Initialize email transporter based on config
  */
-async function sendEmail({ to, subject, html, text }) {
-  const apiKey = process.env.RESEND_API_KEY;
-  const fromEmail = process.env.EMAIL_FROM || 'TestForge <onboarding@resend.dev>';
-
-  if (!apiKey) {
-    console.log('[EMAIL] RESEND_API_KEY not configured - email skipped');
-    console.log('[EMAIL] Would send to:', to);
-    console.log('[EMAIL] Subject:', subject);
-    return { success: false, reason: 'RESEND_API_KEY not configured' };
+async function initTransporter() {
+  if (transporter) return transporter;
+  
+  // Check if email is configured
+  const smtpHost = process.env.SMTP_HOST;
+  const sendgridKey = process.env.SENDGRID_API_KEY;
+  
+  if (!smtpHost && !sendgridKey) {
+    logger.warn('Email not configured - SMTP_HOST or SENDGRID_API_KEY required');
+    return null;
   }
-
-  console.log('[EMAIL] Attempting to send email to:', to);
-  console.log('[EMAIL] From:', fromEmail);
-  console.log('[EMAIL] Subject:', subject);
-
+  
   try {
-    const response = await fetch(RESEND_API_URL, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        from: fromEmail,
-        to: Array.isArray(to) ? to : [to],
-        subject,
-        html,
-        text,
-      }),
-    });
-
-    const data = await response.json();
-    console.log('[EMAIL] Resend API response:', JSON.stringify(data));
-
-    if (!response.ok) {
-      console.error('[EMAIL] Failed to send email:', data);
-      logger.error({ to, subject, error: data }, 'Failed to send email');
-      return { success: false, reason: data.message || data.error?.message || 'Failed to send email' };
+    const nodemailer = require('nodemailer');
+    
+    if (sendgridKey) {
+      // SendGrid transport
+      transporter = nodemailer.createTransport({
+        host: 'smtp.sendgrid.net',
+        port: 587,
+        auth: {
+          user: 'apikey',
+          pass: sendgridKey
+        }
+      });
+    } else {
+      // Generic SMTP transport
+      transporter = nodemailer.createTransport({
+        host: smtpHost,
+        port: parseInt(process.env.SMTP_PORT || '587'),
+        secure: process.env.SMTP_SECURE === 'true',
+        auth: process.env.SMTP_USER ? {
+          user: process.env.SMTP_USER,
+          pass: process.env.SMTP_PASS
+        } : undefined
+      });
     }
-
-    console.log('[EMAIL] Email sent successfully, ID:', data.id);
-    logger.info({ to, subject, id: data.id }, 'Email sent successfully');
-    return { success: true, id: data.id };
+    
+    await transporter.verify();
+    logger.info('Email transporter initialized');
+    return transporter;
   } catch (err) {
-    console.error('[EMAIL] Email service error:', err.message);
-    logger.error({ err, to, subject }, 'Email service error');
-    return { success: false, reason: err.message };
+    logger.error({ err: err.message }, 'Failed to initialize email transporter');
+    return null;
   }
 }
 
 /**
- * Send team invite email
+ * Queue an email for delivery
  */
-async function sendInviteEmail({ email, inviteUrl, organizationName, role, inviterEmail }) {
-  const appUrl = process.env.FRONTEND_URL || 'https://testforge-app.vercel.app';
-  const fullInviteUrl = `${appUrl}${inviteUrl}`;
-
-  console.log('[EMAIL] Preparing invite email');
-  console.log('[EMAIL] To:', email);
-  console.log('[EMAIL] Org:', organizationName);
-  console.log('[EMAIL] Invite URL:', fullInviteUrl);
-
-  const subject = `You're invited to join ${organizationName} on TestForge`;
-
-  const html = `
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Join ${organizationName} on TestForge</title>
-</head>
-<body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; background-color: #f4f4f5;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f4f4f5; padding: 40px 20px;">
-    <tr>
-      <td align="center">
-        <table width="600" cellpadding="0" cellspacing="0" style="background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
-          <!-- Header -->
-          <tr>
-            <td style="background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 100%); padding: 32px 40px; text-align: center;">
-              <h1 style="margin: 0; color: #ffffff; font-size: 24px; font-weight: 600;">
-                🧪 TestForge
-              </h1>
-              <p style="margin: 8px 0 0; color: #94a3b8; font-size: 14px;">
-                Build. Run. Trust your tests.
-              </p>
-            </td>
-          </tr>
-          
-          <!-- Content -->
-          <tr>
-            <td style="padding: 40px;">
-              <h2 style="margin: 0 0 16px; color: #0f172a; font-size: 20px; font-weight: 600;">
-                You've been invited! 🎉
-              </h2>
-              
-              <p style="margin: 0 0 24px; color: #475569; font-size: 16px; line-height: 1.6;">
-                <strong>${inviterEmail}</strong> has invited you to join 
-                <strong>${organizationName}</strong> on TestForge as a <strong>${role}</strong>.
-              </p>
-              
-              <p style="margin: 0 0 32px; color: #475569; font-size: 16px; line-height: 1.6;">
-                TestForge helps QA teams create projects, manage test cases, and leverage AI to find coverage gaps, detect duplicates, and assess quality automatically.
-              </p>
-              
-              <!-- CTA Button -->
-              <table width="100%" cellpadding="0" cellspacing="0">
-                <tr>
-                  <td align="center">
-                    <a href="${fullInviteUrl}" 
-                       style="display: inline-block; background: linear-gradient(135deg, #0ea5e9 0%, #0284c7 100%); color: #ffffff; text-decoration: none; padding: 14px 32px; border-radius: 6px; font-size: 16px; font-weight: 600; box-shadow: 0 4px 6px rgba(14, 165, 233, 0.3);">
-                      Accept Invite
-                    </a>
-                  </td>
-                </tr>
-              </table>
-              
-              <p style="margin: 32px 0 0; color: #94a3b8; font-size: 14px; text-align: center;">
-                This invite expires in 7 days.
-              </p>
-              
-              <!-- Link fallback -->
-              <p style="margin: 24px 0 0; color: #94a3b8; font-size: 12px; word-break: break-all;">
-                If the button doesn't work, copy and paste this link:<br>
-                <a href="${fullInviteUrl}" style="color: #0ea5e9;">${fullInviteUrl}</a>
-              </p>
-            </td>
-          </tr>
-          
-          <!-- Footer -->
-          <tr>
-            <td style="background-color: #f8fafc; padding: 24px 40px; border-top: 1px solid #e2e8f0;">
-              <p style="margin: 0; color: #94a3b8; font-size: 12px; text-align: center;">
-                © ${new Date().getFullYear()} TestForge. All rights reserved.<br>
-                You received this email because someone invited you to TestForge.
-              </p>
-            </td>
-          </tr>
-        </table>
-      </td>
-    </tr>
-  </table>
-</body>
-</html>
-`;
-
-  const text = `
-You've been invited to join ${organizationName} on TestForge!
-
-${inviterEmail} has invited you to join as a ${role}.
-
-TestForge helps QA teams create projects, manage test cases, and leverage AI to find coverage gaps, detect duplicates, and assess quality automatically.
-
-Accept your invite: ${fullInviteUrl}
-
-This invite expires in 7 days.
-
----
-© ${new Date().getFullYear()} TestForge
-`;
-
-  return sendEmail({ to: email, subject, html, text });
+async function queueEmail(userId, { recipientEmail, subject, bodyHtml, bodyText, reportId }) {
+  const result = await db.query(
+    `INSERT INTO email_queue 
+     (user_id, recipient_email, subject, body_html, body_text, report_id, status)
+     VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+     RETURNING id`,
+    [userId, recipientEmail, subject, bodyHtml, bodyText || '', reportId || null]
+  );
+  
+  logger.info({ userId, emailId: result.rows[0].id, recipientEmail }, 'Email queued');
+  
+  // Try to send immediately
+  setImmediate(() => processEmailQueue());
+  
+  return result.rows[0];
 }
 
 /**
- * Send welcome email after accepting invite
+ * Process pending emails in the queue
  */
-async function sendWelcomeEmail({ email, organizationName }) {
-  const appUrl = process.env.FRONTEND_URL || 'https://testforge-app.vercel.app';
+async function processEmailQueue() {
+  const transport = await initTransporter();
+  if (!transport) {
+    logger.debug('Email transport not available, skipping queue processing');
+    return;
+  }
+  
+  // Get pending emails
+  const pending = await db.query(
+    `SELECT * FROM email_queue 
+     WHERE status = 'pending' AND attempts < max_attempts
+     ORDER BY scheduled_at ASC LIMIT 10`
+  );
+  
+  for (const email of pending.rows) {
+    try {
+      await db.query(
+        `UPDATE email_queue SET status = 'sending', attempts = attempts + 1 WHERE id = $1`,
+        [email.id]
+      );
+      
+      await transport.sendMail({
+        from: process.env.EMAIL_FROM || 'TestForge <noreply@testforge.app>',
+        to: email.recipient_email,
+        subject: email.subject,
+        html: email.body_html,
+        text: email.body_text
+      });
+      
+      await db.query(
+        `UPDATE email_queue SET status = 'sent', sent_at = NOW() WHERE id = $1`,
+        [email.id]
+      );
+      
+      logger.info({ emailId: email.id, recipient: email.recipient_email }, 'Email sent');
+    } catch (err) {
+      const shouldRetry = email.attempts + 1 < email.max_attempts;
+      await db.query(
+        `UPDATE email_queue SET status = $1, last_error = $2 WHERE id = $3`,
+        [shouldRetry ? 'pending' : 'failed', err.message, email.id]
+      );
+      logger.error({ emailId: email.id, err: err.message }, 'Email send failed');
+    }
+  }
+}
 
-  const subject = `Welcome to ${organizationName} on TestForge! 🎉`;
-
-  const html = `
+/**
+ * Generate report completion email
+ */
+function generateReportEmail(report, userEmail) {
+  const passRate = report.totalTests > 0 
+    ? Math.round((report.passedCount / report.totalTests) * 100) 
+    : 0;
+  
+  const statusColor = report.failedCount === 0 ? '#22c55e' : '#ef4444';
+  const statusText = report.failedCount === 0 ? 'PASSED' : 'FAILED';
+  
+  const subject = `[TestForge] ${report.title || 'Test Run'} - ${statusText} (${passRate}% pass rate)`;
+  
+  const bodyHtml = `
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #374151; }
+    .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+    .header { background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%); color: white; padding: 24px; border-radius: 12px 12px 0 0; }
+    .header h1 { margin: 0; font-size: 20px; }
+    .content { background: #fff; border: 1px solid #e5e7eb; border-top: none; padding: 24px; border-radius: 0 0 12px 12px; }
+    .status-badge { display: inline-block; padding: 6px 16px; border-radius: 20px; font-weight: 600; font-size: 14px; color: white; background: ${statusColor}; }
+    .stats { display: flex; gap: 16px; margin: 20px 0; }
+    .stat { flex: 1; text-align: center; padding: 16px; background: #f9fafb; border-radius: 8px; }
+    .stat-value { font-size: 28px; font-weight: 700; color: #111827; }
+    .stat-label { font-size: 12px; color: #6b7280; text-transform: uppercase; }
+    .passed .stat-value { color: #22c55e; }
+    .failed .stat-value { color: #ef4444; }
+    .details { margin-top: 20px; padding-top: 20px; border-top: 1px solid #e5e7eb; }
+    .details-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #f3f4f6; }
+    .btn { display: inline-block; padding: 12px 24px; background: #6366f1; color: white; text-decoration: none; border-radius: 8px; font-weight: 600; margin-top: 20px; }
+    .footer { text-align: center; margin-top: 24px; font-size: 12px; color: #9ca3af; }
+  </style>
 </head>
-<body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; background-color: #f4f4f5;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f4f4f5; padding: 40px 20px;">
-    <tr>
-      <td align="center">
-        <table width="600" cellpadding="0" cellspacing="0" style="background-color: #ffffff; border-radius: 8px; overflow: hidden;">
-          <tr>
-            <td style="background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 100%); padding: 32px 40px; text-align: center;">
-              <h1 style="margin: 0; color: #ffffff; font-size: 24px;">🧪 TestForge</h1>
-            </td>
-          </tr>
-          <tr>
-            <td style="padding: 40px;">
-              <h2 style="margin: 0 0 16px; color: #0f172a;">Welcome to the team! 🎉</h2>
-              <p style="margin: 0 0 24px; color: #475569; line-height: 1.6;">
-                You've successfully joined <strong>${organizationName}</strong> on TestForge.
-              </p>
-              <p style="margin: 0 0 32px; color: #475569; line-height: 1.6;">
-                Get started by exploring your projects and creating test cases.
-              </p>
-              <table width="100%" cellpadding="0" cellspacing="0">
-                <tr>
-                  <td align="center">
-                    <a href="${appUrl}" style="display: inline-block; background: linear-gradient(135deg, #0ea5e9 0%, #0284c7 100%); color: #ffffff; text-decoration: none; padding: 14px 32px; border-radius: 6px; font-weight: 600;">
-                      Go to TestForge
-                    </a>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-        </table>
-      </td>
-    </tr>
-  </table>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>🧪 TestForge Report</h1>
+    </div>
+    <div class="content">
+      <h2 style="margin-top:0">${report.title || 'Test Run Complete'}</h2>
+      <span class="status-badge">${statusText}</span>
+      
+      <div class="stats">
+        <div class="stat">
+          <div class="stat-value">${report.totalTests}</div>
+          <div class="stat-label">Total Tests</div>
+        </div>
+        <div class="stat passed">
+          <div class="stat-value">${report.passedCount}</div>
+          <div class="stat-label">Passed</div>
+        </div>
+        <div class="stat failed">
+          <div class="stat-value">${report.failedCount}</div>
+          <div class="stat-label">Failed</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value">${passRate}%</div>
+          <div class="stat-label">Pass Rate</div>
+        </div>
+      </div>
+      
+      <div class="details">
+        <div class="details-row">
+          <span>Duration</span>
+          <strong>${(report.totalDurationMs / 1000).toFixed(2)}s</strong>
+        </div>
+        <div class="details-row">
+          <span>Run Type</span>
+          <strong>${report.runType}</strong>
+        </div>
+        ${report.environmentName ? `<div class="details-row"><span>Environment</span><strong>${report.environmentName}</strong></div>` : ''}
+        <div class="details-row">
+          <span>Completed</span>
+          <strong>${new Date(report.completedAt).toLocaleString()}</strong>
+        </div>
+      </div>
+      
+      <a href="${process.env.FRONTEND_URL || 'https://testforge.app'}/reports/${report.id}" class="btn">View Full Report</a>
+    </div>
+    <div class="footer">
+      <p>You're receiving this because you have notifications enabled for test runs.</p>
+      <p>TestForge - Build. Run. Trust.</p>
+    </div>
+  </div>
 </body>
-</html>
+</html>`;
+
+  const bodyText = `
+TestForge Report: ${report.title || 'Test Run Complete'}
+Status: ${statusText}
+
+Summary:
+- Total Tests: ${report.totalTests}
+- Passed: ${report.passedCount}
+- Failed: ${report.failedCount}
+- Pass Rate: ${passRate}%
+- Duration: ${(report.totalDurationMs / 1000).toFixed(2)}s
+
+View full report: ${process.env.FRONTEND_URL || 'https://testforge.app'}/reports/${report.id}
 `;
 
-  return sendEmail({ to: email, subject, html, text: `Welcome to ${organizationName} on TestForge! Visit ${appUrl} to get started.` });
+  return { subject, bodyHtml, bodyText };
 }
+
+/**
+ * Send report completion email
+ */
+async function sendReportEmail(userId, report, recipientEmail) {
+  const { subject, bodyHtml, bodyText } = generateReportEmail(report, recipientEmail);
+  return queueEmail(userId, {
+    recipientEmail,
+    subject,
+    bodyHtml,
+    bodyText,
+    reportId: report.id
+  });
+}
+
+/**
+ * Get email queue status
+ */
+async function getEmailQueueStatus(userId) {
+  const result = await db.query(
+    `SELECT status, COUNT(*)::int AS count
+     FROM email_queue WHERE user_id = $1
+     GROUP BY status`,
+    [userId]
+  );
+  
+  return result.rows.reduce((acc, row) => {
+    acc[row.status] = row.count;
+    return acc;
+  }, { pending: 0, sending: 0, sent: 0, failed: 0 });
+}
+
+// Start periodic queue processing
+setInterval(processEmailQueue, 60000);
 
 module.exports = {
-  sendEmail,
-  sendInviteEmail,
-  sendWelcomeEmail,
+  queueEmail, processEmailQueue, generateReportEmail,
+  sendReportEmail, getEmailQueueStatus, initTransporter
 };

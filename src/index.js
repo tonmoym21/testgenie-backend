@@ -1,103 +1,101 @@
-require('dotenv').config();
+/**
+ * TestForge Backend - Updated Express Server Entry Point
+ * Includes new routes for dashboards, run reports, and email
+ */
 
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const helmet = require('helmet');
-const pinoHttp = require('pino-http');
+const path = require('path');
 
 const config = require('./config');
 const logger = require('./utils/logger');
-const { generalLimiter } = require('./middleware/rateLimiter');
 const { errorHandler } = require('./middleware/errorHandler');
-const { authenticate } = require('./middleware/auth');
+const rateLimiter = require('./middleware/rateLimiter');
 
-// Route imports
-const playwrightRoutes = require('./routes/playwright');
-const automationAssetRoutes = require('./routes/automationAssets');
-const targetAppConfigRoutes = require('./routes/targetAppConfig');
-const healthRoutes = require('./routes/health');
+// Import routes
 const authRoutes = require('./routes/auth');
 const projectRoutes = require('./routes/projects');
-const storyRoutes = require('./routes/stories');
 const testcaseRoutes = require('./routes/testcases');
 const analyzeRoutes = require('./routes/analyze');
+const storyRoutes = require('./routes/stories');
+const playwrightRoutes = require('./routes/playwright');
 const executeRoutes = require('./routes/execute');
-const reportsRoutes = require('./routes/reports');
-const collectionsRoutes = require('./routes/collections');
-const environmentsRoutes = require('./routes/environments');
-const schedulesRoutes = require('./routes/schedules');
+const automationAssetRoutes = require('./routes/automationAssets');
+const targetConfigRoutes = require('./routes/targetAppConfig');
+const healthRoutes = require('./routes/health');
+const screenshotRoutes = require('./routes/screenshots');
 const teamRoutes = require('./routes/team');
+
+// Updated/New routes
+const environmentRoutes = require('./routes/environments'); // Use environments-updated.js
+const collectionRoutes = require('./routes/collections');   // Use collections-updated.js
+const scheduleRoutes = require('./routes/schedules');       // Use schedules-updated.js
+const reportRoutes = require('./routes/reports');
+
+// New routes for v2
+const dashboardRoutes = require('./routes/dashboard');
+const runReportRoutes = require('./routes/run-reports');
 
 const app = express();
 
-// Middleware stack
-app.use(
-  cors({
-    origin: config.CORS_ORIGIN,
-    methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: true,
-  })
-);
-app.use(helmet());
-app.use(express.json({ limit: '1mb' }));
-app.use(
-  pinoHttp({
-    logger,
-    autoLogging: {
-      ignore: (req) => req.url === '/health',
-    },
-  })
-);
-app.use(generalLimiter);
+// Middleware
+app.use(cors({
+  origin: process.env.CORS_ORIGIN || '*',
+  credentials: true,
+}));
+app.use(express.json({ limit: '10mb' }));
+app.use(rateLimiter);
 
-// Routes
-app.use(healthRoutes);
-app.use('/api/auth', authRoutes);
-app.use('/api/projects', projectRoutes);
-app.use('/api/projects/:projectId/stories', storyRoutes);
-app.use('/api/projects/:projectId/playwright', playwrightRoutes);
-app.use('/api/projects/:projectId/automation', automationAssetRoutes);
-app.use('/api/projects/:projectId/target-app', targetAppConfigRoutes);
-app.use('/api/projects/:projectId/testcases', testcaseRoutes);
-app.use('/api/projects/:projectId/analyze', analyzeRoutes);
-app.use('/api', executeRoutes);
-app.use('/api/reports', reportsRoutes);
-app.use('/api/collections', collectionsRoutes);
-app.use('/api/environments', environmentsRoutes);
-app.use('/api/schedules', schedulesRoutes);
-app.use('/api/team', teamRoutes);
-
-// 404 catch-all
-app.use((_req, res) => {
-  res.status(404).json({
-    error: { code: 'NOT_FOUND', message: 'Route not found' },
-  });
+// Request logging
+app.use((req, _res, next) => {
+  logger.info({ method: req.method, url: req.url }, 'incoming request');
+  next();
 });
 
-// Centralized error handler
+// Health check (no auth)
+app.use('/api/health', healthRoutes);
+
+// Auth routes (no auth middleware)
+app.use('/api/auth', authRoutes);
+
+// Protected routes
+app.use('/api/projects', projectRoutes);
+app.use('/api/testcases', testcaseRoutes);
+app.use('/api/analyze', analyzeRoutes);
+app.use('/api/stories', storyRoutes);
+app.use('/api/playwright', playwrightRoutes);
+app.use('/api', executeRoutes);
+app.use('/api/automation-assets', automationAssetRoutes);
+app.use('/api/target-config', targetConfigRoutes);
+app.use('/api/screenshots', screenshotRoutes);
+app.use('/api/team', teamRoutes);
+
+// Updated routes
+app.use('/api/environments', environmentRoutes);
+app.use('/api/collections', collectionRoutes);
+app.use('/api/schedules', scheduleRoutes);
+app.use('/api/reports', reportRoutes);
+
+// New v2 routes
+app.use('/api/dashboard', dashboardRoutes);
+app.use('/api/run-reports', runReportRoutes);
+
+// Serve screenshots from disk
+app.use('/api/screenshots', express.static(path.join(__dirname, '..', 'screenshots')));
+
+// Error handling
 app.use(errorHandler);
 
+// 404 handler
+app.use((_req, res) => {
+  res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Endpoint not found' } });
+});
+
 // Start server
-if (require.main === module) {
-  const server = app.listen(config.PORT, () => {
-    logger.info({ port: config.PORT, env: config.NODE_ENV }, 'TestGenie API server started');
-  });
-
-  const shutdown = async (signal) => {
-    logger.info({ signal }, 'Shutdown signal received');
-    server.close(() => {
-      logger.info('HTTP server closed');
-      process.exit(0);
-    });
-    setTimeout(() => {
-      logger.error('Forced shutdown after timeout');
-      process.exit(1);
-    }, 10000);
-  };
-
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
-}
+const PORT = config.PORT || 3000;
+app.listen(PORT, () => {
+  logger.info({ port: PORT }, 'TestForge server started');
+});
 
 module.exports = app;

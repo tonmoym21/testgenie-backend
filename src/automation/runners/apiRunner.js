@@ -1,168 +1,280 @@
-const logger = require('../../utils/logger');
+/**
+ * API Test Runner
+ * Executes API tests and evaluates assertions
+ * Now with environment variable resolution support
+ */
 
-function getPath(obj, pathStr) {
-  return pathStr.split('.').reduce((current, key) => {
-    if (current === null || current === undefined) return undefined;
-    return current[key];
-  }, obj);
-}
+const envService = require('../services/environmentService');
 
-function evaluateAssertion(assertion, response) {
-  const { target, operator, expected, path: jsonPath } = assertion;
-  let actual;
-
-  switch (target) {
-    case 'status': actual = response.status; break;
-    case 'body': actual = jsonPath ? getPath(response.body, jsonPath) : response.body; break;
-    case 'header': actual = response.headers[jsonPath?.toLowerCase()]; break;
-    case 'response_time': actual = response.responseTime; break;
-    default: return { passed: false, message: 'Unknown target: ' + target };
-  }
-
-  switch (operator) {
-    case 'equals':
-      if (actual !== expected && JSON.stringify(actual) !== JSON.stringify(expected))
-        return { passed: false, message: 'Expected ' + target + (jsonPath ? '.' + jsonPath : '') + ' to equal ' + JSON.stringify(expected) + ', got ' + JSON.stringify(actual) };
-      break;
-    case 'contains':
-      if (typeof actual === 'string' && !actual.includes(expected))
-        return { passed: false, message: 'Expected ' + target + ' to contain "' + expected + '", got "' + actual + '"' };
-      if (typeof actual === 'object' && !JSON.stringify(actual).includes(expected))
-        return { passed: false, message: 'Expected ' + target + ' to contain "' + expected + '"' };
-      break;
-    case 'greater_than':
-      if (typeof actual !== 'number' || actual <= expected)
-        return { passed: false, message: 'Expected ' + target + ' to be > ' + expected + ', got ' + actual };
-      break;
-    case 'less_than':
-      if (typeof actual !== 'number' || actual >= expected)
-        return { passed: false, message: 'Expected ' + target + ' to be < ' + expected + ', got ' + actual };
-      break;
-    case 'exists':
-      if (actual === undefined || actual === null)
-        return { passed: false, message: 'Expected ' + target + (jsonPath ? '.' + jsonPath : '') + ' to exist, but it is ' + actual };
-      break;
-    case 'matches':
-      if (!new RegExp(expected).test(String(actual)))
-        return { passed: false, message: 'Expected ' + target + ' to match /' + expected + '/, got "' + actual + '"' };
-      break;
-    default:
-      return { passed: false, message: 'Unknown operator: ' + operator };
-  }
-
-  return { passed: true, message: target + (jsonPath ? '.' + jsonPath : '') + ' ' + operator + ' ' + JSON.stringify(expected) + ' -- passed' };
-}
-
-async function runApiTest(testDef) {
-  const { name, config } = testDef;
-  const startTime = Date.now();
+/**
+ * Run an API test with the given configuration
+ * @param {Object} config - Test configuration
+ * @param {string} config.method - HTTP method
+ * @param {string} config.url - Request URL (may contain {{VAR}} placeholders)
+ * @param {Object} config.headers - Request headers (values may contain {{VAR}})
+ * @param {Object} config.body - Request body (values may contain {{VAR}})
+ * @param {Array} config.assertions - Assertions to evaluate
+ * @param {number} config.timeout - Request timeout in ms
+ * @param {Object} [envVars] - Environment variables for resolution
+ * @returns {Object} Test result with rawResponse, assertionResults, logs
+ */
+async function runApiTest(config, envVars = null) {
   const logs = [];
-  let status = 'passed';
-  let errorMessage = null;
-  const assertionResults = [];
-  let rawResponse = null;
-
   const log = (level, message) => {
-    const entry = { timestamp: new Date().toISOString(), level, message };
-    logs.push(entry);
-    logger[level]({ test: name }, message);
+    logs.push({ level, message, timestamp: new Date().toISOString() });
   };
 
+  log('info', `Starting API test: ${config.method} ${config.url}`);
+
+  // Resolve environment variables if provided
+  let resolvedConfig = config;
+  if (envVars && Object.keys(envVars).length > 0) {
+    resolvedConfig = envService.resolveObjectVariables(config, envVars);
+    log('debug', `Resolved ${Object.keys(envVars).length} environment variables`);
+  }
+
+  const { method, url, headers = {}, body, assertions = [], timeout = 10000 } = resolvedConfig;
+
+  const startTime = Date.now();
+  let rawResponse = null;
+  let assertionResults = [];
+
   try {
-    log('info', 'Starting API test: ' + name);
-    log('info', config.method + ' ' + config.url);
+    log('info', `Sending ${method} request to ${url}`);
 
-    const options = {
-      method: config.method,
-      headers: { 'Content-Type': 'application/json', ...(config.headers || {}) },
-      signal: AbortSignal.timeout(config.timeout || 10000),
+    // Build fetch options
+    const fetchOptions = {
+      method,
+      headers: { ...headers },
+      signal: AbortSignal.timeout(timeout),
     };
 
-    if (config.body && !['GET', 'DELETE'].includes(config.method)) {
-      options.body = JSON.stringify(config.body);
-    }
-
-    const requestStart = Date.now();
-    const res = await fetch(config.url, options);
-    const responseTime = Date.now() - requestStart;
-
-    let body;
-    const contentType = res.headers.get('content-type') || '';
-    const rawText = await res.text();
-
-    if (contentType.includes('application/json')) {
-      try { body = JSON.parse(rawText); } catch { body = rawText; }
-    } else {
-      body = rawText;
-    }
-
-    const responseHeaders = {};
-    res.headers.forEach((value, key) => { responseHeaders[key] = value; });
-
-    // Store raw response for Postman-style viewer
-    rawResponse = {
-      statusCode: res.status,
-      statusText: res.statusText,
-      headers: responseHeaders,
-      body: body,
-      rawBody: rawText,
-      responseTime: responseTime,
-      size: rawText.length,
-    };
-
-    const response = {
-      status: res.status,
-      headers: responseHeaders,
-      body,
-      responseTime,
-    };
-
-    log('info', 'Response: ' + res.status + ' ' + res.statusText + ' (' + responseTime + 'ms, ' + rawText.length + ' bytes)');
-
-    for (let i = 0; i < config.assertions.length; i++) {
-      const assertion = config.assertions[i];
-      const result = evaluateAssertion(assertion, response);
-      assertionResults.push({ index: i + 1, ...assertion, ...result });
-
-      if (result.passed) {
-        log('info', 'Assertion ' + (i + 1) + ': ' + result.message);
+    // Add body for non-GET requests
+    if (body && !['GET', 'HEAD'].includes(method.toUpperCase())) {
+      if (typeof body === 'object') {
+        fetchOptions.body = JSON.stringify(body);
+        if (!fetchOptions.headers['Content-Type']) {
+          fetchOptions.headers['Content-Type'] = 'application/json';
+        }
       } else {
-        log('error', 'Assertion ' + (i + 1) + ' FAILED: ' + result.message);
-        status = 'failed';
-        if (!errorMessage) errorMessage = result.message;
+        fetchOptions.body = body;
       }
     }
 
-    if (status === 'passed') {
-      log('info', 'All ' + config.assertions.length + ' assertions passed');
-    } else {
-      const failedCount = assertionResults.filter((a) => !a.passed).length;
-      log('error', failedCount + ' of ' + config.assertions.length + ' assertions failed');
+    // Execute request
+    const response = await fetch(url, fetchOptions);
+    const responseTime = Date.now() - startTime;
+
+    // Read response body
+    const contentType = response.headers.get('content-type') || '';
+    let responseBody;
+    try {
+      if (contentType.includes('application/json')) {
+        responseBody = await response.json();
+      } else {
+        responseBody = await response.text();
+      }
+    } catch (e) {
+      responseBody = null;
+      log('warn', `Failed to parse response body: ${e.message}`);
     }
-  } catch (err) {
-    status = 'failed';
-    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
-      errorMessage = 'Request timed out after ' + (config.timeout || 10000) + 'ms';
+
+    // Build raw response object
+    rawResponse = {
+      statusCode: response.status,
+      statusText: response.statusText,
+      headers: Object.fromEntries(response.headers.entries()),
+      body: responseBody,
+      responseTime,
+      size: JSON.stringify(responseBody || '').length,
+    };
+
+    log('info', `Received ${response.status} ${response.statusText} in ${responseTime}ms`);
+
+    // Evaluate assertions
+    assertionResults = evaluateAssertions(assertions, rawResponse, log);
+
+  } catch (error) {
+    const responseTime = Date.now() - startTime;
+    log('error', `Request failed: ${error.message}`);
+
+    if (error.name === 'TimeoutError' || error.message.includes('timeout')) {
+      rawResponse = {
+        error: 'Request timed out',
+        responseTime,
+        statusCode: null,
+        statusText: 'Timeout',
+        headers: {},
+        body: null,
+        size: 0,
+      };
     } else {
-      errorMessage = err.message;
+      rawResponse = {
+        error: error.message,
+        responseTime,
+        statusCode: null,
+        statusText: 'Error',
+        headers: {},
+        body: null,
+        size: 0,
+      };
     }
-    log('error', 'Test failed: ' + errorMessage);
+
+    // All assertions fail on request error
+    assertionResults = assertions.map((a) => ({
+      ...a,
+      passed: false,
+      message: `Request failed: ${error.message}`,
+      actual: null,
+    }));
   }
 
-  const duration = Date.now() - startTime;
+  // Determine overall status
+  const allPassed = assertionResults.every((r) => r.passed);
+  const status = allPassed ? 'passed' : 'failed';
+
+  log('info', `Test ${status}: ${assertionResults.filter((r) => r.passed).length}/${assertionResults.length} assertions passed`);
 
   return {
-    name,
-    type: 'api',
-    status,
-    error: errorMessage,
-    duration,
-    assertionResults,
     rawResponse,
+    assertionResults,
     logs,
-    screenshots: [],
-    completedAt: new Date().toISOString(),
+    status,
+    duration: rawResponse.responseTime,
+    error: allPassed ? null : assertionResults.find((r) => !r.passed)?.message,
   };
+}
+
+/**
+ * Evaluate assertions against the response
+ */
+function evaluateAssertions(assertions, rawResponse, log) {
+  return assertions.map((assertion) => {
+    const { target, operator, expected, path } = assertion;
+    let actual;
+    let passed = false;
+    let message = '';
+
+    try {
+      // Get actual value based on target
+      switch (target) {
+        case 'status':
+          actual = rawResponse.statusCode;
+          break;
+        case 'response_time':
+          actual = rawResponse.responseTime;
+          break;
+        case 'header':
+          if (path) {
+            actual = rawResponse.headers[path.toLowerCase()];
+          } else {
+            actual = rawResponse.headers;
+          }
+          break;
+        case 'body':
+          if (path) {
+            actual = getNestedValue(rawResponse.body, path);
+          } else {
+            actual = rawResponse.body;
+          }
+          break;
+        default:
+          message = `Unknown assertion target: ${target}`;
+          log('error', message);
+          return { ...assertion, passed: false, message, actual: null };
+      }
+
+      // Evaluate operator
+      switch (operator) {
+        case 'equals':
+          passed = actual == expected; // Use loose equality for flexibility
+          message = passed 
+            ? `${target}${path ? '.' + path : ''} equals ${JSON.stringify(expected)}`
+            : `Expected ${target}${path ? '.' + path : ''} to equal ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`;
+          break;
+        case 'contains':
+          if (typeof actual === 'string') {
+            passed = actual.includes(String(expected));
+          } else if (typeof actual === 'object') {
+            passed = JSON.stringify(actual).includes(String(expected));
+          } else {
+            passed = false;
+          }
+          message = passed
+            ? `${target}${path ? '.' + path : ''} contains "${expected}"`
+            : `Expected ${target}${path ? '.' + path : ''} to contain "${expected}"`;
+          break;
+        case 'greater_than':
+          passed = Number(actual) > Number(expected);
+          message = passed
+            ? `${target}${path ? '.' + path : ''} (${actual}) is greater than ${expected}`
+            : `Expected ${target}${path ? '.' + path : ''} (${actual}) to be greater than ${expected}`;
+          break;
+        case 'less_than':
+          passed = Number(actual) < Number(expected);
+          message = passed
+            ? `${target}${path ? '.' + path : ''} (${actual}) is less than ${expected}`
+            : `Expected ${target}${path ? '.' + path : ''} (${actual}) to be less than ${expected}`;
+          break;
+        case 'exists':
+          passed = actual !== undefined && actual !== null;
+          message = passed
+            ? `${target}${path ? '.' + path : ''} exists`
+            : `Expected ${target}${path ? '.' + path : ''} to exist`;
+          break;
+        case 'matches':
+          try {
+            const regex = new RegExp(expected);
+            passed = regex.test(String(actual));
+            message = passed
+              ? `${target}${path ? '.' + path : ''} matches pattern "${expected}"`
+              : `Expected ${target}${path ? '.' + path : ''} to match pattern "${expected}"`;
+          } catch (e) {
+            passed = false;
+            message = `Invalid regex pattern: ${expected}`;
+          }
+          break;
+        default:
+          message = `Unknown operator: ${operator}`;
+          log('error', message);
+      }
+
+      log(passed ? 'info' : 'warn', message);
+
+    } catch (error) {
+      passed = false;
+      message = `Assertion error: ${error.message}`;
+      log('error', message);
+    }
+
+    return { ...assertion, passed, message, actual };
+  });
+}
+
+/**
+ * Get nested value from object using dot notation path
+ */
+function getNestedValue(obj, path) {
+  if (!obj || !path) return obj;
+  
+  const parts = path.split('.');
+  let current = obj;
+  
+  for (const part of parts) {
+    // Handle array indices like "data.0.name" or "data[0].name"
+    const match = part.match(/^(\w+)\[(\d+)\]$/);
+    if (match) {
+      current = current?.[match[1]]?.[parseInt(match[2])];
+    } else if (part.match(/^\d+$/)) {
+      current = current?.[parseInt(part)];
+    } else {
+      current = current?.[part];
+    }
+    
+    if (current === undefined) return undefined;
+  }
+  
+  return current;
 }
 
 module.exports = { runApiTest };
