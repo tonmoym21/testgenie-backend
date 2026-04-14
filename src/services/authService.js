@@ -10,9 +10,10 @@ const BCRYPT_ROUNDS = 12;
 
 /**
  * Register a new user.
- * - Auto-assigns organization based on email domain
- * - Creates org if it doesn't exist
- * - Makes first user of org the owner
+ * 
+ * Flow:
+ * 1. If NO organization exists → First user creates default org and becomes owner
+ * 2. If organization exists → Registration is blocked (must use invite)
  */
 async function register(email, password) {
   email = email.toLowerCase().trim();
@@ -22,48 +23,22 @@ async function register(email, password) {
     throw new ConflictError('Email already registered');
   }
 
-  // Auto-assign organization based on email domain
-  const domain = email.split('@')[1];
-  let orgId = null;
-  let isFirstMember = false;
+  // Check if ANY organization exists
+  const orgCheck = await db.query('SELECT COUNT(*) as count FROM organizations');
+  const orgExists = parseInt(orgCheck.rows[0].count, 10) > 0;
 
-  if (domain) {
-    // Check if org exists for this domain
-    const orgResult = await db.query('SELECT id FROM organizations WHERE domain = $1', [domain]);
-    
-    if (orgResult.rows.length > 0) {
-      orgId = orgResult.rows[0].id;
-      
-      // Check if domain restriction is enabled
-      const org = await db.query(
-        'SELECT domain_restriction_enabled FROM organizations WHERE id = $1',
-        [orgId]
-      );
-      
-      if (org.rows[0]?.domain_restriction_enabled) {
-        // Check if this domain is in allowed list or is the org's primary domain
-        const allowedResult = await db.query(
-          `SELECT domain FROM allowed_email_domains WHERE organization_id = $1
-           UNION SELECT domain FROM organizations WHERE id = $1`,
-          [orgId]
-        );
-        const allowedDomains = allowedResult.rows.map(r => r.domain);
-        
-        if (!allowedDomains.includes(domain)) {
-          throw new ForbiddenError(`Registration with domain ${domain} is not allowed. Contact your organization admin.`);
-        }
-      }
-    } else {
-      // Create new organization for this domain
-      const orgName = domain.split('.')[0].charAt(0).toUpperCase() + domain.split('.')[0].slice(1);
-      const newOrg = await db.query(
-        'INSERT INTO organizations (name, domain) VALUES ($1, $2) RETURNING id',
-        [orgName, domain]
-      );
-      orgId = newOrg.rows[0].id;
-      isFirstMember = true;
-    }
+  if (orgExists) {
+    // Organization exists - new users must be invited
+    throw new ForbiddenError('Registration is invite-only. Please contact your admin for an invite link.');
   }
+
+  // First user ever - create default organization and make them owner
+  const orgName = 'TestForge';
+  const newOrg = await db.query(
+    'INSERT INTO organizations (name, domain_restriction_enabled) VALUES ($1, true) RETURNING id',
+    [orgName]
+  );
+  const orgId = newOrg.rows[0].id;
 
   // Create user
   const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
@@ -76,25 +51,22 @@ async function register(email, password) {
   
   const user = result.rows[0];
 
-  // Create organization membership
-  if (orgId) {
-    const role = isFirstMember ? 'owner' : 'member';
-    await db.query(
-      `INSERT INTO organization_members (organization_id, user_id, role)
-       VALUES ($1, $2, $3)`,
-      [orgId, user.id, role]
-    );
-    
-    // Log audit event
-    await teamService.logAuditEvent(
-      orgId,
-      user.id,
-      isFirstMember ? 'organization_created' : 'member_joined',
-      'user',
-      user.id,
-      { email, role }
-    );
-  }
+  // Make first user the owner
+  await db.query(
+    `INSERT INTO organization_members (organization_id, user_id, role)
+     VALUES ($1, $2, 'owner')`,
+    [orgId, user.id]
+  );
+  
+  // Log audit event
+  await teamService.logAuditEvent(
+    orgId,
+    user.id,
+    'organization_created',
+    'user',
+    user.id,
+    { email, role: 'owner', isFirstUser: true }
+  );
 
   return user;
 }
