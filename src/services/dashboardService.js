@@ -1,11 +1,10 @@
-const db = require('../db');
-const logger = require('../utils/logger');
-
 /**
- * Dashboard Service
- * Provides real-time metrics and aggregations for dashboards
+ * Dashboard Service v2 - Safe Error Handling
+ * Last updated: 2026-04-15
  * All methods handle missing tables and empty data gracefully
  */
+const db = require('../db');
+const logger = require('../utils/logger');
 
 /**
  * Safe query wrapper - returns empty result on error

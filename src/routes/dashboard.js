@@ -1,3 +1,7 @@
+/**
+ * Dashboard Routes - v2 with safe error handling
+ * Last updated: 2026-04-15
+ */
 const { Router } = require('express');
 const { authenticate } = require('../middleware/auth');
 const dashboardService = require('../services/dashboardService');
