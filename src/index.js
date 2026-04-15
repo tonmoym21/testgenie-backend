@@ -102,13 +102,12 @@ app.use('/api/health', healthRoutes);
 // Auth routes (no auth middleware)
 app.use('/api/auth', authRoutes);
 
-// Protected routes
+// Protected routes (specific paths first, generic /api last)
 app.use('/api/projects', projectRoutes);
 app.use('/api/testcases', testcaseRoutes);
 app.use('/api/analyze', analyzeRoutes);
 app.use('/api/stories', storyRoutes);
 app.use('/api/playwright', playwrightRoutes);
-app.use('/api', executeRoutes);
 app.use('/api/automation-assets', automationAssetRoutes);
 app.use('/api/target-config', targetConfigRoutes);
 app.use('/api/screenshots', screenshotRoutes);
@@ -118,10 +117,14 @@ app.use('/api/collections', collectionRoutes);
 app.use('/api/schedules', scheduleRoutes);
 app.use('/api/reports', reportRoutes);
 
-// Dashboard routes - mounted with explicit logging
+// Dashboard routes
 logger.info('Mounting dashboard routes at /api/dashboard');
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/run-reports', runReportRoutes);
+
+// Execute routes LAST — mounted at /api with router.use(authenticate)
+// Must come after all other /api/* routes so it doesn't block public endpoints
+app.use('/api', executeRoutes);
 
 // Serve screenshots from disk
 app.use('/api/screenshots', express.static(path.join(__dirname, '..', 'screenshots')));
