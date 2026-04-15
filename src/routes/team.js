@@ -1,7 +1,7 @@
 const { Router } = require('express');
 const { z } = require('zod');
 const { validate } = require('../middleware/validate');
-const { authenticate } = require('../middleware/auth');
+const { authenticate, optionalAuth } = require('../middleware/auth');
 const { requireRole, requireMinRole, attachOrgContext } = require('../middleware/rbac');
 const teamService = require('../services/teamService');
 
@@ -293,11 +293,22 @@ router.get('/invite-info', async (req, res, next) => {
 });
 
 // POST /api/team/accept-invite - Accept invite (authenticated)
-router.post('/accept-invite', authenticate, async (req, res, next) => {
+// Uses optionalAuth so unauthenticated users get a clear "please login" error
+// instead of a raw 401 from the auth middleware
+router.post('/accept-invite', optionalAuth, async (req, res, next) => {
   try {
     const { token } = req.body;
     if (!token) {
       return res.status(400).json({ error: { code: 'MISSING_TOKEN', message: 'Token is required' } });
+    }
+
+    if (!req.user) {
+      return res.status(401).json({
+        error: {
+          code: 'AUTH_REQUIRED',
+          message: 'Please log in or create an account to accept this invite',
+        },
+      });
     }
 
     const result = await teamService.acceptInvite(token, req.user.id);
