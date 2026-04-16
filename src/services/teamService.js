@@ -324,17 +324,62 @@ async function createInvite(orgId, email, role, invitedBy) {
     throw new ConflictError('User is already a member of this organization');
   }
 
-  // Check for pending invite
-  const pendingInvite = await db.query(
-    `SELECT id FROM organization_invites 
-     WHERE organization_id = $1 AND email = $2 AND status = 'pending' AND expires_at > NOW()`,
+  // Get inviter's email (used for email template)
+  const inviterResult = await db.query('SELECT email FROM users WHERE id = $1', [invitedBy]);
+  const inviterEmail = inviterResult.rows[0]?.email || 'A team member';
+
+  // If a pending invite already exists for this email, treat this as a
+  // "refresh & resend": rotate the token, extend expiry, update role if changed,
+  // and return the invite with a fresh URL. This is idempotent and matches user
+  // expectation when they click "Send invite" for someone they already invited.
+  const existing = await db.query(
+    `SELECT id, role FROM organization_invites
+     WHERE organization_id = $1 AND LOWER(email) = LOWER($2) AND status = 'pending'
+     ORDER BY created_at DESC LIMIT 1`,
     [orgId, email]
   );
-  if (pendingInvite.rows.length > 0) {
-    throw new ConflictError('A pending invite already exists for this email');
+
+  if (existing.rows.length > 0) {
+    const existingInviteId = existing.rows[0].id;
+    const existingRole = existing.rows[0].role;
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+
+    const updated = await db.query(
+      `UPDATE organization_invites
+         SET token = $1, expires_at = $2, role = $3, invited_by = $4
+         WHERE id = $5
+         RETURNING id, email, role, status, expires_at, created_at`,
+      [token, expiresAt, role, invitedBy, existingInviteId]
+    );
+
+    await logAuditEvent(orgId, invitedBy, 'invite_refreshed', 'invite', existingInviteId, {
+      email,
+      oldRole: existingRole,
+      newRole: role,
+    });
+
+    const inviteUrl = `/accept-invite?token=${token}`;
+    const emailResult = await emailService.sendInviteEmail({
+      email,
+      inviteUrl,
+      organizationName: org.name,
+      role,
+      inviterEmail,
+    });
+
+    return {
+      ...updated.rows[0],
+      token,
+      inviteUrl,
+      emailSent: emailResult.success,
+      emailError: emailResult.reason,
+      reused: true,
+    };
   }
 
-  // Generate secure token
+  // No pending invite exists (or previous one was revoked/expired/accepted) —
+  // create a brand-new invite record.
   const token = crypto.randomBytes(32).toString('hex');
   const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
 
@@ -346,10 +391,6 @@ async function createInvite(orgId, email, role, invitedBy) {
   );
 
   await logAuditEvent(orgId, invitedBy, 'invite_sent', 'invite', result.rows[0].id, { email, role });
-
-  // Get inviter's email
-  const inviterResult = await db.query('SELECT email FROM users WHERE id = $1', [invitedBy]);
-  const inviterEmail = inviterResult.rows[0]?.email || 'A team member';
 
   // Send invite email
   const inviteUrl = `/accept-invite?token=${token}`;
@@ -367,6 +408,7 @@ async function createInvite(orgId, email, role, invitedBy) {
     inviteUrl,
     emailSent: emailResult.success,
     emailError: emailResult.reason,
+    reused: false,
   };
 }
 
