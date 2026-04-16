@@ -1,8 +1,8 @@
 const { Router } = require('express');
 const { z } = require('zod');
 const { validate } = require('../middleware/validate');
-const { authenticate } = require('../middleware/auth');
-const { requireRole, requireMinRole, attachOrgContext } = require('../middleware/rbac');
+const { authenticate, optionalAuth } = require('../middleware/auth');
+const { requireRole, attachOrgContext } = require('../middleware/rbac');
 const teamService = require('../services/teamService');
 
 const router = Router();
@@ -37,19 +37,98 @@ const addDomainSchema = z.object({
   domain: z.string().min(3).max(100),
 });
 
-const listMembersSchema = z.object({
-  status: z.enum(['active', 'deactivated', 'all']).optional(),
-  role: z.enum(['owner', 'admin', 'member', 'viewer']).optional(),
-  search: z.string().max(100).optional(),
-  limit: z.coerce.number().min(1).max(100).optional(),
-  offset: z.coerce.number().min(0).optional(),
+// ─────────────────────────────────────────────────────────────────────────────
+// PUBLIC INVITE ROUTES (must be declared BEFORE any catch-all middleware and
+// MUST NOT require auth — they power the invite-acceptance page for logged-out users)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/team/invite-info?token=xxx
+ * Public endpoint — returns invite info without requiring auth.
+ * Frontend uses this to render the accept-invite page for both logged-in and
+ * logged-out users.
+ */
+router.get('/invite-info', async (req, res, next) => {
+  try {
+    const { token } = req.query;
+    if (!token) {
+      return res.status(400).json({
+        error: { code: 'MISSING_TOKEN', message: 'Invite token is required' },
+      });
+    }
+
+    const invite = await teamService.getInviteByToken(token);
+    if (!invite) {
+      return res.status(404).json({
+        error: { code: 'INVITE_NOT_FOUND', message: 'Invite not found. The link may be invalid.' },
+      });
+    }
+
+    // Return 200 even when invite is expired/revoked/accepted — the frontend
+    // needs the isValid/isExpired flags to render the appropriate state.
+    res.json(invite);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /api/team/accept-invite
+ * Public-tolerant: uses optionalAuth so we can return a useful, specific error
+ * for unauthenticated callers instead of a generic "Missing or malformed
+ * authorization header" message.
+ *
+ * Flow:
+ *  - Logged in + email matches invite → accept and return membership
+ *  - Logged in + email mismatches → 403 WRONG_ACCOUNT
+ *  - Not logged in → 401 AUTH_REQUIRED_FOR_INVITE (frontend shows login/register)
+ */
+router.post('/accept-invite', optionalAuth, async (req, res, next) => {
+  try {
+    const { token } = req.body || {};
+    if (!token) {
+      return res.status(400).json({
+        error: { code: 'MISSING_TOKEN', message: 'Invite token is required' },
+      });
+    }
+
+    // Not authenticated → tell the frontend exactly what to do.
+    if (!req.user || !req.user.id) {
+      return res.status(401).json({
+        error: {
+          code: 'AUTH_REQUIRED_FOR_INVITE',
+          message: 'Please sign in or create an account to accept this invite.',
+        },
+      });
+    }
+
+    const result = await teamService.acceptInvite(token, req.user.id);
+    res.json(result);
+  } catch (err) {
+    // Map common service errors to stable codes the frontend already handles.
+    if (err && err.message && err.message.toLowerCase().includes('already a member')) {
+      return res.status(409).json({
+        error: { code: 'ALREADY_MEMBER', message: err.message },
+      });
+    }
+    if (err && err.message && err.message.toLowerCase().includes('different email')) {
+      return res.status(403).json({
+        error: { code: 'WRONG_ACCOUNT', message: err.message },
+      });
+    }
+    if (err && err.message && (err.message.toLowerCase().includes('not found') || err.message.toLowerCase().includes('expired'))) {
+      return res.status(404).json({
+        error: { code: 'INVITE_INVALID', message: 'This invite is no longer valid or has expired.' },
+      });
+    }
+    next(err);
+  }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ORGANIZATION ROUTES
+// ORGANIZATION ROUTES (authenticated)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// GET /api/team/organization - Get current organization details
 router.get('/organization', authenticate, attachOrgContext(), async (req, res, next) => {
   try {
     if (!req.organization) {
@@ -71,7 +150,6 @@ router.get('/organization', authenticate, attachOrgContext(), async (req, res, n
   }
 });
 
-// PATCH /api/team/organization - Update organization settings
 router.patch('/organization', authenticate, requireRole(['owner', 'admin']), validate(updateOrgSchema), async (req, res, next) => {
   try {
     const org = await teamService.updateOrganization(req.organization.id, req.user.id, req.body);
@@ -91,7 +169,6 @@ router.patch('/organization', authenticate, requireRole(['owner', 'admin']), val
 // MEMBERS ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
 
-// GET /api/team/members - List organization members
 router.get('/members', authenticate, requireRole(['owner', 'admin']), async (req, res, next) => {
   try {
     const options = {
@@ -101,7 +178,6 @@ router.get('/members', authenticate, requireRole(['owner', 'admin']), async (req
       limit: req.query.limit ? parseInt(req.query.limit, 10) : 50,
       offset: req.query.offset ? parseInt(req.query.offset, 10) : 0,
     };
-    
     const result = await teamService.listMembers(req.organization.id, options);
     res.json(result);
   } catch (err) {
@@ -109,7 +185,6 @@ router.get('/members', authenticate, requireRole(['owner', 'admin']), async (req
   }
 });
 
-// GET /api/team/members/:userId - Get single member details
 router.get('/members/:userId', authenticate, requireRole(['owner', 'admin']), async (req, res, next) => {
   try {
     const member = await teamService.getMember(req.organization.id, parseInt(req.params.userId, 10));
@@ -119,7 +194,6 @@ router.get('/members/:userId', authenticate, requireRole(['owner', 'admin']), as
   }
 });
 
-// PATCH /api/team/members/:userId/role - Update member role
 router.patch('/members/:userId/role', authenticate, requireRole(['owner', 'admin']), validate(updateRoleSchema), async (req, res, next) => {
   try {
     const member = await teamService.updateMemberRole(
@@ -134,7 +208,6 @@ router.patch('/members/:userId/role', authenticate, requireRole(['owner', 'admin
   }
 });
 
-// DELETE /api/team/members/:userId - Remove member from organization
 router.delete('/members/:userId', authenticate, requireRole(['owner', 'admin']), async (req, res, next) => {
   try {
     const result = await teamService.removeMember(
@@ -148,7 +221,6 @@ router.delete('/members/:userId', authenticate, requireRole(['owner', 'admin']),
   }
 });
 
-// POST /api/team/members/:userId/deactivate - Deactivate member
 router.post('/members/:userId/deactivate', authenticate, requireRole(['owner', 'admin']), async (req, res, next) => {
   try {
     const member = await teamService.deactivateMember(
@@ -162,7 +234,6 @@ router.post('/members/:userId/deactivate', authenticate, requireRole(['owner', '
   }
 });
 
-// POST /api/team/members/:userId/reactivate - Reactivate member
 router.post('/members/:userId/reactivate', authenticate, requireRole(['owner', 'admin']), async (req, res, next) => {
   try {
     const member = await teamService.reactivateMember(
@@ -177,10 +248,9 @@ router.post('/members/:userId/reactivate', authenticate, requireRole(['owner', '
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// INVITE ROUTES
+// INVITE ADMIN ROUTES (authenticated)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// GET /api/team/invites - List organization invites
 router.get('/invites', authenticate, requireRole(['owner', 'admin']), async (req, res, next) => {
   try {
     const status = req.query.status || 'pending';
@@ -191,10 +261,8 @@ router.get('/invites', authenticate, requireRole(['owner', 'admin']), async (req
   }
 });
 
-// POST /api/team/invites - Create single invite
 router.post('/invites', authenticate, requireRole(['owner', 'admin']), validate(inviteSchema), async (req, res, next) => {
   try {
-    // Only owners can invite admins
     if (req.body.role === 'admin' && req.organization.role !== 'owner') {
       return res.status(403).json({
         error: { code: 'FORBIDDEN', message: 'Only owners can invite admin users' },
@@ -213,14 +281,12 @@ router.post('/invites', authenticate, requireRole(['owner', 'admin']), validate(
   }
 });
 
-// POST /api/team/invites/bulk - Create multiple invites
 router.post('/invites/bulk', authenticate, requireRole(['owner', 'admin']), validate(bulkInviteSchema), async (req, res, next) => {
   try {
     const results = [];
     const errors = [];
 
     for (const inv of req.body.invites) {
-      // Only owners can invite admins
       if (inv.role === 'admin' && req.organization.role !== 'owner') {
         errors.push({ email: inv.email, error: 'Only owners can invite admin users' });
         continue;
@@ -245,7 +311,6 @@ router.post('/invites/bulk', authenticate, requireRole(['owner', 'admin']), vali
   }
 });
 
-// POST /api/team/invites/:inviteId/resend - Resend invite
 router.post('/invites/:inviteId/resend', authenticate, requireRole(['owner', 'admin']), async (req, res, next) => {
   try {
     const result = await teamService.resendInvite(
@@ -259,7 +324,6 @@ router.post('/invites/:inviteId/resend', authenticate, requireRole(['owner', 'ad
   }
 });
 
-// DELETE /api/team/invites/:inviteId - Revoke invite
 router.delete('/invites/:inviteId', authenticate, requireRole(['owner', 'admin']), async (req, res, next) => {
   try {
     const result = await teamService.revokeInvite(
@@ -273,45 +337,10 @@ router.delete('/invites/:inviteId', authenticate, requireRole(['owner', 'admin']
   }
 });
 
-// GET /api/team/invite-info?token=xxx - Get invite info by token (public, for invite acceptance page)
-router.get('/invite-info', async (req, res, next) => {
-  try {
-    const { token } = req.query;
-    if (!token) {
-      return res.status(400).json({ error: { code: 'MISSING_TOKEN', message: 'Token is required' } });
-    }
-
-    const invite = await teamService.getInviteByToken(token);
-    if (!invite) {
-      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Invite not found' } });
-    }
-
-    res.json(invite);
-  } catch (err) {
-    next(err);
-  }
-});
-
-// POST /api/team/accept-invite - Accept invite (authenticated)
-router.post('/accept-invite', authenticate, async (req, res, next) => {
-  try {
-    const { token } = req.body;
-    if (!token) {
-      return res.status(400).json({ error: { code: 'MISSING_TOKEN', message: 'Token is required' } });
-    }
-
-    const result = await teamService.acceptInvite(token, req.user.id);
-    res.json(result);
-  } catch (err) {
-    next(err);
-  }
-});
-
 // ─────────────────────────────────────────────────────────────────────────────
 // ALLOWED DOMAINS ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
 
-// GET /api/team/domains - List allowed email domains
 router.get('/domains', authenticate, requireRole(['owner', 'admin']), async (req, res, next) => {
   try {
     const domains = await teamService.listAllowedDomains(req.organization.id);
@@ -321,7 +350,6 @@ router.get('/domains', authenticate, requireRole(['owner', 'admin']), async (req
   }
 });
 
-// POST /api/team/domains - Add allowed email domain
 router.post('/domains', authenticate, requireRole(['owner', 'admin']), validate(addDomainSchema), async (req, res, next) => {
   try {
     const domain = await teamService.addAllowedDomain(
@@ -335,7 +363,6 @@ router.post('/domains', authenticate, requireRole(['owner', 'admin']), validate(
   }
 });
 
-// DELETE /api/team/domains/:domainId - Remove allowed email domain
 router.delete('/domains/:domainId', authenticate, requireRole(['owner', 'admin']), async (req, res, next) => {
   try {
     const result = await teamService.removeAllowedDomain(
@@ -353,7 +380,6 @@ router.delete('/domains/:domainId', authenticate, requireRole(['owner', 'admin']
 // AUDIT LOGS ROUTE
 // ─────────────────────────────────────────────────────────────────────────────
 
-// GET /api/team/audit-logs - Get team audit logs
 router.get('/audit-logs', authenticate, requireRole(['owner', 'admin']), async (req, res, next) => {
   try {
     const options = {
@@ -362,7 +388,6 @@ router.get('/audit-logs', authenticate, requireRole(['owner', 'admin']), async (
       limit: req.query.limit ? parseInt(req.query.limit, 10) : 50,
       offset: req.query.offset ? parseInt(req.query.offset, 10) : 0,
     };
-
     const logs = await teamService.getAuditLogs(req.organization.id, options);
     res.json({ logs });
   } catch (err) {
@@ -374,7 +399,6 @@ router.get('/audit-logs', authenticate, requireRole(['owner', 'admin']), async (
 // CURRENT USER TEAM INFO
 // ─────────────────────────────────────────────────────────────────────────────
 
-// GET /api/team/me - Get current user's team membership info
 router.get('/me', authenticate, attachOrgContext(), async (req, res, next) => {
   try {
     if (!req.organization) {

@@ -37,13 +37,20 @@ const analyzeLimiter = rateLimit({
 });
 
 /**
- * General API limiter (100 requests per minute per IP).
+ * General API limiter (300 requests per minute per IP).
+ * Used as the default global rate limiter. Skips health and version endpoints.
  */
 const generalLimiter = rateLimit({
   windowMs: 60000,
-  max: 100,
+  max: 300,
   standardHeaders: true,
   legacyHeaders: false,
+  // Don't rate-limit health or version checks - Railway healthchecks run every few seconds
+  skip: (req) =>
+    req.path === '/health' ||
+    req.path === '/healthz' ||
+    req.path === '/api/health' ||
+    req.path === '/api/version',
   message: {
     error: {
       code: 'RATE_LIMITED',
@@ -52,4 +59,12 @@ const generalLimiter = rateLimit({
   },
 });
 
-module.exports = { authLimiter, analyzeLimiter, generalLimiter };
+/**
+ * Default export: the general limiter function itself.
+ * This makes `const rateLimiter = require('./rateLimiter'); app.use(rateLimiter)` work correctly.
+ * Named exports are attached to the function for backward compat.
+ */
+module.exports = generalLimiter;
+module.exports.authLimiter = authLimiter;
+module.exports.analyzeLimiter = analyzeLimiter;
+module.exports.generalLimiter = generalLimiter;

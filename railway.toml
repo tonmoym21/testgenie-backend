@@ -1,8 +1,15 @@
 [build]
 builder = "nixpacks"
-buildCommand = "npm install && npx playwright install chromium"
+# Install deps then install the Chromium browser for Playwright.
+# `|| true` on the browser install prevents a Playwright hiccup from failing the entire deploy
+# since UI test execution can be retried at runtime.
+buildCommand = "npm ci --include=dev && (npx playwright install --with-deps chromium || npx playwright install chromium || true)"
 
 [deploy]
 startCommand = "node src/index.js"
+# /health is a lightweight no-DB endpoint defined in src/index.js that always returns 200
+# as long as the Node process is up. This prevents healthcheck-driven restart loops.
 healthcheckPath = "/health"
+healthcheckTimeout = 30
 restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
