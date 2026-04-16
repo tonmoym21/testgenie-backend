@@ -8,6 +8,41 @@ const emailService = require('./emailService');
 const ROLE_HIERARCHY = { owner: 4, admin: 3, member: 2, viewer: 1 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SAFE EMAIL WRAPPER
+// Email delivery for invites/welcome is currently PARKED — the emailService
+// module does not implement sendInviteEmail/sendWelcomeEmail. We still want
+// invite creation and resend to succeed and return the invite URL so admins
+// can share it manually. This wrapper:
+//   - calls the real method if it exists AND the `mail` feature flag is on
+//   - otherwise no-ops and returns { success: false, reason: 'MAIL_DISABLED' }
+//   - never throws — email failures must NEVER fail invite creation
+// To re-enable mail later, implement sendInviteEmail/sendWelcomeEmail on
+// emailService and (optionally) set MAIL_ENABLED=true in the environment.
+// ─────────────────────────────────────────────────────────────────────────────
+const MAIL_ENABLED = process.env.MAIL_ENABLED === 'true';
+
+async function safeEmail(methodName, payload) {
+  if (!MAIL_ENABLED) {
+    logger.info({ methodName, to: payload?.email }, 'Mail disabled — skipping');
+    return { success: false, reason: 'MAIL_DISABLED' };
+  }
+  const fn = emailService && typeof emailService[methodName] === 'function'
+    ? emailService[methodName]
+    : null;
+  if (!fn) {
+    logger.warn({ methodName }, 'Mail method not implemented — skipping');
+    return { success: false, reason: 'NOT_IMPLEMENTED' };
+  }
+  try {
+    const result = await fn(payload);
+    return result || { success: true };
+  } catch (err) {
+    logger.error({ err: err.message, methodName }, 'Mail send failed — continuing without it');
+    return { success: false, reason: 'SEND_FAILED', error: err.message };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ORGANIZATION
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -360,7 +395,7 @@ async function createInvite(orgId, email, role, invitedBy) {
     });
 
     const inviteUrl = `/accept-invite?token=${token}`;
-    const emailResult = await emailService.sendInviteEmail({
+    const emailResult = await safeEmail('sendInviteEmail', {
       email,
       inviteUrl,
       organizationName: org.name,
@@ -374,6 +409,7 @@ async function createInvite(orgId, email, role, invitedBy) {
       inviteUrl,
       emailSent: emailResult.success,
       emailError: emailResult.reason,
+      mailDisabled: emailResult.reason === 'MAIL_DISABLED' || emailResult.reason === 'NOT_IMPLEMENTED',
       reused: true,
     };
   }
@@ -392,9 +428,9 @@ async function createInvite(orgId, email, role, invitedBy) {
 
   await logAuditEvent(orgId, invitedBy, 'invite_sent', 'invite', result.rows[0].id, { email, role });
 
-  // Send invite email
+  // Send invite email (no-op if mail is disabled/parked — invite creation still succeeds)
   const inviteUrl = `/accept-invite?token=${token}`;
-  const emailResult = await emailService.sendInviteEmail({
+  const emailResult = await safeEmail('sendInviteEmail', {
     email,
     inviteUrl,
     organizationName: org.name,
@@ -408,6 +444,7 @@ async function createInvite(orgId, email, role, invitedBy) {
     inviteUrl,
     emailSent: emailResult.success,
     emailError: emailResult.reason,
+    mailDisabled: emailResult.reason === 'MAIL_DISABLED' || emailResult.reason === 'NOT_IMPLEMENTED',
     reused: false,
   };
 }
@@ -471,9 +508,9 @@ async function resendInvite(orgId, inviteId, actorId) {
   const inviterResult = await db.query('SELECT email FROM users WHERE id = $1', [actorId]);
   const inviterEmail = inviterResult.rows[0]?.email || 'A team member';
 
-  // Send invite email again
+  // Send invite email again (no-op if mail parked)
   const inviteUrl = `/accept-invite?token=${token}`;
-  const emailResult = await emailService.sendInviteEmail({
+  const emailResult = await safeEmail('sendInviteEmail', {
     email: invite.rows[0].email,
     inviteUrl,
     organizationName: org.name,
@@ -484,10 +521,14 @@ async function resendInvite(orgId, inviteId, actorId) {
   return {
     id: inviteId,
     email: invite.rows[0].email,
+    role: invite.rows[0].role,
+    status: 'pending',
+    expiresAt: expiresAt,
     token,
     inviteUrl,
     emailSent: emailResult.success,
     emailError: emailResult.reason,
+    mailDisabled: emailResult.reason === 'MAIL_DISABLED' || emailResult.reason === 'NOT_IMPLEMENTED',
   };
 }
 
@@ -566,11 +607,11 @@ async function acceptInvite(token, userId) {
     role: inv.role,
   });
 
-  // Send welcome email
-  emailService.sendWelcomeEmail({
+  // Send welcome email (no-op if mail parked)
+  safeEmail('sendWelcomeEmail', {
     email: inv.email,
     organizationName: inv.org_name,
-  });
+  }).catch(() => {});
 
   return {
     organizationId: inv.organization_id,
@@ -607,10 +648,12 @@ async function getInviteByToken(token) {
 
 async function listAllowedDomains(orgId) {
   const result = await db.query(
-    `SELECT id, domain, created_at
-     FROM allowed_email_domains
-     WHERE organization_id = $1
-     ORDER BY domain`,
+    `SELECT d.id, d.domain, d.created_at, d.created_by,
+            u.email AS created_by_email
+     FROM allowed_email_domains d
+     LEFT JOIN users u ON d.created_by = u.id
+     WHERE d.organization_id = $1
+     ORDER BY d.created_at DESC, d.domain ASC`,
     [orgId]
   );
   return result.rows;
@@ -626,15 +669,20 @@ async function addAllowedDomain(orgId, domain, actorId) {
 
   try {
     const result = await db.query(
-      `INSERT INTO allowed_email_domains (organization_id, domain)
-       VALUES ($1, $2)
-       RETURNING id, domain, created_at`,
-      [orgId, domain]
+      `INSERT INTO allowed_email_domains (organization_id, domain, created_by)
+       VALUES ($1, $2, $3)
+       RETURNING id, domain, created_by, created_at`,
+      [orgId, domain, actorId]
     );
 
     await logAuditEvent(orgId, actorId, 'domain_added', 'domain', result.rows[0].id, { domain });
 
-    return result.rows[0];
+    // Re-attach created_by_email for immediate UI display
+    const actorResult = await db.query('SELECT email FROM users WHERE id = $1', [actorId]);
+    return {
+      ...result.rows[0],
+      created_by_email: actorResult.rows[0]?.email || null,
+    };
   } catch (err) {
     if (err.code === '23505') {
       throw new ConflictError('Domain already added');
