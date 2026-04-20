@@ -14,12 +14,18 @@ const { UnauthorizedError } = require('../utils/apiError');
  */
 function authenticate(req, _res, next) {
   const authHeader = req.headers.authorization;
+  let token = null;
 
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return next(new UnauthorizedError('Missing or malformed authorization header'));
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    token = authHeader.split(' ')[1];
+  } else if (req.query && typeof req.query.token === 'string' && req.query.token) {
+    // SSE/EventSource cannot set headers — accept token via query string
+    token = req.query.token;
   }
 
-  const token = authHeader.split(' ')[1];
+  if (!token) {
+    return next(new UnauthorizedError('Missing or malformed authorization header'));
+  }
 
   try {
     const decoded = jwt.verify(token, config.JWT_SECRET);

@@ -23,8 +23,8 @@ const rateLimiter = require('./middleware/rateLimiter'); // default export = gen
 const app = express();
 
 // Build info for deployment verification
-const BUILD_VERSION = '3.2.0';
-const BUILD_DATE = '2026-04-16T00:00:00Z';
+const BUILD_VERSION = '2.3.0';
+const BUILD_DATE = '2026-04-20T00:00:00Z';
 
 logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backend starting...');
 
@@ -84,6 +84,9 @@ const scheduleRoutes = safeRequire('./routes/schedules', 'schedules');
 const reportRoutes = safeRequire('./routes/reports', 'reports');
 const dashboardRoutes = safeRequire('./routes/dashboard', 'dashboard');
 const runReportRoutes = safeRequire('./routes/run-reports', 'run-reports');
+const globalsRoutes = safeRequire('./routes/globals', 'globals');
+const sharingRoutes = safeRequire('./routes/sharing', 'sharing');
+const jiraRoutes = safeRequire('./routes/jira', 'jira');
 
 // ============================================================================
 // CORS — supports a single origin, '*' wildcard, or comma-separated allow list.
@@ -166,6 +169,13 @@ app.use('/api/reports', reportRoutes);
 logger.info('Mounting dashboard routes at /api/dashboard');
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/run-reports', runReportRoutes);
+app.use('/api/globals', globalsRoutes);
+app.use('/api/jira', jiraRoutes);
+// Sharing is mounted as a sub-router on collections: /api/collections/:id/share
+app.use('/api/collections/:id/share', (req, res, next) => {
+  req.params.id = req.params.id; // preserve param
+  next();
+}, sharingRoutes);
 
 // Execute routes LAST — mounted at /api with `router.use(authenticate)` inside.
 app.use('/api', executeRoutes);

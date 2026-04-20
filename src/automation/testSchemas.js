@@ -22,24 +22,30 @@ const uiTestSchema = z.object({
   }),
 });
 
-// Schema for an API test definition
+// Schema for an API test definition — JSON payload only (v2.3)
 const apiTestSchema = z.object({
   name: z.string().min(1).max(200),
   type: z.literal('api'),
   config: z.object({
     method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']),
-    url: z.string().url(),
+    url: z.string().min(1),
     headers: z.record(z.string()).optional(),
-    body: z.any().optional(),
+    // JSON-only: object or array; no raw strings, no form-data
+    body: z.union([z.record(z.any()), z.array(z.any())]).nullable().optional(),
     assertions: z.array(
       z.object({
         target: z.enum(['status', 'body', 'header', 'response_time']),
         operator: z.enum(['equals', 'contains', 'greater_than', 'less_than', 'exists', 'matches']),
         expected: z.any(),
-        path: z.string().optional(), // JSON path for body assertions like "data.id"
+        path: z.string().optional(),
       })
     ).min(1).max(20),
     timeout: z.number().default(10000),
+    // Response chaining extractors: [{name: "userId", path: "data.id"}]
+    extractors: z.array(z.object({
+      name: z.string().min(1),
+      path: z.string().min(1),
+    })).optional(),
   }),
 });
 

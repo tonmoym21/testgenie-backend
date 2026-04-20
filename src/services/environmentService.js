@@ -4,18 +4,18 @@ const { NotFoundError } = require('../utils/apiError');
 
 /**
  * Environment Variable Service
- * Handles CRUD, resolution, and secure secret masking
+ * Supports three variable syntaxes:
+ *   {{VAR_NAME}}          - direct env var lookup (legacy)
+ *   {{env:VAR_NAME}}      - explicit env namespace (v2.3)
+ *   {{response.prev.path}} - response chaining (resolved in collection runner)
  */
 
-// Regex to match {{VARIABLE_NAME}} patterns
-const VAR_PATTERN = /\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}/g;
+// Matches: {{VAR}}, {{env:VAR}}, {{response.prev.field.nested}}
+const VAR_PATTERN = /\{\{(env:[A-Za-z_][A-Za-z0-9_]*|response\.prev\.[A-Za-z_][A-Za-z0-9_.]*|[A-Za-z_][A-Za-z0-9_]*)\}\}/g;
 
-/**
- * Get all environments for a user
- */
 async function getEnvironments(userId) {
   const result = await db.query(
-    `SELECT id, name, variables, is_secret AS "isSecret", is_active AS "isActive", 
+    `SELECT id, name, variables, is_secret AS "isSecret", is_active AS "isActive",
             created_at AS "createdAt", updated_at AS "updatedAt"
      FROM environments WHERE user_id = $1 ORDER BY created_at DESC`,
     [userId]
@@ -23,9 +23,6 @@ async function getEnvironments(userId) {
   return result.rows.map(maskSecrets);
 }
 
-/**
- * Get single environment by ID
- */
 async function getEnvironment(userId, envId) {
   const result = await db.query(
     `SELECT id, name, variables, is_secret AS "isSecret", is_active AS "isActive",
@@ -37,9 +34,6 @@ async function getEnvironment(userId, envId) {
   return maskSecrets(result.rows[0]);
 }
 
-/**
- * Get active environment for a user
- */
 async function getActiveEnvironment(userId) {
   const result = await db.query(
     `SELECT id, name, variables, is_secret AS "isSecret", is_active AS "isActive"
@@ -49,42 +43,41 @@ async function getActiveEnvironment(userId) {
   return result.rows[0] || null;
 }
 
-/**
- * Create a new environment
- */
 async function createEnvironment(userId, data) {
   const { name, variables, isSecret = {}, isActive = false } = data;
-  
   if (isActive) {
     await db.query('UPDATE environments SET is_active = false WHERE user_id = $1', [userId]);
   }
-  
   const result = await db.query(
     `INSERT INTO environments (user_id, name, variables, is_secret, is_active)
      VALUES ($1, $2, $3, $4, $5)
      RETURNING id, name, variables, is_secret AS "isSecret", is_active AS "isActive", created_at AS "createdAt"`,
     [userId, name, JSON.stringify(variables || {}), JSON.stringify(isSecret), isActive]
   );
-  
   logger.info({ userId, envId: result.rows[0].id, name }, 'Environment created');
   return maskSecrets(result.rows[0]);
 }
 
 /**
- * Resolve variables in a string using environment variables
+ * Resolve a single string against a flat variables map.
+ * Handles:
+ *   {{VAR_NAME}}           → variables['VAR_NAME']
+ *   {{env:VAR_NAME}}       → variables['VAR_NAME']  (strip "env:" prefix)
+ *   {{response.prev.path}} → variables['response.prev.path']  (pre-injected by chain runner)
  */
 function resolveVariables(text, variables) {
   if (!text || typeof text !== 'string') return text;
-  return text.replace(VAR_PATTERN, (match, varName) => {
-    if (varName in variables) return variables[varName];
-    logger.warn({ varName }, 'Unresolved environment variable');
+  return text.replace(VAR_PATTERN, (match, token) => {
+    // Normalise env: prefix → bare key
+    const key = token.startsWith('env:') ? token.slice(4) : token;
+    if (key in variables) return variables[key];
+    // response.prev.* may be stored under full dotted key
+    if (token in variables) return variables[token];
+    logger.warn({ token }, 'Unresolved variable');
     return match;
   });
 }
 
-/**
- * Resolve variables in an object recursively
- */
 function resolveObjectVariables(obj, variables) {
   if (!obj || !variables) return obj;
   if (typeof obj === 'string') return resolveVariables(obj, variables);
@@ -99,9 +92,6 @@ function resolveObjectVariables(obj, variables) {
   return obj;
 }
 
-/**
- * Resolve test definition with environment variables
- */
 async function resolveTestDefinition(userId, testDef, envId = null) {
   let env;
   if (envId) {
@@ -114,16 +104,11 @@ async function resolveTestDefinition(userId, testDef, envId = null) {
   } else {
     env = await getActiveEnvironment(userId);
   }
-  
   if (!env || !env.variables) return testDef;
-  
   const variables = typeof env.variables === 'string' ? JSON.parse(env.variables) : env.variables;
   return resolveObjectVariables(JSON.parse(JSON.stringify(testDef)), variables);
 }
 
-/**
- * Get raw variables for resolution (includes secrets)
- */
 async function getRawVariables(userId, envId = null) {
   let result;
   if (envId) {
@@ -137,8 +122,49 @@ async function getRawVariables(userId, envId = null) {
 }
 
 /**
- * Mask secret values in environment response
+ * Get global variables for a user and merge them into a flat map.
+ * Global vars are injected BEFORE env vars so env vars can override them.
  */
+async function getGlobalVariables(userId) {
+  const result = await db.query(
+    'SELECT key, value FROM global_variables WHERE user_id = $1',
+    [userId]
+  );
+  const map = {};
+  for (const row of result.rows) map[row.key] = row.value;
+  return map;
+}
+
+/**
+ * Build merged variable context: globals → env vars → chain overrides
+ * Priority (highest wins): chainVars > envVars > globalVars
+ */
+async function buildVariableContext(userId, envId = null, chainVars = {}) {
+  const globalVars = await getGlobalVariables(userId);
+  const envVars = await getRawVariables(userId, envId);
+  return { ...globalVars, ...envVars, ...chainVars };
+}
+
+/**
+ * Inject previous response data into chain vars as "response.prev.*" keys.
+ * Handles nested objects via dot-flattening one level deep.
+ */
+function buildChainVars(prevResponseBody) {
+  if (!prevResponseBody || typeof prevResponseBody !== 'object') return {};
+  const chain = {};
+  function flatten(obj, prefix) {
+    for (const [k, v] of Object.entries(obj)) {
+      const dotKey = `${prefix}.${k}`;
+      chain[dotKey] = String(v ?? '');
+      if (v && typeof v === 'object' && !Array.isArray(v)) {
+        flatten(v, dotKey);
+      }
+    }
+  }
+  flatten(prevResponseBody, 'response.prev');
+  return chain;
+}
+
 function maskSecrets(env) {
   if (!env) return env;
   const isSecret = typeof env.isSecret === 'string' ? JSON.parse(env.isSecret) : env.isSecret || {};
@@ -150,9 +176,6 @@ function maskSecrets(env) {
   return { ...env, variables: maskedVariables, isSecret };
 }
 
-/**
- * Mask secrets in logs and error messages
- */
 function maskSecretsInText(text, secretValues) {
   if (!text || !secretValues || secretValues.length === 0) return text;
   let masked = text;
@@ -162,9 +185,6 @@ function maskSecretsInText(text, secretValues) {
   return masked;
 }
 
-/**
- * Get list of secret values for masking in logs
- */
 async function getSecretValues(userId, envId = null) {
   let result;
   if (envId) {
@@ -186,5 +206,6 @@ async function getSecretValues(userId, envId = null) {
 module.exports = {
   getEnvironments, getEnvironment, getActiveEnvironment, createEnvironment,
   resolveVariables, resolveObjectVariables, resolveTestDefinition,
-  getRawVariables, maskSecrets, maskSecretsInText, getSecretValues,
+  getRawVariables, getGlobalVariables, buildVariableContext, buildChainVars,
+  maskSecrets, maskSecretsInText, getSecretValues,
 };
