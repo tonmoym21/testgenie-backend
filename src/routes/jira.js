@@ -16,7 +16,6 @@ const { NotFoundError } = require('../utils/apiError');
 const logger = require('../utils/logger');
 
 const router = Router();
-router.use(authenticate);
 
 const JIRA_AUTH_URL = 'https://auth.atlassian.com/authorize';
 const JIRA_TOKEN_URL = 'https://auth.atlassian.com/oauth/token';
@@ -29,6 +28,68 @@ function jiraConfig() {
     redirectUri: process.env.JIRA_REDIRECT_URI || `${process.env.APP_URL || 'http://localhost:3000'}/api/jira/callback`,
   };
 }
+
+// GET /api/jira/callback — OAuth2 callback (called by Atlassian, no JWT)
+// Declared BEFORE authenticate middleware so it's publicly reachable.
+router.get('/callback', async (req, res, next) => {
+  try {
+    const { code, state } = req.query;
+    if (!code) return res.status(400).send('Missing OAuth code');
+
+    let userId;
+    try {
+      const s = JSON.parse(Buffer.from(state || '', 'base64').toString('utf8'));
+      userId = s.userId;
+    } catch { return res.status(400).send('Invalid state'); }
+    if (!userId) return res.status(400).send('Missing user in state');
+
+    const { clientId, clientSecret, redirectUri } = jiraConfig();
+    const tokenRes = await fetch(JIRA_TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        grant_type: 'authorization_code',
+        client_id: clientId,
+        client_secret: clientSecret,
+        code,
+        redirect_uri: redirectUri,
+      }),
+    });
+    if (!tokenRes.ok) {
+      const err = await tokenRes.text();
+      logger.error({ err }, 'Jira token exchange failed');
+      return res.status(400).send('OAuth token exchange failed');
+    }
+
+    const tokens = await tokenRes.json();
+    const expiresAt = new Date(Date.now() + tokens.expires_in * 1000);
+    const resourcesRes = await fetch(JIRA_RESOURCES_URL, {
+      headers: { Authorization: `Bearer ${tokens.access_token}` },
+    });
+    const resources = resourcesRes.ok ? await resourcesRes.json() : [];
+    const site = resources[0] || {};
+
+    await db.query(
+      `INSERT INTO jira_integrations (user_id, jira_base_url, cloud_id, access_token, refresh_token, token_expires_at, is_active)
+       VALUES ($1, $2, $3, $4, $5, $6, true)
+       ON CONFLICT (user_id) DO UPDATE SET
+         jira_base_url = EXCLUDED.jira_base_url,
+         cloud_id = EXCLUDED.cloud_id,
+         access_token = EXCLUDED.access_token,
+         refresh_token = EXCLUDED.refresh_token,
+         token_expires_at = EXCLUDED.token_expires_at,
+         is_active = true,
+         updated_at = NOW()`,
+      [userId, site.url || '', site.id || '', tokens.access_token, tokens.refresh_token || null, expiresAt]
+    );
+
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+    res.redirect(`${frontendUrl}/jira?connected=1`);
+  } catch (err) { next(err); }
+});
+
+// All routes below require authentication
+router.use(authenticate);
 
 // GET /api/jira/status — check if user has active integration
 router.get('/status', async (req, res, next) => {
@@ -61,61 +122,6 @@ router.get('/auth-url', (req, res) => {
     prompt: 'consent',
   });
   res.json({ url: `${JIRA_AUTH_URL}?${params}` });
-});
-
-// GET /api/jira/callback — OAuth2 callback (also called via query-param redirect)
-router.get('/callback', async (req, res, next) => {
-  try {
-    const { code, state } = req.query;
-    if (!code) return res.status(400).json({ error: { code: 'MISSING_CODE', message: 'No OAuth code' } });
-
-    const { clientId, clientSecret, redirectUri } = jiraConfig();
-    const tokenRes = await fetch(JIRA_TOKEN_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        grant_type: 'authorization_code',
-        client_id: clientId,
-        client_secret: clientSecret,
-        code,
-        redirect_uri: redirectUri,
-      }),
-    });
-
-    if (!tokenRes.ok) {
-      const err = await tokenRes.text();
-      logger.error({ err }, 'Jira token exchange failed');
-      return res.status(400).json({ error: { code: 'TOKEN_EXCHANGE_FAILED', message: 'OAuth token exchange failed' } });
-    }
-
-    const tokens = await tokenRes.json();
-    const expiresAt = new Date(Date.now() + tokens.expires_in * 1000);
-
-    // Fetch accessible resources to get cloud ID and base URL
-    const resourcesRes = await fetch(JIRA_RESOURCES_URL, {
-      headers: { Authorization: `Bearer ${tokens.access_token}` },
-    });
-    const resources = resourcesRes.ok ? await resourcesRes.json() : [];
-    const site = resources[0] || {};
-
-    await db.query(
-      `INSERT INTO jira_integrations (user_id, jira_base_url, cloud_id, access_token, refresh_token, token_expires_at, is_active)
-       VALUES ($1, $2, $3, $4, $5, $6, true)
-       ON CONFLICT (user_id) DO UPDATE SET
-         jira_base_url = EXCLUDED.jira_base_url,
-         cloud_id = EXCLUDED.cloud_id,
-         access_token = EXCLUDED.access_token,
-         refresh_token = EXCLUDED.refresh_token,
-         token_expires_at = EXCLUDED.token_expires_at,
-         is_active = true,
-         updated_at = NOW()`,
-      [req.user.id, site.url || '', site.id || '', tokens.access_token, tokens.refresh_token || null, expiresAt]
-    );
-
-    // Redirect to frontend Jira page
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
-    res.redirect(`${frontendUrl}/jira?connected=1`);
-  } catch (err) { next(err); }
 });
 
 // DELETE /api/jira/disconnect — remove integration
