@@ -17,7 +17,7 @@ const envSchema = z.object({
 
   OPENAI_API_KEY: z.string().min(1),
   OPENAI_MODEL: z.string().default('gpt-4o'),
-  OPENAI_MAX_TOKENS: z.coerce.number().default(4000),
+  OPENAI_MAX_TOKENS: z.coerce.number().default(12000),
 
   AUTH_RATE_LIMIT_WINDOW_MS: z.coerce.number().default(900000),
   AUTH_RATE_LIMIT_MAX: z.coerce.number().default(20),

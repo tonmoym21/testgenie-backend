@@ -274,6 +274,60 @@ router.post('/:storyId/export-csv', authenticate, async (req, res, next) => {
   }
 });
 
+// POST /api/projects/:projectId/stories/:storyId/scenarios — manually add a scenario
+router.post('/:storyId/scenarios', authenticate, async (req, res, next) => {
+  try {
+    const { projectId, storyId } = req.params;
+    const userId = req.user.id;
+
+    const storyCheck = await db.query(
+      'SELECT id FROM stories WHERE id = $1 AND project_id = $2 AND user_id = $3',
+      [storyId, projectId, userId]
+    );
+    if (storyCheck.rows.length === 0) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Story not found' } });
+    }
+
+    const { category, title, summary, preconditions, test_intent, inputs, expected_outcome, priority } = req.body;
+
+    const validCategories = ['happy_path', 'negative', 'edge', 'validation', 'role_permission', 'state_transition', 'api_impact', 'non_functional'];
+    const validPriorities = ['P0', 'P1', 'P2', 'P3'];
+
+    if (!category || !validCategories.includes(category)) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: 'Invalid category' } });
+    }
+    if (!title || title.trim().length < 5) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: 'Title must be at least 5 characters' } });
+    }
+    if (!expected_outcome || expected_outcome.trim().length < 5) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: 'Expected outcome is required' } });
+    }
+    if (!priority || !validPriorities.includes(priority)) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: 'Invalid priority' } });
+    }
+
+    const result = await db.query(
+      `INSERT INTO scenarios (story_id, project_id, user_id, category, title, summary, preconditions, test_intent, inputs, expected_outcome, priority, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending')
+       RETURNING *`,
+      [
+        storyId, projectId, userId,
+        category, title.trim(),
+        summary ? summary.trim() : '',
+        JSON.stringify(Array.isArray(preconditions) ? preconditions : (preconditions ? [preconditions] : [])),
+        test_intent ? test_intent.trim() : '',
+        JSON.stringify(inputs && typeof inputs === 'object' ? inputs : {}),
+        expected_outcome.trim(),
+        priority,
+      ]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /api/projects/:projectId/stories/:storyId/coverage
 router.get('/:storyId/coverage', authenticate, async (req, res, next) => {
   try {
@@ -315,7 +369,16 @@ router.get('/:storyId/coverage', authenticate, async (req, res, next) => {
 
     const missingCategories = allCategories.filter(c => !byCategory[c]);
     const coveredCount = allCategories.length - missingCategories.length;
-    const qualityScore = Math.round((coveredCount / allCategories.length) * 100);
+
+    // Quality score: 70% from category coverage + 30% from depth (avg scenarios per covered category)
+    const categoryScore = (coveredCount / allCategories.length) * 70;
+    let depthScore = 0;
+    if (coveredCount > 0) {
+      const coveredCats = allCategories.filter(c => byCategory[c]);
+      const avgPerCat = coveredCats.reduce((sum, c) => sum + byCategory[c].total, 0) / coveredCats.length;
+      depthScore = Math.min(avgPerCat / 3, 1) * 30;
+    }
+    const qualityScore = Math.min(Math.round(categoryScore + depthScore), 100);
 
     res.json({ total, approved, rejected, pending, byCategory, missingCategories, qualityScore, readyForExport: approved > 0 && pending === 0 });
   } catch (err) {
