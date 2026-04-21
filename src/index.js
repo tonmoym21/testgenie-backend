@@ -29,6 +29,38 @@ const BUILD_DATE = '2026-04-20T00:00:00Z';
 logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backend starting...');
 
 // ============================================================================
+// INLINE STARTUP MIGRATIONS — idempotent ALTER TABLE IF NOT EXISTS statements
+// run on boot so Railway deploys don't need a separate migration step.
+// ============================================================================
+(async function runStartupMigrations() {
+  try {
+    const db = require('./db');
+    const statements = [
+      `ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS story_id INTEGER REFERENCES stories(id) ON DELETE SET NULL`,
+      `ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS jira_issue_key VARCHAR(50)`,
+      `ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS organization_id INTEGER REFERENCES organizations(id) ON DELETE SET NULL`,
+      `ALTER TABLE scenarios ADD COLUMN IF NOT EXISTS jira_issue_key VARCHAR(50)`,
+      `CREATE INDEX IF NOT EXISTS idx_test_cases_story_id ON test_cases(story_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_test_cases_jira_issue_key ON test_cases(jira_issue_key)`,
+      `CREATE INDEX IF NOT EXISTS idx_test_cases_organization_id ON test_cases(organization_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_scenarios_jira_issue_key ON scenarios(jira_issue_key)`,
+      `UPDATE test_cases tc SET organization_id = u.organization_id FROM users u
+         WHERE tc.user_id = u.id AND u.organization_id IS NOT NULL AND tc.organization_id IS NULL`,
+    ];
+    for (const sql of statements) {
+      try {
+        await db.query(sql);
+      } catch (err) {
+        logger.warn({ err: err.message, sql: sql.slice(0, 80) }, 'Startup migration statement failed (continuing)');
+      }
+    }
+    logger.info('Startup migrations complete');
+  } catch (err) {
+    logger.error({ err: err.message }, 'Startup migrations failed to run');
+  }
+})();
+
+// ============================================================================
 // LIGHTWEIGHT HEALTHCHECKS — mounted BEFORE everything else so Railway's
 // healthcheck always passes regardless of DB/route state.
 // ============================================================================
