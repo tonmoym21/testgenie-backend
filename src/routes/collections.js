@@ -231,6 +231,48 @@ router.delete('/:colId/tests/:testId', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// POST /api/collections/:colId/tests/:testId/run — run a single test
+router.post('/:colId/tests/:testId/run', async (req, res, next) => {
+  try {
+    const col = await db.query('SELECT id FROM collections WHERE id = $1 AND user_id = $2', [req.params.colId, req.user.id]);
+    if (col.rows.length === 0) throw new NotFoundError('Collection');
+
+    const t = await db.query(
+      'SELECT id, name, test_type, test_definition FROM collection_tests WHERE id = $1 AND collection_id = $2',
+      [req.params.testId, req.params.colId]
+    );
+    if (t.rows.length === 0) throw new NotFoundError('Test');
+
+    const { environmentId } = req.body || {};
+    const baseVars = await envService.buildVariableContext(req.user.id, environmentId || null);
+    const row = t.rows[0];
+    const testDef = typeof row.test_definition === 'string' ? JSON.parse(row.test_definition) : row.test_definition;
+    const resolvedDef = envService.resolveObjectVariables(testDef, baseVars);
+    const fullTest = {
+      name: row.name,
+      type: row.test_type,
+      config: resolvedDef,
+      ...resolvedDef,
+    };
+    const executionService = require('../automation/executionService');
+    const result = await executionService.executeTest(req.user.id, null, fullTest);
+
+    res.json({
+      testId: row.id,
+      name: row.name,
+      type: row.test_type,
+      executionId: result.id,
+      status: result.status,
+      duration: result.duration,
+      error: result.error,
+      rawResponse: result.rawResponse,
+      assertionResults: result.assertionResults || [],
+      logs: result.logs || [],
+      extractedVars: result.extractedVars || {},
+    });
+  } catch (err) { next(err); }
+});
+
 // ============================
 // Run helpers
 // ============================
@@ -460,6 +502,27 @@ router.get('/:id/run-stream', async (req, res, next) => {
     const tests = await fetchTestsForRun(req.params.id, { folderId, parsedTestIds });
     const baseVars = await envService.buildVariableContext(req.user.id, environmentId || null);
 
+    // Create run report so the UI can link to /reports/:reportId
+    let envName = null;
+    if (environmentId) {
+      const envRow = await db.query('SELECT name FROM environments WHERE id = $1', [environmentId]);
+      envName = envRow.rows[0]?.name;
+    }
+    const report = await runReportService.createRunReport(req.user.id, {
+      runType: 'collection',
+      collectionId: parseInt(req.params.id),
+      folderId: folderId || null,
+      environmentId: environmentId || null,
+      environmentName: envName,
+      environmentSnapshot: baseVars,
+      title: col.rows[0].name,
+      triggeredBy: 'manual',
+    });
+    await db.query(
+      'UPDATE run_reports SET progress_total = $1 WHERE id = $2',
+      [tests.length, report.id]
+    ).catch(() => {});
+
     // SSE setup
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
@@ -470,16 +533,29 @@ router.get('/:id/run-stream', async (req, res, next) => {
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     };
 
-    send('start', { total: tests.length, collectionName: col.rows[0].name });
+    send('start', { total: tests.length, collectionName: col.rows[0].name, reportId: report.id });
 
     let completed = 0;
     const allResults = [];
 
     const executionService = require('../automation/executionService');
 
-    const onProgress = (index, result) => {
+    const onProgress = async (index, result) => {
       completed++;
       allResults.push(result);
+      await runReportService.addTestResult(report.id, {
+        testId: result.testId,
+        name: result.name,
+        status: result.status,
+        duration: result.duration,
+        error: result.error,
+        rawResponse: result.rawResponse,
+        assertionResults: result.assertionResults,
+      }).catch(() => {});
+      await db.query(
+        'UPDATE run_reports SET progress_completed = progress_completed + 1 WHERE id = $1',
+        [report.id]
+      ).catch(() => {});
       send('progress', {
         index,
         completed,
@@ -497,11 +573,14 @@ router.get('/:id/run-stream', async (req, res, next) => {
     await runTestsParallel(tests, baseVars, executionService, req.user.id, onProgress);
 
     const passed = allResults.filter((r) => r.status === 'passed').length;
+    const failed = allResults.length - passed;
+    await runReportService.completeRunReport(report.id, failed === 0 ? 'completed' : 'failed').catch(() => {});
     send('done', {
       total: tests.length,
       passed,
       failed: tests.length - passed,
       passRate: tests.length > 0 ? Math.round((passed / tests.length) * 100) : 0,
+      reportId: report.id,
     });
 
     res.end();

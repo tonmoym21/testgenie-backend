@@ -155,10 +155,13 @@ app.use('/api/auth', authRoutes);
 app.use('/api/projects', projectRoutes);
 app.use('/api/testcases', testcaseRoutes);
 app.use('/api/analyze', analyzeRoutes);
+// Stories and target-config routers use mergeParams and read req.params.projectId
+app.use('/api/projects/:projectId/stories', storyRoutes);
+app.use('/api/projects/:projectId/target-config', targetConfigRoutes);
+// Legacy/top-level mount for stories (for pages that don't have a projectId in URL)
 app.use('/api/stories', storyRoutes);
 app.use('/api/playwright', playwrightRoutes);
 app.use('/api/automation-assets', automationAssetRoutes);
-app.use('/api/target-config', targetConfigRoutes);
 app.use('/api/team', teamRoutes);
 app.use('/api/environments', environmentRoutes);
 app.use('/api/collections', collectionRoutes);
@@ -172,10 +175,8 @@ app.use('/api/run-reports', runReportRoutes);
 app.use('/api/globals', globalsRoutes);
 app.use('/api/jira', jiraRoutes);
 // Sharing is mounted as a sub-router on collections: /api/collections/:id/share
-app.use('/api/collections/:id/share', (req, res, next) => {
-  req.params.id = req.params.id; // preserve param
-  next();
-}, sharingRoutes);
+// sharing router uses mergeParams to read req.params.id
+app.use('/api/collections/:id/share', sharingRoutes);
 
 // Execute routes LAST — mounted at /api with `router.use(authenticate)` inside.
 app.use('/api', executeRoutes);
