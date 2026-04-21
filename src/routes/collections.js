@@ -281,8 +281,15 @@ async function runTestsParallel(tests, baseVars, executionService, userId, onPro
     const vars = { ...baseVars, ...chainVars };
 
     try {
-      const resolved = envService.resolveObjectVariables(testDef, vars);
-      const result = await executionService.executeTest(userId, null, resolved);
+      const resolvedDef = envService.resolveObjectVariables(testDef, vars);
+      // executeTest expects a full test def with name + type at top level
+      const fullTest = {
+        name: test.name,
+        type: test.test_type,
+        config: resolvedDef,
+        ...resolvedDef,
+      };
+      const result = await executionService.executeTest(userId, null, fullTest);
 
       // Update chain vars from this test's extractors
       if (result.extractedVars && Object.keys(result.extractedVars).length) {
