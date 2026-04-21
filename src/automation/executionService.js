@@ -38,8 +38,8 @@ async function executeTest(userId, projectId, testDef) {
     [
       userId,
       projectId || null,
-      result.name,
-      result.type,
+      result.name || testDef.name,
+      result.type || testDef.type,
       JSON.stringify(testDef),
       result.status,
       result.error || null,
