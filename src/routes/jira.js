@@ -195,6 +195,67 @@ router.get('/search', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// GET /api/jira/issue/:issueKey/test-cases — all test cases linked to a Jira issue (org-wide)
+router.get('/issue/:issueKey/test-cases', async (req, res, next) => {
+  try {
+    const { issueKey } = req.params;
+    const { id: userId, orgId } = req.user;
+
+    const result = await db.query(
+      `SELECT tc.id, tc.title, tc.content, tc.status, tc.priority,
+              tc.jira_issue_key AS "jiraIssueKey",
+              tc.created_at AS "createdAt", u.email AS "createdByEmail",
+              p.name AS "projectName"
+       FROM test_cases tc
+       JOIN users u ON u.id = tc.user_id
+       JOIN projects p ON p.id = tc.project_id
+       WHERE tc.jira_issue_key = $1
+         AND (tc.user_id = $2 OR u.organization_id = $3)
+       ORDER BY tc.created_at DESC`,
+      [issueKey, userId, orgId || -1]
+    );
+    res.json({ issueKey, data: result.rows });
+  } catch (err) { next(err); }
+});
+
+// POST /api/jira/issue/:issueKey/sync-test-cases — push linked test cases as a Jira comment
+router.post('/issue/:issueKey/sync-test-cases', async (req, res, next) => {
+  try {
+    const { issueKey } = req.params;
+    const { id: userId, orgId } = req.user;
+
+    const token = await getValidToken(userId);
+    const integration = await db.query('SELECT cloud_id FROM jira_integrations WHERE user_id = $1', [userId]);
+    const cloudId = integration.rows[0]?.cloud_id;
+    if (!cloudId) return res.status(400).json({ error: 'No active Jira integration' });
+
+    const tcResult = await db.query(
+      `SELECT tc.id, tc.title, tc.content, tc.status, tc.priority
+       FROM test_cases tc
+       JOIN users u ON u.id = tc.user_id
+       WHERE tc.jira_issue_key = $1
+         AND (tc.user_id = $2 OR u.organization_id = $3)
+       ORDER BY tc.created_at DESC`,
+      [issueKey, userId, orgId || -1]
+    );
+    if (tcResult.rows.length === 0) {
+      return res.status(400).json({ error: 'No test cases linked to this issue' });
+    }
+
+    const adf = buildTestCaseComment(tcResult.rows, issueKey);
+    await fetch(
+      `https://api.atlassian.com/ex/jira/${cloudId}/rest/api/3/issue/${issueKey}/comment`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ body: adf }),
+      }
+    );
+
+    res.json({ message: 'Synced', count: tcResult.rows.length });
+  } catch (err) { next(err); }
+});
+
 // GET /api/jira/links — list test links for user
 router.get('/links', async (req, res, next) => {
   try {
@@ -300,5 +361,25 @@ router.post('/links/:id/sync', async (req, res, next) => {
     res.json({ message: 'Synced', status: lastStatus, summary: summaryText });
   } catch (err) { next(err); }
 });
+
+function buildTestCaseComment(testCases, context) {
+  const content = [
+    {
+      type: 'paragraph',
+      content: [{ type: 'text', text: `🧪 TestForge Test Cases — ${context}`, marks: [{ type: 'strong' }] }],
+    },
+  ];
+  for (const tc of testCases) {
+    content.push({
+      type: 'paragraph',
+      content: [{ type: 'text', text: `[${(tc.priority || 'medium').toUpperCase()}] ${tc.title}`, marks: [{ type: 'strong' }] }],
+    });
+    if (tc.content) {
+      content.push({ type: 'paragraph', content: [{ type: 'text', text: tc.content }] });
+    }
+    content.push({ type: 'rule' });
+  }
+  return { type: 'doc', version: 1, content };
+}
 
 module.exports = router;

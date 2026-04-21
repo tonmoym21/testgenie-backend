@@ -274,6 +274,110 @@ router.post('/:storyId/export-csv', authenticate, async (req, res, next) => {
   }
 });
 
+// GET /api/projects/:projectId/stories/:storyId/manual-test-cases
+router.get('/:storyId/manual-test-cases', authenticate, async (req, res, next) => {
+  try {
+    const { projectId, storyId } = req.params;
+    const { id: userId, orgId } = req.user;
+
+    const storyCheck = await db.query(
+      'SELECT id FROM stories WHERE id = $1 AND project_id = $2',
+      [storyId, projectId]
+    );
+    if (storyCheck.rows.length === 0) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Story not found' } });
+    }
+
+    // Fetch test cases linked to this story — visible to the whole org
+    let query, params;
+    if (orgId) {
+      query = `SELECT tc.id, tc.title, tc.content, tc.status, tc.priority,
+                      tc.jira_issue_key AS "jiraIssueKey",
+                      tc.created_at AS "createdAt", tc.user_id AS "createdBy",
+                      u.email AS "createdByEmail"
+               FROM test_cases tc
+               JOIN users u ON u.id = tc.user_id
+               WHERE tc.story_id = $1 AND tc.project_id = $2
+               ORDER BY tc.created_at DESC`;
+      params = [storyId, projectId];
+    } else {
+      query = `SELECT tc.id, tc.title, tc.content, tc.status, tc.priority,
+                      tc.jira_issue_key AS "jiraIssueKey",
+                      tc.created_at AS "createdAt", tc.user_id AS "createdBy",
+                      u.email AS "createdByEmail"
+               FROM test_cases tc
+               JOIN users u ON u.id = tc.user_id
+               WHERE tc.story_id = $1 AND tc.project_id = $2 AND tc.user_id = $3
+               ORDER BY tc.created_at DESC`;
+      params = [storyId, projectId, userId];
+    }
+
+    const result = await db.query(query, params);
+    res.json(result.rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/projects/:projectId/stories/:storyId/manual-test-cases
+router.post('/:storyId/manual-test-cases', authenticate, async (req, res, next) => {
+  try {
+    const { projectId, storyId } = req.params;
+    const { id: userId } = req.user;
+    const { title, content, priority } = req.body;
+
+    if (!title || title.trim().length < 2) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: 'Title is required' } });
+    }
+    if (!content || content.trim().length < 2) {
+      return res.status(400).json({ error: { code: 'VALIDATION', message: 'Content is required' } });
+    }
+
+    const storyCheck = await db.query(
+      'SELECT id FROM stories WHERE id = $1 AND project_id = $2',
+      [storyId, projectId]
+    );
+    if (storyCheck.rows.length === 0) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Story not found' } });
+    }
+
+    const userRow = await db.query('SELECT organization_id FROM users WHERE id = $1', [userId]);
+    const organizationId = userRow.rows[0]?.organization_id || null;
+
+    const result = await db.query(
+      `INSERT INTO test_cases (project_id, user_id, title, content, priority, story_id, organization_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, title, content, status, priority,
+                 jira_issue_key AS "jiraIssueKey",
+                 created_at AS "createdAt", user_id AS "createdBy"`,
+      [projectId, userId, title.trim(), content.trim(), priority || 'medium', storyId, organizationId]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /api/projects/:projectId/stories/:storyId/manual-test-cases/:tcId
+router.delete('/:storyId/manual-test-cases/:tcId', authenticate, async (req, res, next) => {
+  try {
+    const { projectId, storyId, tcId } = req.params;
+    const { id: userId } = req.user;
+
+    const result = await db.query(
+      'DELETE FROM test_cases WHERE id = $1 AND project_id = $2 AND story_id = $3 AND user_id = $4 RETURNING id',
+      [tcId, projectId, storyId, userId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Test case not found' } });
+    }
+    res.json({ message: 'Deleted' });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // POST /api/projects/:projectId/stories/:storyId/scenarios — manually add a scenario
 router.post('/:storyId/scenarios', authenticate, async (req, res, next) => {
   try {
