@@ -24,6 +24,7 @@ async function verifyProjectAccess(userId, projectId, orgId) {
 }
 
 const TC_COLS = `id, title, content, status, priority, story_id AS "storyId",
+  folder_id AS "folderId",
   jira_issue_key AS "jiraIssueKey",
   ai_analysis AS "aiAnalysis",
   created_at AS "createdAt", updated_at AS "updatedAt",
@@ -32,7 +33,7 @@ const TC_COLS = `id, title, content, status, priority, story_id AS "storyId",
 /**
  * List test cases for a project — org-wide when orgId is provided.
  */
-async function list(userId, projectId, { status, priority, storyId, page = 1, limit = 100 }, orgId) {
+async function list(userId, projectId, { status, priority, storyId, folderId, page = 1, limit = 100 }, orgId) {
   await verifyProjectAccess(userId, projectId, orgId);
 
   const offset = (page - 1) * limit;
@@ -59,6 +60,14 @@ async function list(userId, projectId, { status, priority, storyId, page = 1, li
     } else {
       params.push(storyId);
       whereClause += ` AND tc.story_id = $${params.length}`;
+    }
+  }
+  if (folderId !== undefined) {
+    if (folderId === null) {
+      whereClause += ' AND tc.folder_id IS NULL';
+    } else {
+      params.push(folderId);
+      whereClause += ` AND tc.folder_id = $${params.length}`;
     }
   }
 
@@ -111,7 +120,7 @@ async function getById(userId, projectId, testCaseId, orgId) {
 /**
  * Create a single test case.
  */
-async function create(userId, projectId, { title, content, priority, storyId }, orgId) {
+async function create(userId, projectId, { title, content, priority, storyId, folderId }, orgId) {
   await verifyProjectAccess(userId, projectId, orgId);
 
   // Resolve organization_id for the creating user
@@ -119,10 +128,10 @@ async function create(userId, projectId, { title, content, priority, storyId }, 
   const organizationId = userRow.rows[0]?.organization_id || null;
 
   const result = await db.query(
-    `INSERT INTO test_cases (project_id, user_id, title, content, priority, story_id, organization_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
+    `INSERT INTO test_cases (project_id, user_id, title, content, priority, story_id, folder_id, organization_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      RETURNING ${TC_COLS}`,
-    [projectId, userId, title, content, priority || 'medium', storyId || null, organizationId]
+    [projectId, userId, title, content, priority || 'medium', storyId || null, folderId || null, organizationId]
   );
   return result.rows[0];
 }
@@ -172,7 +181,11 @@ async function batchCreate(userId, projectId, testCases, orgId) {
 async function update(userId, projectId, testCaseId, fields, orgId) {
   await getById(userId, projectId, testCaseId, orgId);
 
-  const allowed = ['title', 'content', 'status', 'priority', 'jira_issue_key'];
+  const allowed = ['title', 'content', 'status', 'priority', 'jira_issue_key', 'folder_id'];
+  // Accept camelCase folderId from client too
+  if (fields.folderId !== undefined && fields.folder_id === undefined) {
+    fields.folder_id = fields.folderId;
+  }
   const setClauses = [];
   const params = [];
 

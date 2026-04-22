@@ -39,6 +39,21 @@ logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backen
       `ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS story_id INTEGER REFERENCES stories(id) ON DELETE SET NULL`,
       `ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS jira_issue_key VARCHAR(50)`,
       `ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS organization_id INTEGER REFERENCES organizations(id) ON DELETE SET NULL`,
+      `CREATE TABLE IF NOT EXISTS folders (
+         id SERIAL PRIMARY KEY,
+         project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+         parent_id INTEGER REFERENCES folders(id) ON DELETE CASCADE,
+         name VARCHAR(200) NOT NULL,
+         position INTEGER DEFAULT 0,
+         user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+         organization_id INTEGER REFERENCES organizations(id) ON DELETE SET NULL,
+         created_at TIMESTAMPTZ DEFAULT NOW(),
+         updated_at TIMESTAMPTZ DEFAULT NOW()
+       )`,
+      `CREATE INDEX IF NOT EXISTS idx_folders_project_id ON folders(project_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_folders_parent_id ON folders(parent_id)`,
+      `ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL`,
+      `CREATE INDEX IF NOT EXISTS idx_test_cases_folder_id ON test_cases(folder_id)`,
       `ALTER TABLE scenarios ADD COLUMN IF NOT EXISTS jira_issue_key VARCHAR(50)`,
       `CREATE INDEX IF NOT EXISTS idx_test_cases_story_id ON test_cases(story_id)`,
       `CREATE INDEX IF NOT EXISTS idx_test_cases_jira_issue_key ON test_cases(jira_issue_key)`,
@@ -119,6 +134,7 @@ const runReportRoutes = safeRequire('./routes/run-reports', 'run-reports');
 const globalsRoutes = safeRequire('./routes/globals', 'globals');
 const sharingRoutes = safeRequire('./routes/sharing', 'sharing');
 const jiraRoutes = safeRequire('./routes/jira', 'jira');
+const folderRoutes = safeRequire('./routes/folders', 'folders');
 
 // ============================================================================
 // CORS — supports a single origin, '*' wildcard, or comma-separated allow list.
@@ -185,6 +201,10 @@ app.use('/api/auth', authRoutes);
 
 // Protected routes — specific paths first
 app.use('/api/projects', projectRoutes);
+// Folders — scoped under a project
+app.use('/api/projects/:projectId/folders', folderRoutes);
+// Test cases — support both the flat legacy mount and the nested project-scoped mount
+app.use('/api/projects/:projectId/testcases', testcaseRoutes);
 app.use('/api/testcases', testcaseRoutes);
 app.use('/api/analyze', analyzeRoutes);
 // Stories and target-config routers use mergeParams and read req.params.projectId

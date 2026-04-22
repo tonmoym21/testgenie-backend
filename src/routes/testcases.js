@@ -14,6 +14,7 @@ const createTestCaseSchema = z.object({
   content: z.string().min(1).max(10000),
   priority: z.enum(['low', 'medium', 'high', 'critical']).optional(),
   storyId: z.number().int().positive().optional().nullable(),
+  folderId: z.number().int().positive().optional().nullable(),
 });
 
 const batchCreateSchema = z.object({
@@ -32,6 +33,7 @@ const listQuerySchema = z.object({
   status: z.string().optional(),
   priority: z.string().optional(),
   storyId: z.string().optional(),
+  folderId: z.string().optional(),
 });
 
 router.get('/', validateQuery(listQuerySchema), async (req, res) => {
@@ -45,8 +47,11 @@ router.get('/', validateQuery(listQuerySchema), async (req, res) => {
     const storyId = req.query.storyId !== undefined
       ? (req.query.storyId === 'null' ? null : parseInt(req.query.storyId))
       : undefined;
+    const folderId = req.query.folderId !== undefined
+      ? (req.query.folderId === 'null' ? null : parseInt(req.query.folderId))
+      : undefined;
 
-    const result = await testcaseService.list(userId, projectId, { status, priority, storyId, page, limit }, orgId);
+    const result = await testcaseService.list(userId, projectId, { status, priority, storyId, folderId, page, limit }, orgId);
     res.status(200).json(result);
   } catch (error) {
     res.status(error.statusCode || 500).json({ error: error.message || 'Failed to fetch test cases' });
@@ -68,8 +73,8 @@ router.post('/', validate(createTestCaseSchema), async (req, res) => {
   try {
     const { projectId } = req.params;
     const { id: userId, orgId } = req.user;
-    const { title, content, priority, storyId } = req.body;
-    const result = await testcaseService.create(userId, projectId, { title, content, priority, storyId }, orgId);
+    const { title, content, priority, storyId, folderId } = req.body;
+    const result = await testcaseService.create(userId, projectId, { title, content, priority, storyId, folderId }, orgId);
     res.status(201).json(result);
   } catch (error) {
     res.status(error.statusCode || 500).json({ error: error.message });
