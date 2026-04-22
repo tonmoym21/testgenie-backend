@@ -22,6 +22,15 @@ const createSchema = z.object({
 
 const updateSchema = createSchema.partial();
 
+const addCasesSchema = z.object({
+  testCaseIds: z.array(z.number().int().positive()).min(1).max(500),
+});
+
+const resultSchema = z.object({
+  status: z.enum(['untested', 'passed', 'failed', 'blocked', 'skipped', 'retest']),
+  comment: z.string().max(5000).optional().nullable(),
+});
+
 router.get('/', async (req, res) => {
   try {
     const { projectId } = req.params;
@@ -72,6 +81,61 @@ router.delete('/:id', async (req, res) => {
     const { id: userId, orgId } = req.user;
     await testRunService.remove(userId, projectId, id, orgId);
     res.status(204).send();
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ error: error.message });
+  }
+});
+
+router.get('/:id/cases', async (req, res) => {
+  try {
+    const { projectId, id } = req.params;
+    const { id: userId, orgId } = req.user;
+    const result = await testRunService.getCases(userId, projectId, id, orgId);
+    res.json(result);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ error: error.message });
+  }
+});
+
+router.post('/:id/cases', validate(addCasesSchema), async (req, res) => {
+  try {
+    const { projectId, id } = req.params;
+    const { id: userId, orgId } = req.user;
+    const result = await testRunService.addCases(userId, projectId, id, req.body.testCaseIds, orgId);
+    res.json(result);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ error: error.message });
+  }
+});
+
+router.delete('/:id/cases/:caseId', async (req, res) => {
+  try {
+    const { projectId, id, caseId } = req.params;
+    const { id: userId, orgId } = req.user;
+    await testRunService.removeCase(userId, projectId, id, caseId, orgId);
+    res.status(204).send();
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ error: error.message });
+  }
+});
+
+router.patch('/:id/cases/:caseId/result', validate(resultSchema), async (req, res) => {
+  try {
+    const { projectId, id, caseId } = req.params;
+    const { id: userId, orgId } = req.user;
+    const result = await testRunService.setResult(userId, projectId, id, caseId, req.body, orgId);
+    res.json(result);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ error: error.message });
+  }
+});
+
+router.get('/:id/stats', async (req, res) => {
+  try {
+    const { projectId, id } = req.params;
+    const { id: userId, orgId } = req.user;
+    const result = await testRunService.getStats(userId, projectId, id, orgId);
+    res.json(result);
   } catch (error) {
     res.status(error.statusCode || 500).json({ error: error.message });
   }
