@@ -22,7 +22,7 @@ const COLS = `tr.id, tr.project_id AS "projectId", tr.name, tr.description, tr.s
   tr.auto_assign AS "autoAssign",
   tr.created_at AS "createdAt", tr.updated_at AS "updatedAt",
   tr.user_id AS "createdBy",
-  u.email AS "assigneeEmail", u.name AS "assigneeName"`;
+  u.email AS "assigneeEmail", u.display_name AS "assigneeName"`;
 
 async function list(userId, projectId, { state } = {}, orgId) {
   await verifyProjectAccess(userId, projectId, orgId);
