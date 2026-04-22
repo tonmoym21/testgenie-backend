@@ -23,12 +23,13 @@ async function verifyProjectAccess(userId, projectId, orgId) {
   if (result.rows.length === 0) throw new NotFoundError('Project');
 }
 
-const TC_COLS = `id, title, content, status, priority, story_id AS "storyId",
-  folder_id AS "folderId",
-  jira_issue_key AS "jiraIssueKey",
-  ai_analysis AS "aiAnalysis",
-  created_at AS "createdAt", updated_at AS "updatedAt",
-  user_id AS "createdBy"`;
+const TC_COLS = `tc.id, tc.title, tc.content, tc.status, tc.priority,
+  tc.story_id AS "storyId",
+  tc.folder_id AS "folderId",
+  tc.jira_issue_key AS "jiraIssueKey",
+  tc.ai_analysis AS "aiAnalysis",
+  tc.created_at AS "createdAt", tc.updated_at AS "updatedAt",
+  tc.user_id AS "createdBy"`;
 
 /**
  * List test cases for a project — org-wide when orgId is provided.
@@ -97,7 +98,7 @@ async function getById(userId, projectId, testCaseId, orgId) {
   let result;
   if (orgId) {
     result = await db.query(
-      `SELECT tc.${TC_COLS.split('\n').join(' tc.')}
+      `SELECT ${TC_COLS}
        FROM test_cases tc
        JOIN projects p ON p.id = tc.project_id
        JOIN users u ON u.id = p.user_id
@@ -109,7 +110,7 @@ async function getById(userId, projectId, testCaseId, orgId) {
     result = await db.query(
       `SELECT ${TC_COLS}
          FROM test_cases tc
-         WHERE id = $1 AND project_id = $2 AND user_id = $3`,
+         WHERE tc.id = $1 AND tc.project_id = $2 AND tc.user_id = $3`,
       [testCaseId, projectId, userId]
     );
   }
@@ -128,7 +129,7 @@ async function create(userId, projectId, { title, content, priority, storyId, fo
   const organizationId = userRow.rows[0]?.organization_id || null;
 
   const result = await db.query(
-    `INSERT INTO test_cases (project_id, user_id, title, content, priority, story_id, folder_id, organization_id)
+    `INSERT INTO test_cases AS tc (project_id, user_id, title, content, priority, story_id, folder_id, organization_id)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      RETURNING ${TC_COLS}`,
     [projectId, userId, title, content, priority || 'medium', storyId || null, folderId || null, organizationId]
@@ -160,7 +161,7 @@ async function batchCreate(userId, projectId, testCases, orgId) {
     }
 
     const result = await client.query(
-      `INSERT INTO test_cases (project_id, user_id, title, content, priority, organization_id)
+      `INSERT INTO test_cases AS tc (project_id, user_id, title, content, priority, organization_id)
        VALUES ${placeholders.join(', ')}
        RETURNING ${TC_COLS}`,
       values
@@ -203,9 +204,9 @@ async function update(userId, projectId, testCaseId, fields, orgId) {
 
   params.push(testCaseId, projectId);
   const result = await db.query(
-    `UPDATE test_cases
+    `UPDATE test_cases AS tc
      SET ${setClauses.join(', ')}
-     WHERE id = $${params.length - 1} AND project_id = $${params.length}
+     WHERE tc.id = $${params.length - 1} AND tc.project_id = $${params.length}
      RETURNING ${TC_COLS}`,
     params
   );
