@@ -169,10 +169,11 @@ async function getCases(userId, projectId, runId, orgId) {
   const ids = (run.testCaseIds || []).map(Number).filter(Boolean);
   if (ids.length === 0) return { data: [] };
   const result = await db.query(
-    `SELECT tc.id, tc.title, tc.priority, tc.jira_issue_key AS "jiraIssueKey",
+    `SELECT tc.id, tc.title, tc.priority, tc.content, tc.jira_issue_key AS "jiraIssueKey",
             tc.folder_id AS "folderId",
             COALESCE(r.status, 'untested') AS status,
             r.comment,
+            COALESCE(r.step_results, '[]'::jsonb) AS "stepResults",
             r.executed_at AS "executedAt",
             r.executed_by AS "executedBy",
             u.display_name AS "executedByName", u.email AS "executedByEmail"
@@ -184,6 +185,57 @@ async function getCases(userId, projectId, runId, orgId) {
     [runId, ids]
   );
   return { data: result.rows };
+}
+
+function deriveCaseStatusFromSteps(stepResults) {
+  if (!stepResults || stepResults.length === 0) return 'untested';
+  const statuses = stepResults.map((s) => s?.status).filter(Boolean);
+  if (statuses.length === 0) return 'untested';
+  if (statuses.includes('failed')) return 'failed';
+  if (statuses.includes('blocked')) return 'blocked';
+  if (statuses.includes('retest')) return 'retest';
+  if (statuses.every((s) => s === 'passed')) return 'passed';
+  if (statuses.every((s) => s === 'skipped')) return 'skipped';
+  return 'untested';
+}
+
+async function setStepResult(userId, projectId, runId, caseId, stepIndex, { status, notes }, orgId) {
+  await getById(userId, projectId, runId, orgId);
+  const allowed = ['untested', 'passed', 'failed', 'blocked', 'skipped', 'retest'];
+  if (!allowed.includes(status)) {
+    const err = new Error(`Invalid status. Must be one of: ${allowed.join(', ')}`);
+    err.statusCode = 400;
+    throw err;
+  }
+  // Ensure the row exists
+  await db.query(
+    `INSERT INTO test_run_results (test_run_id, test_case_id, status)
+     VALUES ($1, $2, 'untested')
+     ON CONFLICT (test_run_id, test_case_id) DO NOTHING`,
+    [runId, caseId]
+  );
+  const existing = await db.query(
+    `SELECT step_results FROM test_run_results WHERE test_run_id = $1 AND test_case_id = $2`,
+    [runId, caseId]
+  );
+  const steps = Array.isArray(existing.rows[0]?.step_results) ? [...existing.rows[0].step_results] : [];
+  const idx = Number(stepIndex);
+  while (steps.length <= idx) steps.push(null);
+  steps[idx] = { status, notes: notes || null, executedAt: new Date().toISOString(), executedBy: userId };
+  const derived = deriveCaseStatusFromSteps(steps);
+  const result = await db.query(
+    `UPDATE test_run_results
+        SET step_results = $1::jsonb,
+            status = $2,
+            executed_by = $3,
+            executed_at = NOW(),
+            updated_at = NOW()
+      WHERE test_run_id = $4 AND test_case_id = $5
+      RETURNING test_case_id AS "testCaseId", status, step_results AS "stepResults"`,
+    [JSON.stringify(steps), derived, userId, runId, caseId]
+  );
+  await maybeUpdateRunState(projectId, runId);
+  return result.rows[0];
 }
 
 async function setResult(userId, projectId, runId, caseId, { status, comment }, orgId) {
@@ -259,5 +311,5 @@ async function getStats(userId, projectId, runId, orgId) {
 
 module.exports = {
   list, getById, create, update, remove,
-  addCases, removeCase, getCases, setResult, getStats,
+  addCases, removeCase, getCases, setResult, setStepResult, getStats,
 };

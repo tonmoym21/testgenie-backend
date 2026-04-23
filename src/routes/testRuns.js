@@ -31,6 +31,11 @@ const resultSchema = z.object({
   comment: z.string().max(5000).optional().nullable(),
 });
 
+const stepResultSchema = z.object({
+  status: z.enum(['untested', 'passed', 'failed', 'blocked', 'skipped', 'retest']),
+  notes: z.string().max(5000).optional().nullable(),
+});
+
 router.get('/', async (req, res) => {
   try {
     const { projectId } = req.params;
@@ -124,6 +129,17 @@ router.patch('/:id/cases/:caseId/result', validate(resultSchema), async (req, re
     const { projectId, id, caseId } = req.params;
     const { id: userId, orgId } = req.user;
     const result = await testRunService.setResult(userId, projectId, id, caseId, req.body, orgId);
+    res.json(result);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ error: error.message });
+  }
+});
+
+router.patch('/:id/cases/:caseId/steps/:stepIndex/result', validate(stepResultSchema), async (req, res) => {
+  try {
+    const { projectId, id, caseId, stepIndex } = req.params;
+    const { id: userId, orgId } = req.user;
+    const result = await testRunService.setStepResult(userId, projectId, id, caseId, stepIndex, req.body, orgId);
     res.json(result);
   } catch (error) {
     res.status(error.statusCode || 500).json({ error: error.message });
