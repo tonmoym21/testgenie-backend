@@ -36,6 +36,10 @@ const stepResultSchema = z.object({
   notes: z.string().max(5000).optional().nullable(),
 });
 
+const stepNoteSchema = z.object({
+  note: z.string().max(5000).nullable().optional(),
+});
+
 router.get('/', async (req, res) => {
   try {
     const { projectId } = req.params;
@@ -140,6 +144,28 @@ router.patch('/:id/cases/:caseId/steps/:stepIndex/result', validate(stepResultSc
     const { projectId, id, caseId, stepIndex } = req.params;
     const { id: userId, orgId } = req.user;
     const result = await testRunService.setStepResult(userId, projectId, id, caseId, stepIndex, req.body, orgId);
+    res.json(result);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ error: error.message });
+  }
+});
+
+router.patch('/:id/cases/:caseId/steps/:stepIndex/note', validate(stepNoteSchema), async (req, res) => {
+  try {
+    const { projectId, id, caseId, stepIndex } = req.params;
+    const { id: userId, orgId } = req.user;
+    const result = await testRunService.setStepNote(userId, projectId, id, caseId, stepIndex, req.body, orgId);
+    res.json(result);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ error: error.message });
+  }
+});
+
+router.get('/:id/execution-log', async (req, res) => {
+  try {
+    const { projectId, id } = req.params;
+    const { id: userId, orgId } = req.user;
+    const result = await testRunService.getExecutionLog(userId, projectId, id, orgId);
     res.json(result);
   } catch (error) {
     res.status(error.statusCode || 500).json({ error: error.message });

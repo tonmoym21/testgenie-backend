@@ -309,7 +309,79 @@ async function getStats(userId, projectId, runId, orgId) {
   return { total, executed, passRate, progress, byStatus };
 }
 
+async function setStepNote(userId, projectId, runId, caseId, stepIndex, { note }, orgId) {
+  await getById(userId, projectId, runId, orgId);
+  await db.query(
+    `INSERT INTO test_run_results (test_run_id, test_case_id, status)
+     VALUES ($1, $2, 'untested')
+     ON CONFLICT (test_run_id, test_case_id) DO NOTHING`,
+    [runId, caseId]
+  );
+  const existing = await db.query(
+    `SELECT step_results FROM test_run_results WHERE test_run_id = $1 AND test_case_id = $2`,
+    [runId, caseId]
+  );
+  const steps = Array.isArray(existing.rows[0]?.step_results) ? [...existing.rows[0].step_results] : [];
+  const idx = Number(stepIndex);
+  while (steps.length <= idx) steps.push(null);
+  const prev = steps[idx] || { status: 'untested' };
+  steps[idx] = {
+    ...prev,
+    note: note || null,
+    noteBy: userId,
+    noteAt: new Date().toISOString(),
+  };
+  const result = await db.query(
+    `UPDATE test_run_results
+        SET step_results = $1::jsonb, updated_at = NOW()
+      WHERE test_run_id = $2 AND test_case_id = $3
+      RETURNING test_case_id AS "testCaseId", step_results AS "stepResults"`,
+    [JSON.stringify(steps), runId, caseId]
+  );
+  return result.rows[0];
+}
+
+async function getExecutionLog(userId, projectId, runId, orgId) {
+  await getById(userId, projectId, runId, orgId);
+  const rows = await db.query(
+    `SELECT tc.id AS "caseId", tc.title AS "caseTitle",
+            r.step_results AS "stepResults",
+            r.updated_at AS "updatedAt",
+            r.executed_by AS "executedBy",
+            u.display_name AS "executedByName", u.email AS "executedByEmail"
+       FROM test_run_results r
+       JOIN test_cases tc ON tc.id = r.test_case_id
+       LEFT JOIN users u ON u.id = r.executed_by
+      WHERE r.test_run_id = $1
+      ORDER BY r.updated_at DESC NULLS LAST`,
+    [runId]
+  );
+  const entries = [];
+  for (const row of rows.rows) {
+    const steps = Array.isArray(row.stepResults) ? row.stepResults : [];
+    steps.forEach((s, i) => {
+      if (!s) return;
+      entries.push({
+        caseId: row.caseId,
+        caseTitle: row.caseTitle,
+        stepIndex: i,
+        status: s.status || 'untested',
+        note: s.note || s.notes || null,
+        updatedAt: s.executedAt || s.noteAt || row.updatedAt,
+        updatedBy: row.executedByName || row.executedByEmail || null,
+      });
+    });
+  }
+  entries.sort((a, b) => {
+    const ta = a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
+    const tb = b.updatedAt ? new Date(b.updatedAt).getTime() : 0;
+    return tb - ta;
+  });
+  return { data: entries };
+}
+
 module.exports = {
   list, getById, create, update, remove,
-  addCases, removeCase, getCases, setResult, setStepResult, getStats,
+  addCases, removeCase, getCases, setResult, setStepResult, setStepNote,
+  getExecutionLog, getStats,
 };

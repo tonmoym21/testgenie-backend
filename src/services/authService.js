@@ -5,6 +5,7 @@ const db = require('../db');
 const config = require('../config');
 const { ConflictError, UnauthorizedError, ForbiddenError, NotFoundError } = require('../utils/apiError');
 const teamService = require('./teamService');
+const { isCorporateDomain, getEmailDomain } = require('../utils/emailDomain');
 
 const BCRYPT_ROUNDS = 12;
 
@@ -27,18 +28,47 @@ async function register(email, password) {
   const orgCheck = await db.query('SELECT COUNT(*) as count FROM organizations');
   const orgExists = parseInt(orgCheck.rows[0].count, 10) > 0;
 
-  if (orgExists) {
-    // Organization exists - new users must be invited
-    throw new ForbiddenError('Registration is invite-only. Please contact your admin for an invite link.');
-  }
+  let orgId = null;
+  let isFirstUser = false;
+  let autoJoinedOrg = false;
 
-  // First user ever - create default organization and make them owner
-  const orgName = 'TestForge';
-  const newOrg = await db.query(
-    'INSERT INTO organizations (name, domain_restriction_enabled) VALUES ($1, true) RETURNING id',
-    [orgName]
-  );
-  const orgId = newOrg.rows[0].id;
+  if (orgExists) {
+    // Try auto-join by corporate email domain before blocking.
+    if (isCorporateDomain(email)) {
+      const domain = getEmailDomain(email);
+      // Match against organizations.domain OR any existing user whose email shares this domain.
+      const domainOrg = await db.query(
+        `SELECT o.id FROM organizations o WHERE LOWER(o.domain) = $1
+         UNION
+         SELECT DISTINCT u.organization_id AS id FROM users u
+          WHERE u.organization_id IS NOT NULL
+            AND LOWER(SPLIT_PART(u.email, '@', 2)) = $1
+         LIMIT 1`,
+        [domain]
+      );
+      if (domainOrg.rows.length > 0) {
+        orgId = domainOrg.rows[0].id;
+        autoJoinedOrg = true;
+        // Ensure the org has this domain recorded for future lookups.
+        await db.query(
+          `UPDATE organizations SET domain = $1 WHERE id = $2 AND (domain IS NULL OR domain = '')`,
+          [domain, orgId]
+        );
+      }
+    }
+    if (!orgId) {
+      throw new ForbiddenError('Registration is invite-only. Please contact your admin for an invite link.');
+    }
+  } else {
+    // First user ever - create default organization and make them owner
+    isFirstUser = true;
+    const orgName = 'TestForge';
+    const newOrg = await db.query(
+      'INSERT INTO organizations (name, domain, domain_restriction_enabled) VALUES ($1, $2, true) RETURNING id',
+      [orgName, isCorporateDomain(email) ? getEmailDomain(email) : null]
+    );
+    orgId = newOrg.rows[0].id;
+  }
 
   // Create user
   const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
@@ -51,21 +81,20 @@ async function register(email, password) {
   
   const user = result.rows[0];
 
-  // Make first user the owner
+  const role = isFirstUser ? 'owner' : 'member';
   await db.query(
     `INSERT INTO organization_members (organization_id, user_id, role)
-     VALUES ($1, $2, 'owner')`,
-    [orgId, user.id]
+     VALUES ($1, $2, $3)`,
+    [orgId, user.id, role]
   );
-  
-  // Log audit event
+
   await teamService.logAuditEvent(
     orgId,
     user.id,
-    'organization_created',
+    isFirstUser ? 'organization_created' : 'user_auto_joined_by_domain',
     'user',
     user.id,
-    { email, role: 'owner', isFirstUser: true }
+    { email, role, isFirstUser, autoJoinedOrg }
   );
 
   return user;
