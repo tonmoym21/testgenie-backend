@@ -15,6 +15,7 @@ const createTestCaseSchema = z.object({
   priority: z.enum(['low', 'medium', 'high', 'critical']).optional(),
   storyId: z.number().int().positive().optional().nullable(),
   folderId: z.number().int().positive().optional().nullable(),
+  assigneeUserId: z.number().int().positive().optional().nullable(),
 });
 
 const batchCreateSchema = z.object({
@@ -73,8 +74,8 @@ router.post('/', validate(createTestCaseSchema), async (req, res) => {
   try {
     const { projectId } = req.params;
     const { id: userId, orgId } = req.user;
-    const { title, content, priority, storyId, folderId } = req.body;
-    const result = await testcaseService.create(userId, projectId, { title, content, priority, storyId, folderId }, orgId);
+    const { title, content, priority, storyId, folderId, assigneeUserId } = req.body;
+    const result = await testcaseService.create(userId, projectId, { title, content, priority, storyId, folderId, assigneeUserId }, orgId);
     res.status(201).json(result);
   } catch (error) {
     res.status(error.statusCode || 500).json({ error: error.message });

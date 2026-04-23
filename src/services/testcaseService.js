@@ -28,6 +28,7 @@ const TC_COLS = `tc.id, tc.title, tc.content, tc.status, tc.priority,
   tc.folder_id AS "folderId",
   tc.jira_issue_key AS "jiraIssueKey",
   tc.ai_analysis AS "aiAnalysis",
+  tc.assignee_user_id AS "assigneeUserId",
   tc.created_at AS "createdAt", tc.updated_at AS "updatedAt",
   tc.user_id AS "createdBy"`;
 
@@ -121,7 +122,7 @@ async function getById(userId, projectId, testCaseId, orgId) {
 /**
  * Create a single test case.
  */
-async function create(userId, projectId, { title, content, priority, storyId, folderId }, orgId) {
+async function create(userId, projectId, { title, content, priority, storyId, folderId, assigneeUserId }, orgId) {
   await verifyProjectAccess(userId, projectId, orgId);
 
   // Resolve organization_id for the creating user
@@ -129,10 +130,10 @@ async function create(userId, projectId, { title, content, priority, storyId, fo
   const organizationId = userRow.rows[0]?.organization_id || null;
 
   const result = await db.query(
-    `INSERT INTO test_cases AS tc (project_id, user_id, title, content, priority, story_id, folder_id, organization_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    `INSERT INTO test_cases AS tc (project_id, user_id, title, content, priority, story_id, folder_id, assignee_user_id, organization_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      RETURNING ${TC_COLS}`,
-    [projectId, userId, title, content, priority || 'medium', storyId || null, folderId || null, organizationId]
+    [projectId, userId, title, content, priority || 'medium', storyId || null, folderId || null, assigneeUserId || null, organizationId]
   );
   return result.rows[0];
 }
@@ -182,10 +183,13 @@ async function batchCreate(userId, projectId, testCases, orgId) {
 async function update(userId, projectId, testCaseId, fields, orgId) {
   await getById(userId, projectId, testCaseId, orgId);
 
-  const allowed = ['title', 'content', 'status', 'priority', 'jira_issue_key', 'folder_id'];
+  const allowed = ['title', 'content', 'status', 'priority', 'jira_issue_key', 'folder_id', 'assignee_user_id'];
   // Accept camelCase folderId from client too
   if (fields.folderId !== undefined && fields.folder_id === undefined) {
     fields.folder_id = fields.folderId;
+  }
+  if (fields.assigneeUserId !== undefined && fields.assignee_user_id === undefined) {
+    fields.assignee_user_id = fields.assigneeUserId;
   }
   const setClauses = [];
   const params = [];

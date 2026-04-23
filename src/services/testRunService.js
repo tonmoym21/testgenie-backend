@@ -176,10 +176,13 @@ async function getCases(userId, projectId, runId, orgId) {
             COALESCE(r.step_results, '[]'::jsonb) AS "stepResults",
             r.executed_at AS "executedAt",
             r.executed_by AS "executedBy",
+            r.assignee_user_id AS "assigneeUserId",
+            a.display_name AS "assigneeName", a.email AS "assigneeEmail",
             u.display_name AS "executedByName", u.email AS "executedByEmail"
        FROM test_cases tc
        LEFT JOIN test_run_results r ON r.test_case_id = tc.id AND r.test_run_id = $1
        LEFT JOIN users u ON u.id = r.executed_by
+       LEFT JOIN users a ON a.id = r.assignee_user_id
       WHERE tc.id = ANY($2::int[])
       ORDER BY tc.id`,
     [runId, ids]
@@ -380,8 +383,20 @@ async function getExecutionLog(userId, projectId, runId, orgId) {
   return { data: entries };
 }
 
+async function setCaseAssignee(userId, projectId, runId, caseId, assigneeUserId, orgId) {
+  await getById(userId, projectId, runId, orgId);
+  await db.query(
+    `INSERT INTO test_run_results (test_run_id, test_case_id, status, assignee_user_id)
+     VALUES ($1, $2, 'untested', $3)
+     ON CONFLICT (test_run_id, test_case_id)
+     DO UPDATE SET assignee_user_id = EXCLUDED.assignee_user_id, updated_at = NOW()`,
+    [runId, caseId, assigneeUserId || null]
+  );
+  return { testCaseId: Number(caseId), assigneeUserId: assigneeUserId || null };
+}
+
 module.exports = {
   list, getById, create, update, remove,
   addCases, removeCase, getCases, setResult, setStepResult, setStepNote,
-  getExecutionLog, getStats,
+  getExecutionLog, getStats, setCaseAssignee,
 };

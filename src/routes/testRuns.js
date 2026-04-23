@@ -40,6 +40,10 @@ const stepNoteSchema = z.object({
   note: z.string().max(5000).nullable().optional(),
 });
 
+const assigneeSchema = z.object({
+  assigneeUserId: z.number().int().positive().nullable(),
+});
+
 router.get('/', async (req, res) => {
   try {
     const { projectId } = req.params;
@@ -155,6 +159,17 @@ router.patch('/:id/cases/:caseId/steps/:stepIndex/note', validate(stepNoteSchema
     const { projectId, id, caseId, stepIndex } = req.params;
     const { id: userId, orgId } = req.user;
     const result = await testRunService.setStepNote(userId, projectId, id, caseId, stepIndex, req.body, orgId);
+    res.json(result);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ error: error.message });
+  }
+});
+
+router.patch('/:id/cases/:caseId/assignee', validate(assigneeSchema), async (req, res) => {
+  try {
+    const { projectId, id, caseId } = req.params;
+    const { id: userId, orgId } = req.user;
+    const result = await testRunService.setCaseAssignee(userId, projectId, id, caseId, req.body.assigneeUserId, orgId);
     res.json(result);
   } catch (error) {
     res.status(error.statusCode || 500).json({ error: error.message });

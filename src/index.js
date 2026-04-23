@@ -89,6 +89,8 @@ logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backen
       `CREATE INDEX IF NOT EXISTS idx_test_run_results_run_id ON test_run_results(test_run_id)`,
       `CREATE INDEX IF NOT EXISTS idx_test_run_results_status ON test_run_results(status)`,
       `ALTER TABLE test_run_results ADD COLUMN IF NOT EXISTS step_results JSONB DEFAULT '[]'::jsonb`,
+      `ALTER TABLE test_run_results ADD COLUMN IF NOT EXISTS assignee_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL`,
+      `ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS assignee_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL`,
       `ALTER TABLE test_runs ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ`,
       `ALTER TABLE test_runs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ`,
       `ALTER TABLE scenarios ADD COLUMN IF NOT EXISTS jira_issue_key VARCHAR(50)`,

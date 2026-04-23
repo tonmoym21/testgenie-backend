@@ -169,6 +169,26 @@ router.patch('/organization', authenticate, requireRole(['owner', 'admin']), val
 // MEMBERS ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Lightweight list of assignable org members for every authenticated user.
+// Used to populate assignee dropdowns — no admin role required.
+router.get('/assignable-members', authenticate, attachOrgContext(), async (req, res, next) => {
+  try {
+    if (!req.organization) {
+      return res.json({ members: [] });
+    }
+    const result = await teamService.listMembers(req.organization.id, { limit: 500, offset: 0 });
+    const members = (result.members || result.data || result || []).map((m) => ({
+      id: m.id,
+      email: m.email,
+      displayName: m.displayName || m.display_name || null,
+      avatarUrl: m.avatarUrl || m.avatar_url || null,
+    }));
+    res.json({ members });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.get('/members', authenticate, requireRole(['owner', 'admin']), async (req, res, next) => {
   try {
     const options = {
