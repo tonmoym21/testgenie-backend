@@ -175,6 +175,7 @@ const sharingRoutes = safeRequire('./routes/sharing', 'sharing');
 const jiraRoutes = safeRequire('./routes/jira', 'jira');
 const folderRoutes = safeRequire('./routes/folders', 'folders');
 const testRunRoutes = safeRequire('./routes/testRuns', 'testRuns');
+const projectInsightsRoutes = safeRequire('./routes/projectInsights', 'projectInsights');
 
 // ============================================================================
 // CORS — supports a single origin, '*' wildcard, or comma-separated allow list.
@@ -244,6 +245,7 @@ app.use('/api/projects', projectRoutes);
 // Folders — scoped under a project
 app.use('/api/projects/:projectId/folders', folderRoutes);
 app.use('/api/projects/:projectId/test-runs', testRunRoutes);
+app.use('/api/projects/:projectId/insights', projectInsightsRoutes);
 // Test cases — support both the flat legacy mount and the nested project-scoped mount
 app.use('/api/projects/:projectId/testcases', testcaseRoutes);
 app.use('/api/testcases', testcaseRoutes);
