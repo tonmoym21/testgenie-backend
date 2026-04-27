@@ -170,14 +170,23 @@ router.get('/:storyId/scenarios', authenticate, async (req, res, next) => {
       return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Story not found' } });
     }
 
+    // LEFT JOIN test_cases so the FE can show "Organize" affordances and bulk-organize
+    // approved cases without a second round trip.
     const result = await db.query(
-      `SELECT * FROM scenarios WHERE story_id = $1 ORDER BY
-        CASE category
-          WHEN 'happy_path' THEN 1 WHEN 'negative' THEN 2
-          WHEN 'edge' THEN 3 WHEN 'validation' THEN 4
-          WHEN 'role_permission' THEN 5 WHEN 'state_transition' THEN 6
-          WHEN 'api_impact' THEN 7 WHEN 'non_functional' THEN 8
-        END, created_at`,
+      `SELECT s.*,
+              tc.id        AS "linkedTestCaseId",
+              tc.folder_id AS "linkedTestCaseFolderId",
+              tc.title     AS "linkedTestCaseTitle"
+         FROM scenarios s
+         LEFT JOIN test_cases tc ON tc.scenario_id = s.id
+        WHERE s.story_id = $1
+        ORDER BY
+         CASE s.category
+           WHEN 'happy_path' THEN 1 WHEN 'negative' THEN 2
+           WHEN 'edge' THEN 3 WHEN 'validation' THEN 4
+           WHEN 'role_permission' THEN 5 WHEN 'state_transition' THEN 6
+           WHEN 'api_impact' THEN 7 WHEN 'non_functional' THEN 8
+         END, s.created_at`,
       [storyId]
     );
 
