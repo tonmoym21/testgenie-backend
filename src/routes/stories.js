@@ -227,9 +227,11 @@ async function ensureTestCaseForScenario(scenario, projectId, userId, organizati
   const content = buildTestCaseContentFromScenario(scenario);
   const priority = SCENARIO_PRIORITY_TO_TC[scenario.priority] || 'medium';
 
+  // status is left to its column default ('draft') — the test_cases CHECK constraint
+  // disallows 'approved', and approval is already represented by the linked scenario.
   const inserted = await db.query(
-    `INSERT INTO test_cases (project_id, user_id, title, content, priority, story_id, scenario_id, organization_id, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'approved')
+    `INSERT INTO test_cases (project_id, user_id, title, content, priority, story_id, scenario_id, organization_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      RETURNING id, title, content, status, priority, story_id AS "storyId",
                folder_id AS "folderId", scenario_id AS "scenarioId",
                jira_issue_key AS "jiraIssueKey", assignee_user_id AS "assigneeUserId",
