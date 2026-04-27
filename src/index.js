@@ -54,6 +54,8 @@ logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backen
       `CREATE INDEX IF NOT EXISTS idx_folders_parent_id ON folders(parent_id)`,
       `ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL`,
       `CREATE INDEX IF NOT EXISTS idx_test_cases_folder_id ON test_cases(folder_id)`,
+      `ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS scenario_id INTEGER REFERENCES scenarios(id) ON DELETE SET NULL`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_test_cases_scenario_id_unique ON test_cases(scenario_id) WHERE scenario_id IS NOT NULL`,
       `CREATE TABLE IF NOT EXISTS test_runs (
          id SERIAL PRIMARY KEY,
          project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,

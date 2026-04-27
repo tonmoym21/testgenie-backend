@@ -187,6 +187,58 @@ router.get('/:storyId/scenarios', authenticate, async (req, res, next) => {
   }
 });
 
+// Map scenario priority (P0–P3) → test_case priority (critical/high/medium/low)
+const SCENARIO_PRIORITY_TO_TC = { P0: 'critical', P1: 'high', P2: 'medium', P3: 'low' };
+
+// Build the manual-test-case `content` field from a scenario row.
+function buildTestCaseContentFromScenario(scenario) {
+  const parts = [];
+  if (scenario.summary) parts.push(scenario.summary.trim());
+
+  let preconditions = scenario.preconditions;
+  if (typeof preconditions === 'string') {
+    try { preconditions = JSON.parse(preconditions); } catch { preconditions = [preconditions]; }
+  }
+  if (Array.isArray(preconditions) && preconditions.length > 0) {
+    parts.push('\nPreconditions:');
+    for (const p of preconditions) parts.push('- ' + String(p));
+  }
+
+  if (scenario.expected_outcome) {
+    parts.push('\nExpected:\n' + scenario.expected_outcome.trim());
+  }
+  return parts.join('\n');
+}
+
+// Idempotently link an approved scenario to a test_cases row.
+// Returns the existing or newly-created test case (with camelCase keys), or null on failure.
+async function ensureTestCaseForScenario(scenario, projectId, userId, organizationId) {
+  const existing = await db.query(
+    `SELECT id, title, content, status, priority, story_id AS "storyId",
+            folder_id AS "folderId", scenario_id AS "scenarioId",
+            jira_issue_key AS "jiraIssueKey", assignee_user_id AS "assigneeUserId",
+            created_at AS "createdAt", updated_at AS "updatedAt", user_id AS "createdBy"
+       FROM test_cases WHERE scenario_id = $1`,
+    [scenario.id]
+  );
+  if (existing.rows.length > 0) return existing.rows[0];
+
+  const title = scenario.title;
+  const content = buildTestCaseContentFromScenario(scenario);
+  const priority = SCENARIO_PRIORITY_TO_TC[scenario.priority] || 'medium';
+
+  const inserted = await db.query(
+    `INSERT INTO test_cases (project_id, user_id, title, content, priority, story_id, scenario_id, organization_id, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'approved')
+     RETURNING id, title, content, status, priority, story_id AS "storyId",
+               folder_id AS "folderId", scenario_id AS "scenarioId",
+               jira_issue_key AS "jiraIssueKey", assignee_user_id AS "assigneeUserId",
+               created_at AS "createdAt", updated_at AS "updatedAt", user_id AS "createdBy"`,
+    [projectId, userId, title, content, priority, scenario.story_id, scenario.id, organizationId]
+  );
+  return inserted.rows[0];
+}
+
 // PATCH /api/projects/:projectId/stories/:storyId/scenarios/:scenarioId
 router.patch('/:storyId/scenarios/:scenarioId', authenticate, async (req, res, next) => {
   try {
@@ -216,7 +268,23 @@ router.patch('/:storyId/scenarios/:scenarioId', authenticate, async (req, res, n
       return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Scenario not found' } });
     }
 
-    res.json(result.rows[0]);
+    const scenario = result.rows[0];
+    let linkedTestCase = null;
+
+    // On approval, idempotently materialize the scenario into a test_cases row so the user
+    // can immediately organize it (keep loose / move to existing folder / create new folder).
+    if (status === 'approved') {
+      try {
+        const userRow = await db.query('SELECT organization_id FROM users WHERE id = $1', [userId]);
+        const organizationId = userRow.rows[0]?.organization_id || null;
+        linkedTestCase = await ensureTestCaseForScenario(scenario, projectId, userId, organizationId);
+      } catch (convErr) {
+        logger.error({ err: convErr.message, scenarioId }, 'Failed to materialize test case for approved scenario');
+        // Don't fail the approval if conversion blows up — surface scenario update; FE just won't open the modal.
+      }
+    }
+
+    res.json({ ...scenario, linkedTestCase });
   } catch (err) {
     next(err);
   }

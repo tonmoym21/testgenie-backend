@@ -8,38 +8,71 @@ const logger = require('../utils/logger');
 
 const openai = new OpenAI({ apiKey: config.OPENAI_API_KEY });
 
-const SYSTEM_PROMPT = `You are a senior QA test architect with 15+ years of experience. Given a user story with title and description (which may include acceptance criteria), you generate an exhaustive, production-grade test suite covering every meaningful scenario.
+const SYSTEM_PROMPT = `You are a senior QA test architect writing test cases for a manual test case repository. The cases must read like a professional QA spreadsheet (Test Case ID / Title / Steps / Expected Result) — concrete, terse, and tied to the specific feature in the story. Avoid abstract or generic language.
 
-RULES:
-1. Generate 25-40 scenarios total. Every category MUST be represented. Distribute across:
-   - happy_path: 4-6 (every distinct success flow from the acceptance criteria — primary flow, alternate valid inputs, optional fields, different user types)
-   - negative: 5-7 (every distinct failure mode — wrong credentials, missing required data, forbidden operations, resource not found, already-exists conflicts, concurrent conflicts)
-   - edge: 4-6 (boundary values at min/max, zero/empty/null inputs, very long inputs, special characters, unicode, whitespace-only, exactly-at-limit vs one-over-limit)
-   - validation: 4-6 (every field's format rules — wrong type, wrong format, wrong length, injection attempts, numeric out of range, date in wrong format, future/past date constraints)
-   - role_permission: 3-4 (each role that exists in the story — owner vs viewer, admin vs regular user, unauthenticated, cross-tenant access)
-   - state_transition: 3-4 (every state the entity moves through — create→active, active→archived, draft→published, cancellation, re-activation)
-   - api_impact: 3-4 (timeout, 500 error, 429 rate limit, network drop mid-request, concurrent duplicate requests, large payload)
-   - non_functional: 3-4 (page load under 2s, mobile 375px viewport, keyboard-only navigation, screen reader labels, WCAG contrast)
+OUTPUT STYLE — match this exactly:
 
-2. Each scenario MUST reference specific fields, values, actions and outcomes from THIS story. No generic placeholders.
+  Title:    "Verify <specific behavior using exact feature/role/field name from story>"
+            e.g. "Verify Analytics Admin role creation"
+                 "Verify permission label & description"
+                 "Verify Analytics tab hidden for non-eligible user"
+                 "Verify direct URL access restriction"
+            NEVER use boilerplate like "happy path", "primary flow", "successful submission",
+            "feature works correctly", or anything that just restates the story title.
 
-3. Preconditions: list every setup step needed — DB state, user role, existing records, feature flags, environment config. Be exact.
+  Summary:  Read as STEPS — a short action chain a tester can execute. Use one of two formats:
+              (a) Single line, arrow-separated:
+                  "Login as Analytics Admin → Open Role Management → View role details"
+              (b) Numbered multi-step (when more than 4 actions are needed):
+                  "1. Login as admin  2. Open Permissions page  3. Remove Analytics role  4. Refresh session"
+            Use real UI labels, page names, buttons, fields and roles from the story.
+            No narrative ("This test verifies that..."). No motivation. Just the actions.
+            Max 300 chars.
 
-4. Inputs: use realistic field names and values from the story domain (e.g. {"email": "qa+test@example.com", "amount": 10000, "currency": "USD"}). For negative tests use the exact bad value.
+  Expected: ONE observable, verifiable sentence. Name the exact thing a tester sees:
+              - exact UI text / label / badge
+              - element visible / hidden / disabled
+              - HTTP status code
+              - DB row state
+              - redirect target
+            Examples of correct shape:
+              "'Analytics Admin' role is available with correct label & description"
+              "Analytics tab is not visible in left navigation"
+              "HTTP 403 returned; Analytics dashboard not rendered"
+              "Role removed; access revoked on next page refresh"
+            FORBIDDEN PHRASES (never use): "works correctly", "as expected", "successfully" (alone),
+            "no errors", "data loads", "completes without issues", "behaves properly",
+            "is functional", "works fine", "performs as designed". Be specific or rewrite.
 
-5. Expected outcome: one specific, verifiable sentence — what the UI shows, what the DB contains, what HTTP status returns, what event fires. Never say "works correctly".
+  Preconditions: concrete, exact setup — named role, data state, feature flag, environment.
+                 e.g. ["User has 'Analytics Admin' role assigned",
+                       "At least one report exists in DB",
+                       "Feature flag analytics_v2 = true"]
 
-6. Test intent: the business risk or compliance concern being validated, in one sentence.
+  Inputs:   Realistic field names and values lifted from the story.
+            e.g. {"role": "Analytics Admin", "userEmail": "qa+viewer@example.com"}
 
-7. Summary: describe WHAT is being tested and WHY it matters for this specific feature (2-3 sentences, max 300 chars).
+  Test intent: One sentence on the business / compliance / security risk being validated.
 
-8. Priority:
-   - P0: Blocks release — data loss, security breach, auth broken, payment failure
-   - P1: Major workflow broken — key user journey fails, data corruption
-   - P2: Degraded experience — edge case fails, minor data issue, slow response
-   - P3: Nice-to-have — cosmetic, non-critical accessibility, low-traffic path
+COVERAGE — generate 25-40 scenarios. Every category MUST be represented:
+   - happy_path (4-6): every distinct success flow from the acceptance criteria — primary, alternate inputs, optional fields, different user types
+   - negative (5-7): every failure mode — wrong creds, missing required, forbidden op, not found, already exists, concurrent conflict
+   - edge (4-6): boundary min/max, empty/null, very long, special chars, unicode, whitespace, exactly-at-limit vs one-over
+   - validation (4-6): each field's format rules — wrong type, wrong format, wrong length, injection, out of range, bad date
+   - role_permission (3-4): each role referenced in the story — owner/viewer, admin/non-admin, unauthenticated, cross-tenant
+   - state_transition (3-4): every state the entity moves through — create→active, active→archived, draft→published, cancel, re-activate
+   - api_impact (3-4): timeout, 500, 429 rate limit, network drop mid-request, concurrent duplicates, large payload, direct URL/API access
+   - non_functional (3-4): mobile 375px, keyboard navigation, screen reader, page load < 2s, large dataset, cross-browser, audit logging
 
-Respond with ONLY a valid JSON array. No markdown fences, no explanation, no trailing text.`;
+Aim for the depth and breadth a senior tester writes when they sit down to cover a real feature: cover label/description, role visibility per user type, navigation order, tooltips, persistence after logout/refresh, multi-role coexistence, downgrade scenarios, audit log entries, caching after permission change, concurrent sessions, fallback when role removed mid-session — when applicable to the story.
+
+PRIORITY:
+   - P0: blocks release — data loss, security breach, auth broken, payment failure
+   - P1: major workflow broken — key user journey fails, data corruption
+   - P2: degraded experience — edge case fails, minor UI issue, slow response
+   - P3: nice-to-have — cosmetic, non-critical accessibility, low-traffic path
+
+Respond with ONLY a valid JSON array. No markdown fences, no commentary.`;
 
 function buildUserPrompt(title, description) {
   return `USER STORY TITLE: ${title}
@@ -47,25 +80,48 @@ function buildUserPrompt(title, description) {
 USER STORY DESCRIPTION:
 ${description}
 
-Generate an exhaustive test suite (25-40 scenarios) as a JSON array. All 8 categories must appear. Each object must have exactly these fields:
+Generate an exhaustive manual test suite (25-40 scenarios) as a JSON array. Every test case must be SPECIFIC to this story — pull role names, page names, buttons, field names, and entity names directly from the description. All 8 categories must appear.
+
+Each object must have exactly these fields:
 {
   "category": "happy_path|negative|edge|validation|role_permission|state_transition|api_impact|non_functional",
-  "title": "Specific, unique scenario title referencing actual feature details (max 120 chars)",
-  "summary": "2-3 sentence description of what is tested and why it matters for this feature (max 300 chars)",
-  "preconditions": ["Exact DB/env setup step 1", "Exact user state step 2", "Any feature flag or config needed"],
-  "test_intent": "The specific business risk, security concern, or compliance requirement being validated (max 200 chars)",
-  "inputs": {"actualFieldName": "realisticDomainValue", "anotherField": "anotherValue"},
-  "expected_outcome": "Single specific verifiable result: exact UI text shown, HTTP status returned, or DB state achieved (max 300 chars)",
+  "title": "Verify <specific behavior using exact term from story>  (max 120 chars). Start with Verify/Validate/Ensure/Check.",
+  "summary": "Test STEPS as 'Action → Action → Action' or numbered '1. ... 2. ... 3. ...'. No narration. Real UI labels only. (max 300 chars)",
+  "preconditions": ["Exact role/data/flag setup step 1", "Step 2"],
+  "test_intent": "Business risk, security concern, or compliance requirement being validated (max 200 chars)",
+  "inputs": {"realFieldName": "realDomainValue"},
+  "expected_outcome": "ONE observable verifiable sentence — exact UI text, badge, status code, redirect, DB state. NEVER 'works correctly' / 'successfully' / 'as expected' / 'no errors'. (max 300 chars)",
   "priority": "P0|P1|P2|P3"
 }
 
-Do NOT generate duplicate scenarios. Cover every field, every role, every state, every boundary. Be exhaustive.`;
+CHECK before emitting each case:
+- Could a tester open the app and execute the 'summary' steps without re-interpreting them? If not, rewrite.
+- Does 'expected_outcome' name a thing a tester can see / a status they can read? If not, rewrite.
+- Does 'title' tell a reviewer exactly what is being checked, in this story's domain words? If not, rewrite.
+
+Do NOT generate duplicate scenarios. Cover every field, role, state, and boundary referenced in the story.`;
 }
 
 /**
  * Validate a single scenario object for required fields and quality.
  * Returns { valid: boolean, issues: string[] }
  */
+// Phrases that indicate the model fell back to generic boilerplate instead of writing
+// a specific, observable outcome. Used to reject low-quality scenarios.
+const GENERIC_OUTCOME_PHRASES = [
+  'works correctly', 'works fine', 'works as expected', 'as expected',
+  'no errors', 'no error occurs', 'without errors', 'without issues',
+  'completes without issues', 'completes without error',
+  'data loads', 'loads correctly', 'behaves properly', 'behaves correctly',
+  'is functional', 'performs as designed', 'functions properly',
+];
+
+function containsGenericPhrase(text) {
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  return GENERIC_OUTCOME_PHRASES.some((p) => lower.includes(p));
+}
+
 function validateScenario(s, storyTitle) {
   const issues = [];
   const validCategories = ['happy_path', 'negative', 'edge', 'validation', 'role_permission', 'state_transition', 'api_impact', 'non_functional'];
@@ -84,6 +140,16 @@ function validateScenario(s, storyTitle) {
   const storyLower = (storyTitle || '').toLowerCase();
   if (titleLower === storyLower + ' - successful primary flow' || titleLower === storyLower + ' - happy path') {
     issues.push('scenario title is generic boilerplate');
+  }
+
+  // Reject titles that don't lead with an action verb — keeps the spreadsheet style consistent.
+  if (s.title && !/^(verify|validate|ensure|check|confirm)\b/i.test(s.title.trim())) {
+    issues.push('title does not start with Verify/Validate/Ensure/Check/Confirm');
+  }
+
+  // Reject expected outcomes that are vague boilerplate.
+  if (containsGenericPhrase(s.expected_outcome)) {
+    issues.push('expected_outcome contains generic phrase');
   }
 
   return { valid: issues.length === 0, issues };
