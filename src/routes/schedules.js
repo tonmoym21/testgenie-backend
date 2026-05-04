@@ -16,6 +16,15 @@ router.use(authenticate);
 // Store active cron jobs in memory
 const activeJobs = new Map();
 
+// Org-wide visibility helpers (owner OR same organization)
+function accessClause(alias) {
+  return `(${alias}.user_id = $1 OR (${alias}.organization_id IS NOT NULL AND ${alias}.organization_id = $2))`;
+}
+function userScope(req) { return [req.user.id, req.user.orgId || null]; }
+function colAccessClause(alias) {
+  return `(${alias}.user_id = $1 OR (${alias}.organization_id IS NOT NULL AND ${alias}.organization_id = $2))`;
+}
+
 const scheduleSchema = z.object({
   name: z.string().min(1).max(200),
   cronExpression: z.string().min(1),
@@ -53,8 +62,8 @@ router.get('/', async (req, res, next) => {
        LEFT JOIN collections c ON c.id = s.collection_id
        LEFT JOIN collection_folders f ON f.id = s.folder_id
        LEFT JOIN environments e ON e.id = s.environment_id
-       WHERE s.user_id = $1 ORDER BY s.created_at DESC`,
-      [req.user.id]
+       WHERE ${accessClause('s')} ORDER BY s.created_at DESC`,
+      userScope(req)
     );
     res.json({ data: result.rows });
   } catch (err) { next(err); }
@@ -69,8 +78,8 @@ router.get('/:id', async (req, res, next) => {
        LEFT JOIN collections c ON c.id = s.collection_id
        LEFT JOIN collection_folders f ON f.id = s.folder_id
        LEFT JOIN environments e ON e.id = s.environment_id
-       WHERE s.id = $1 AND s.user_id = $2`,
-      [req.params.id, req.user.id]
+       WHERE s.id = $3 AND ${accessClause('s')}`,
+      [...userScope(req), req.params.id]
     );
     if (result.rows.length === 0) throw new NotFoundError('Schedule');
     res.json(formatSchedule(result.rows[0]));
@@ -106,25 +115,25 @@ router.post('/', validate(scheduleSchema), async (req, res, next) => {
       });
     }
 
-    // Verify collection belongs to user
+    // Verify the collection is accessible (owner or org-mate)
     if (collectionId) {
       const col = await db.query(
-        'SELECT id FROM collections WHERE id = $1 AND user_id = $2',
-        [collectionId, req.user.id]
+        `SELECT id FROM collections WHERE id = $3 AND ${colAccessClause('collections')}`,
+        [...userScope(req), collectionId]
       );
       if (col.rows.length === 0) throw new NotFoundError('Collection');
     }
 
     const result = await db.query(
-      `INSERT INTO scheduled_tests 
+      `INSERT INTO scheduled_tests
        (user_id, name, test_definition, cron_expression, is_active, schedule_type,
-        collection_id, folder_id, test_ids, environment_id, notify_on_failure, notify_email)
-       VALUES ($1, $2, $3, $4, true, $5, $6, $7, $8, $9, $10, $11)
+        collection_id, folder_id, test_ids, environment_id, notify_on_failure, notify_email, organization_id)
+       VALUES ($1, $2, $3, $4, true, $5, $6, $7, $8, $9, $10, $11, $12)
        RETURNING id, name, cron_expression AS "cronExpression", is_active AS "isActive",
                  schedule_type AS "scheduleType", created_at AS "createdAt"`,
       [req.user.id, name, testDefinition ? JSON.stringify(testDefinition) : null, cronExpression,
        scheduleType, collectionId || null, folderId || null, testIds ? JSON.stringify(testIds) : null,
-       environmentId || null, notifyOnFailure, notifyEmail || null]
+       environmentId || null, notifyOnFailure, notifyEmail || null, req.user.orgId || null]
     );
 
     const schedule = result.rows[0];
@@ -142,8 +151,8 @@ router.post('/', validate(scheduleSchema), async (req, res, next) => {
 router.patch('/:id', async (req, res, next) => {
   try {
     const existing = await db.query(
-      'SELECT * FROM scheduled_tests WHERE id = $1 AND user_id = $2',
-      [req.params.id, req.user.id]
+      `SELECT * FROM scheduled_tests WHERE id = $3 AND ${accessClause('scheduled_tests')}`,
+      [...userScope(req), req.params.id]
     );
     if (existing.rows.length === 0) throw new NotFoundError('Schedule');
 
@@ -165,11 +174,11 @@ router.patch('/:id', async (req, res, next) => {
     if (sets.length === 0) return res.json({ message: 'Nothing to update' });
     
     sets.push('updated_at = NOW()');
-    params.push(req.params.id, req.user.id);
-    
+    params.push(req.params.id);
+
     const result = await db.query(
       `UPDATE scheduled_tests SET ${sets.join(', ')}
-       WHERE id = $${params.length - 1} AND user_id = $${params.length}
+       WHERE id = $${params.length}
        RETURNING *`,
       params
     );
@@ -198,8 +207,8 @@ router.patch('/:id', async (req, res, next) => {
 router.patch('/:id/toggle', async (req, res, next) => {
   try {
     const existing = await db.query(
-      'SELECT * FROM scheduled_tests WHERE id = $1 AND user_id = $2',
-      [req.params.id, req.user.id]
+      `SELECT * FROM scheduled_tests WHERE id = $3 AND ${accessClause('scheduled_tests')}`,
+      [...userScope(req), req.params.id]
     );
     if (existing.rows.length === 0) throw new NotFoundError('Schedule');
 
@@ -230,8 +239,8 @@ router.patch('/:id/toggle', async (req, res, next) => {
 router.post('/:id/run-now', async (req, res, next) => {
   try {
     const existing = await db.query(
-      'SELECT * FROM scheduled_tests WHERE id = $1 AND user_id = $2',
-      [req.params.id, req.user.id]
+      `SELECT * FROM scheduled_tests WHERE id = $3 AND ${accessClause('scheduled_tests')}`,
+      [...userScope(req), req.params.id]
     );
     if (existing.rows.length === 0) throw new NotFoundError('Schedule');
 
@@ -255,8 +264,8 @@ router.post('/:id/run-now', async (req, res, next) => {
 router.delete('/:id', async (req, res, next) => {
   try {
     const result = await db.query(
-      'DELETE FROM scheduled_tests WHERE id = $1 AND user_id = $2 RETURNING id',
-      [req.params.id, req.user.id]
+      `DELETE FROM scheduled_tests WHERE id = $3 AND ${accessClause('scheduled_tests')} RETURNING id`,
+      [...userScope(req), req.params.id]
     );
     if (result.rows.length === 0) throw new NotFoundError('Schedule');
     stopCronJob(parseInt(req.params.id));
@@ -271,10 +280,10 @@ router.delete('/:id', async (req, res, next) => {
 // GET /api/schedules/folders/:collectionId - get folders for collection
 router.get('/folders/:collectionId', async (req, res, next) => {
   try {
-    // Verify collection ownership
+    // Verify collection access (owner or org-mate)
     const col = await db.query(
-      'SELECT id FROM collections WHERE id = $1 AND user_id = $2',
-      [req.params.collectionId, req.user.id]
+      `SELECT id FROM collections WHERE id = $3 AND ${colAccessClause('collections')}`,
+      [...userScope(req), req.params.collectionId]
     );
     if (col.rows.length === 0) throw new NotFoundError('Collection');
 
@@ -333,25 +342,37 @@ async function executeScheduledRun(scheduleId, userId, config) {
   let tests = [];
   let title = 'Scheduled Run';
 
+  // Normalize testIds — JSONB column may round-trip as array, string, or null
+  let parsedTestIds = null;
+  if (testIds) {
+    if (Array.isArray(testIds)) parsedTestIds = testIds;
+    else if (typeof testIds === 'string') {
+      try { const p = JSON.parse(testIds); if (Array.isArray(p)) parsedTestIds = p; } catch {}
+    }
+    if (parsedTestIds && parsedTestIds.length === 0) parsedTestIds = null;
+  }
+
   // Get tests based on schedule type
   if (scheduleType === 'single' && testDefinition) {
     const def = typeof testDefinition === 'string' ? JSON.parse(testDefinition) : testDefinition;
-    tests = [{ id: null, name: def.name, testDefinition: def }];
+    // Single-test schedules store the full definition (including name + type at top level)
+    tests = [{ id: null, name: def.name, testType: def.type, testDefinition: def }];
     title = def.name;
   } else if (scheduleType === 'collection' && collectionId) {
     const testsResult = await db.query(
       `SELECT ct.id, ct.name, ct.test_type, ct.test_definition
        FROM collection_tests ct
-       WHERE ct.collection_id = $1 ${testIds ? 'AND ct.id = ANY($2)' : ''}
+       WHERE ct.collection_id = $1 ${parsedTestIds ? 'AND ct.id = ANY($2::int[])' : ''}
        ORDER BY ct.sort_order, ct.id`,
-      testIds ? [collectionId, testIds] : [collectionId]
+      parsedTestIds ? [collectionId, parsedTestIds] : [collectionId]
     );
     tests = testsResult.rows.map(t => ({
       id: t.id,
       name: t.name,
+      testType: t.test_type,
       testDefinition: typeof t.test_definition === 'string' ? JSON.parse(t.test_definition) : t.test_definition
     }));
-    
+
     const col = await db.query('SELECT name FROM collections WHERE id = $1', [collectionId]);
     title = col.rows[0]?.name || 'Collection Run';
   } else if (scheduleType === 'folder' && folderId) {
@@ -365,9 +386,10 @@ async function executeScheduledRun(scheduleId, userId, config) {
     tests = testsResult.rows.map(t => ({
       id: t.id,
       name: t.name,
+      testType: t.test_type,
       testDefinition: typeof t.test_definition === 'string' ? JSON.parse(t.test_definition) : t.test_definition
     }));
-    
+
     const folder = await db.query('SELECT name FROM collection_folders WHERE id = $1', [folderId]);
     title = folder.rows[0]?.name || 'Folder Run';
   }
@@ -405,8 +427,16 @@ async function executeScheduledRun(scheduleId, userId, config) {
     try {
       // Resolve environment variables in test definition
       const resolvedDef = envService.resolveObjectVariables(test.testDefinition, envVars);
-      const result = await executionService.executeTest(userId, null, resolvedDef);
-      
+      // executeTest expects name + type at top level; collection_tests store
+      // type in a separate column, and resolvedDef may not have either.
+      const fullTest = {
+        name: test.name,
+        type: test.testType || resolvedDef.type,
+        config: resolvedDef,
+        ...resolvedDef,
+      };
+      const result = await executionService.executeTest(userId, null, fullTest);
+
       await runReportService.addTestResult(report.id, {
         testId: test.id,
         name: test.name,
@@ -415,7 +445,7 @@ async function executeScheduledRun(scheduleId, userId, config) {
         error: result.error,
         rawResponse: result.rawResponse
       });
-      
+
       results.push({ ...result, testId: test.id, name: test.name });
     } catch (err) {
       await runReportService.addTestResult(report.id, {

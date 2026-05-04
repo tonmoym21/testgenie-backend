@@ -23,8 +23,8 @@ const rateLimiter = require('./middleware/rateLimiter'); // default export = gen
 const app = express();
 
 // Build info for deployment verification
-const BUILD_VERSION = '2.4.0';
-const BUILD_DATE = '2026-04-24T00:00:00Z';
+const BUILD_VERSION = '2.5.0';
+const BUILD_DATE = '2026-05-04T00:00:00Z';
 
 logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backend starting...');
 
@@ -102,6 +102,32 @@ logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backen
       `CREATE INDEX IF NOT EXISTS idx_scenarios_jira_issue_key ON scenarios(jira_issue_key)`,
       `UPDATE test_cases tc SET organization_id = u.organization_id FROM users u
          WHERE tc.user_id = u.id AND u.organization_id IS NOT NULL AND tc.organization_id IS NULL`,
+
+      // ── Migration 011: org-wide visibility for projects/collections/environments/schedules/run_reports ──
+      `ALTER TABLE projects ADD COLUMN IF NOT EXISTS organization_id INTEGER REFERENCES organizations(id) ON DELETE SET NULL`,
+      `CREATE INDEX IF NOT EXISTS idx_projects_org ON projects(organization_id)`,
+      `UPDATE projects p SET organization_id = u.organization_id FROM users u
+         WHERE p.user_id = u.id AND u.organization_id IS NOT NULL AND p.organization_id IS NULL`,
+
+      `ALTER TABLE collections ADD COLUMN IF NOT EXISTS organization_id INTEGER REFERENCES organizations(id) ON DELETE SET NULL`,
+      `CREATE INDEX IF NOT EXISTS idx_collections_org ON collections(organization_id)`,
+      `UPDATE collections c SET organization_id = u.organization_id FROM users u
+         WHERE c.user_id = u.id AND u.organization_id IS NOT NULL AND c.organization_id IS NULL`,
+
+      `ALTER TABLE environments ADD COLUMN IF NOT EXISTS organization_id INTEGER REFERENCES organizations(id) ON DELETE SET NULL`,
+      `CREATE INDEX IF NOT EXISTS idx_environments_org ON environments(organization_id)`,
+      `UPDATE environments e SET organization_id = u.organization_id FROM users u
+         WHERE e.user_id = u.id AND u.organization_id IS NOT NULL AND e.organization_id IS NULL`,
+
+      `ALTER TABLE scheduled_tests ADD COLUMN IF NOT EXISTS organization_id INTEGER REFERENCES organizations(id) ON DELETE SET NULL`,
+      `CREATE INDEX IF NOT EXISTS idx_scheduled_tests_org ON scheduled_tests(organization_id)`,
+      `UPDATE scheduled_tests s SET organization_id = u.organization_id FROM users u
+         WHERE s.user_id = u.id AND u.organization_id IS NOT NULL AND s.organization_id IS NULL`,
+
+      `ALTER TABLE run_reports ADD COLUMN IF NOT EXISTS organization_id INTEGER REFERENCES organizations(id) ON DELETE SET NULL`,
+      `CREATE INDEX IF NOT EXISTS idx_run_reports_org ON run_reports(organization_id)`,
+      `UPDATE run_reports r SET organization_id = u.organization_id FROM users u
+         WHERE r.user_id = u.id AND u.organization_id IS NOT NULL AND r.organization_id IS NULL`,
     ];
     for (const sql of statements) {
       try {

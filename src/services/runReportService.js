@@ -17,16 +17,20 @@ async function createRunReport(userId, data) {
     title, triggeredBy = 'manual', tags = []
   } = data;
 
+  // Look up creator's organization so org-mates can see the report
+  const userRow = await db.query('SELECT organization_id FROM users WHERE id = $1', [userId]);
+  const orgId = userRow.rows[0]?.organization_id || null;
+
   const result = await db.query(
-    `INSERT INTO run_reports 
+    `INSERT INTO run_reports
      (user_id, run_type, collection_id, folder_id, schedule_id, project_id,
       environment_id, environment_name, environment_snapshot,
-      title, triggered_by, tags, status, started_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'running', NOW())
+      title, triggered_by, tags, status, started_at, organization_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'running', NOW(), $13)
      RETURNING *`,
     [userId, runType, collectionId || null, folderId || null, scheduleId || null, projectId || null,
      environmentId || null, environmentName, environmentSnapshot ? JSON.stringify(environmentSnapshot) : null,
-     title, triggeredBy, JSON.stringify(tags)]
+     title, triggeredBy, JSON.stringify(tags), orgId]
   );
 
   logger.info({ userId, reportId: result.rows[0].id, runType }, 'Run report created');
@@ -96,7 +100,10 @@ async function getRunReport(userId, reportId) {
      LEFT JOIN collections c ON c.id = r.collection_id
      LEFT JOIN collection_folders f ON f.id = r.folder_id
      LEFT JOIN projects p ON p.id = r.project_id
-     WHERE r.id = $1 AND r.user_id = $2`,
+     WHERE r.id = $1
+       AND (r.user_id = $2
+            OR (r.organization_id IS NOT NULL
+                AND r.organization_id = (SELECT organization_id FROM users WHERE id = $2)))`,
     [reportId, userId]
   );
 
@@ -111,7 +118,9 @@ async function listRunReports(userId, options = {}) {
   const { runType, status, page = 1, limit = 20 } = options;
   const offset = (page - 1) * limit;
   const params = [userId];
-  let whereClause = 'WHERE r.user_id = $1';
+  let whereClause = `WHERE (r.user_id = $1
+       OR (r.organization_id IS NOT NULL
+           AND r.organization_id = (SELECT organization_id FROM users WHERE id = $1)))`;
 
   if (runType) {
     params.push(runType);
@@ -164,7 +173,8 @@ async function getApiRunsSummary(userId) {
        COALESCE(SUM(failed_count), 0)::int AS total_failed,
        COALESCE(AVG(total_duration_ms), 0)::int AS avg_duration
      FROM run_reports
-     WHERE user_id = $1 AND run_type IN ('api', 'collection')`,
+     WHERE (user_id = $1 OR (organization_id IS NOT NULL AND organization_id = (SELECT organization_id FROM users WHERE id = $1)))
+       AND run_type IN ('api', 'collection')`,
     [userId]
   );
 
@@ -172,7 +182,8 @@ async function getApiRunsSummary(userId) {
     `SELECT id, title, status, total_tests, passed_count, failed_count,
             total_duration_ms, started_at, completed_at
      FROM run_reports
-     WHERE user_id = $1 AND run_type IN ('api', 'collection')
+     WHERE (user_id = $1 OR (organization_id IS NOT NULL AND organization_id = (SELECT organization_id FROM users WHERE id = $1)))
+       AND run_type IN ('api', 'collection')
      ORDER BY created_at DESC LIMIT 10`,
     [userId]
   );
@@ -183,7 +194,8 @@ async function getApiRunsSummary(userId) {
             SUM(passed_count)::int AS passed,
             SUM(failed_count)::int AS failed
      FROM run_reports
-     WHERE user_id = $1 AND run_type IN ('api', 'collection')
+     WHERE (user_id = $1 OR (organization_id IS NOT NULL AND organization_id = (SELECT organization_id FROM users WHERE id = $1)))
+       AND run_type IN ('api', 'collection')
        AND started_at > NOW() - INTERVAL '30 days'
      GROUP BY DATE(started_at)
      ORDER BY date`,
@@ -212,7 +224,8 @@ async function getAutomationRunsSummary(userId) {
        COALESCE(SUM(failed_count), 0)::int AS total_failed,
        COALESCE(AVG(total_duration_ms), 0)::int AS avg_duration
      FROM run_reports
-     WHERE user_id = $1 AND run_type = 'automation'`,
+     WHERE (user_id = $1 OR (organization_id IS NOT NULL AND organization_id = (SELECT organization_id FROM users WHERE id = $1)))
+       AND run_type = 'automation'`,
     [userId]
   );
 
@@ -220,7 +233,8 @@ async function getAutomationRunsSummary(userId) {
     `SELECT id, title, status, total_tests, passed_count, failed_count,
             total_duration_ms, started_at, completed_at
      FROM run_reports
-     WHERE user_id = $1 AND run_type = 'automation'
+     WHERE (user_id = $1 OR (organization_id IS NOT NULL AND organization_id = (SELECT organization_id FROM users WHERE id = $1)))
+       AND run_type = 'automation'
      ORDER BY created_at DESC LIMIT 10`,
     [userId]
   );
@@ -231,7 +245,8 @@ async function getAutomationRunsSummary(userId) {
             SUM(passed_count)::int AS passed,
             SUM(failed_count)::int AS failed
      FROM run_reports
-     WHERE user_id = $1 AND run_type = 'automation'
+     WHERE (user_id = $1 OR (organization_id IS NOT NULL AND organization_id = (SELECT organization_id FROM users WHERE id = $1)))
+       AND run_type = 'automation'
        AND started_at > NOW() - INTERVAL '30 days'
      GROUP BY DATE(started_at)
      ORDER BY date`,

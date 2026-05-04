@@ -30,7 +30,7 @@ const listQuerySchema = z.object({
 // GET /api/projects
 router.get('/', validateQuery(listQuerySchema), async (req, res, next) => {
   try {
-    const result = await projectService.list(req.user.id, req.query);
+    const result = await projectService.list(req.user.id, req.query, req.user.orgId);
     res.json(result);
   } catch (err) {
     next(err);
@@ -40,7 +40,7 @@ router.get('/', validateQuery(listQuerySchema), async (req, res, next) => {
 // GET /api/projects/:id
 router.get('/:id', async (req, res, next) => {
   try {
-    const project = await projectService.getById(req.user.id, req.params.id);
+    const project = await projectService.getById(req.user.id, req.params.id, req.user.orgId);
     res.json(project);
   } catch (err) {
     next(err);
@@ -50,7 +50,7 @@ router.get('/:id', async (req, res, next) => {
 // POST /api/projects
 router.post('/', validate(createProjectSchema), async (req, res, next) => {
   try {
-    const project = await projectService.create(req.user.id, req.body);
+    const project = await projectService.create(req.user.id, req.body, req.user.orgId);
     res.status(201).json(project);
   } catch (err) {
     next(err);
@@ -60,7 +60,7 @@ router.post('/', validate(createProjectSchema), async (req, res, next) => {
 // PATCH /api/projects/:id
 router.patch('/:id', validate(updateProjectSchema), async (req, res, next) => {
   try {
-    const project = await projectService.update(req.user.id, req.params.id, req.body);
+    const project = await projectService.update(req.user.id, req.params.id, req.body, req.user.orgId);
     res.json(project);
   } catch (err) {
     next(err);
@@ -70,7 +70,7 @@ router.patch('/:id', validate(updateProjectSchema), async (req, res, next) => {
 // DELETE /api/projects/:id
 router.delete('/:id', async (req, res, next) => {
   try {
-    await projectService.remove(req.user.id, req.params.id);
+    await projectService.remove(req.user.id, req.params.id, req.user.orgId);
     res.json({ message: 'Project deleted' });
   } catch (err) {
     next(err);

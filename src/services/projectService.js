@@ -2,12 +2,33 @@ const db = require('../db');
 const { NotFoundError } = require('../utils/apiError');
 
 /**
- * List projects for a user with pagination and optional status filter.
+ * Build WHERE clause for org-wide visibility:
+ * - Project owner can see/access their own projects
+ * - Any member of the same organization can see/access org projects
+ * Returns { clause, params } where params start with [userId, orgIdOrNull].
  */
-async function list(userId, { status, page = 1, limit = 20 }) {
+function orgScopedWhere(userId, orgId, alias = 'p') {
+  if (orgId) {
+    return {
+      clause: `(${alias}.user_id = $1 OR ${alias}.organization_id = $2)`,
+      params: [userId, orgId],
+    };
+  }
+  return {
+    clause: `${alias}.user_id = $1`,
+    params: [userId],
+  };
+}
+
+/**
+ * List projects for a user with pagination and optional status filter.
+ * Returns own projects + projects belonging to user's organization.
+ */
+async function list(userId, { status, page = 1, limit = 20 }, orgId = null) {
   const offset = (page - 1) * limit;
-  const params = [userId];
-  let whereClause = 'WHERE p.user_id = $1';
+  const scoped = orgScopedWhere(userId, orgId, 'p');
+  const params = [...scoped.params];
+  let whereClause = `WHERE ${scoped.clause}`;
 
   if (status) {
     params.push(status);
@@ -50,9 +71,11 @@ async function list(userId, { status, page = 1, limit = 20 }) {
 }
 
 /**
- * Get a single project by ID, scoped to the user.
+ * Get a single project by ID — visible to owner or any member of the same org.
  */
-async function getById(userId, projectId) {
+async function getById(userId, projectId, orgId = null) {
+  const scoped = orgScopedWhere(userId, orgId, 'p');
+  const params = [...scoped.params, projectId];
   const result = await db.query(
     `SELECT
         p.id,
@@ -68,8 +91,8 @@ async function getById(userId, projectId) {
         FROM test_cases
         GROUP BY project_id
       ) tc ON tc.project_id = p.id
-      WHERE p.id = $1 AND p.user_id = $2`,
-    [projectId, userId]
+      WHERE p.id = $${params.length} AND ${scoped.clause}`,
+    params
   );
 
   if (result.rows.length === 0) {
@@ -80,25 +103,24 @@ async function getById(userId, projectId) {
 }
 
 /**
- * Create a new project.
+ * Create a new project. Stamps organization_id from the creating user.
  */
-async function create(userId, { name, description }) {
+async function create(userId, { name, description }, orgId = null) {
   const result = await db.query(
-    `INSERT INTO projects (user_id, name, description)
-     VALUES ($1, $2, $3)
+    `INSERT INTO projects (user_id, name, description, organization_id)
+     VALUES ($1, $2, $3, $4)
      RETURNING id, name, description, status, created_at AS "createdAt", updated_at AS "updatedAt"`,
-    [userId, name, description || null]
+    [userId, name, description || null, orgId || null]
   );
 
   return { ...result.rows[0], testCaseCount: 0 };
 }
 
 /**
- * Update a project (partial).
+ * Update a project (partial). Any org member may edit.
  */
-async function update(userId, projectId, fields) {
-  // Verify ownership
-  await getById(userId, projectId);
+async function update(userId, projectId, fields, orgId = null) {
+  await getById(userId, projectId, orgId);
 
   const allowed = ['name', 'description', 'status'];
   const setClauses = [];
@@ -112,14 +134,14 @@ async function update(userId, projectId, fields) {
   }
 
   if (setClauses.length === 0) {
-    return getById(userId, projectId);
+    return getById(userId, projectId, orgId);
   }
 
-  params.push(projectId, userId);
+  params.push(projectId);
   const result = await db.query(
     `UPDATE projects
      SET ${setClauses.join(', ')}
-     WHERE id = $${params.length - 1} AND user_id = $${params.length}
+     WHERE id = $${params.length}
      RETURNING id, name, description, status, created_at AS "createdAt", updated_at AS "updatedAt"`,
     params
   );
@@ -128,13 +150,11 @@ async function update(userId, projectId, fields) {
 }
 
 /**
- * Delete a project (cascades to test cases and analysis logs).
+ * Delete a project. Any org member may delete.
  */
-async function remove(userId, projectId) {
-  // Verify ownership
-  await getById(userId, projectId);
-
-  await db.query('DELETE FROM projects WHERE id = $1 AND user_id = $2', [projectId, userId]);
+async function remove(userId, projectId, orgId = null) {
+  await getById(userId, projectId, orgId);
+  await db.query('DELETE FROM projects WHERE id = $1', [projectId]);
 }
 
 module.exports = { list, getById, create, update, remove };

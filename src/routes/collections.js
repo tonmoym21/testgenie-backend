@@ -13,6 +13,25 @@ const router = Router();
 router.use(authenticate);
 
 // ============================
+// Org-wide visibility helpers
+// ============================
+// A user can access a collection if they own it OR it belongs to their org.
+// First two params for any query using this MUST be (userId, orgId).
+function accessClause(alias) {
+  return `(${alias}.user_id = $1 OR (${alias}.organization_id IS NOT NULL AND ${alias}.organization_id = $2))`;
+}
+function userScope(req) { return [req.user.id, req.user.orgId || null]; }
+
+async function assertCollectionAccess(req, colId) {
+  const r = await db.query(
+    `SELECT id FROM collections WHERE id = $3 AND ${accessClause('collections')}`,
+    [...userScope(req), colId]
+  );
+  if (r.rows.length === 0) throw new NotFoundError('Collection');
+  return r.rows[0];
+}
+
+// ============================
 // Collection CRUD
 // ============================
 
@@ -34,6 +53,7 @@ router.get('/', async (req, res, next) => {
   try {
     const result = await db.query(
       `SELECT c.id, c.name, c.description, c.created_at AS "createdAt",
+              c.user_id AS "ownerId",
               COALESCE(ct.count, 0)::int AS "testCount",
               COALESCE(cf.count, 0)::int AS "folderCount"
        FROM collections c
@@ -41,9 +61,9 @@ router.get('/', async (req, res, next) => {
          ON ct.collection_id = c.id
        LEFT JOIN (SELECT collection_id, COUNT(*) AS count FROM collection_folders GROUP BY collection_id) cf
          ON cf.collection_id = c.id
-       WHERE c.user_id = $1
+       WHERE ${accessClause('c')}
        ORDER BY c.created_at DESC`,
-      [req.user.id]
+      userScope(req)
     );
     res.json({ data: result.rows });
   } catch (err) { next(err); }
@@ -53,8 +73,10 @@ router.get('/', async (req, res, next) => {
 router.post('/', validate(createCollectionSchema), async (req, res, next) => {
   try {
     const result = await db.query(
-      'INSERT INTO collections (user_id, name, description) VALUES ($1, $2, $3) RETURNING id, name, description, created_at AS "createdAt"',
-      [req.user.id, req.body.name, req.body.description || null]
+      `INSERT INTO collections (user_id, name, description, organization_id)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, name, description, created_at AS "createdAt"`,
+      [req.user.id, req.body.name, req.body.description || null, req.user.orgId || null]
     );
     res.status(201).json({ ...result.rows[0], testCount: 0, folderCount: 0 });
   } catch (err) { next(err); }
@@ -64,8 +86,9 @@ router.post('/', validate(createCollectionSchema), async (req, res, next) => {
 router.get('/:id', async (req, res, next) => {
   try {
     const col = await db.query(
-      'SELECT id, name, description, created_at AS "createdAt" FROM collections WHERE id = $1 AND user_id = $2',
-      [req.params.id, req.user.id]
+      `SELECT id, name, description, created_at AS "createdAt" FROM collections
+       WHERE id = $3 AND ${accessClause('collections')}`,
+      [...userScope(req), req.params.id]
     );
     if (col.rows.length === 0) throw new NotFoundError('Collection');
 
@@ -95,8 +118,8 @@ router.get('/:id', async (req, res, next) => {
 // DELETE /api/collections/:id
 router.delete('/:id', async (req, res, next) => {
   try {
-    const result = await db.query('DELETE FROM collections WHERE id = $1 AND user_id = $2 RETURNING id', [req.params.id, req.user.id]);
-    if (result.rows.length === 0) throw new NotFoundError('Collection');
+    await assertCollectionAccess(req, req.params.id);
+    await db.query('DELETE FROM collections WHERE id = $1', [req.params.id]);
     res.json({ message: 'Collection deleted' });
   } catch (err) { next(err); }
 });
@@ -114,8 +137,7 @@ const createFolderSchema = z.object({
 
 router.get('/:id/folders', async (req, res, next) => {
   try {
-    const col = await db.query('SELECT id FROM collections WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
-    if (col.rows.length === 0) throw new NotFoundError('Collection');
+    await assertCollectionAccess(req, req.params.id);
     const folders = await db.query(
       `SELECT f.id, f.name, f.description, f.parent_folder_id AS "parentFolderId",
               f.sort_order AS "sortOrder", f.created_at AS "createdAt",
@@ -133,8 +155,7 @@ router.get('/:id/folders', async (req, res, next) => {
 
 router.post('/:id/folders', validate(createFolderSchema), async (req, res, next) => {
   try {
-    const col = await db.query('SELECT id FROM collections WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
-    if (col.rows.length === 0) throw new NotFoundError('Collection');
+    await assertCollectionAccess(req, req.params.id);
     const result = await db.query(
       `INSERT INTO collection_folders (collection_id, name, description, parent_folder_id, sort_order)
        VALUES ($1, $2, $3, $4, $5)
@@ -147,8 +168,7 @@ router.post('/:id/folders', validate(createFolderSchema), async (req, res, next)
 
 router.patch('/:colId/folders/:folderId', async (req, res, next) => {
   try {
-    const col = await db.query('SELECT id FROM collections WHERE id = $1 AND user_id = $2', [req.params.colId, req.user.id]);
-    if (col.rows.length === 0) throw new NotFoundError('Collection');
+    await assertCollectionAccess(req, req.params.colId);
     const { name, description, sortOrder } = req.body;
     const sets = []; const params = [];
     if (name) { params.push(name); sets.push(`name = $${params.length}`); }
@@ -169,8 +189,7 @@ router.patch('/:colId/folders/:folderId', async (req, res, next) => {
 
 router.delete('/:colId/folders/:folderId', async (req, res, next) => {
   try {
-    const col = await db.query('SELECT id FROM collections WHERE id = $1 AND user_id = $2', [req.params.colId, req.user.id]);
-    if (col.rows.length === 0) throw new NotFoundError('Collection');
+    await assertCollectionAccess(req, req.params.colId);
     await db.query('UPDATE collection_tests SET folder_id = NULL WHERE folder_id = $1', [req.params.folderId]);
     const result = await db.query(
       'DELETE FROM collection_folders WHERE id = $1 AND collection_id = $2 RETURNING id',
@@ -187,8 +206,7 @@ router.delete('/:colId/folders/:folderId', async (req, res, next) => {
 
 router.post('/:id/tests', validate(addTestSchema), async (req, res, next) => {
   try {
-    const col = await db.query('SELECT id FROM collections WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
-    if (col.rows.length === 0) throw new NotFoundError('Collection');
+    await assertCollectionAccess(req, req.params.id);
     const result = await db.query(
       `INSERT INTO collection_tests (collection_id, name, test_type, test_definition, sort_order, folder_id)
        VALUES ($1, $2, $3, $4, $5, $6)
@@ -201,8 +219,7 @@ router.post('/:id/tests', validate(addTestSchema), async (req, res, next) => {
 
 router.patch('/:colId/tests/:testId', async (req, res, next) => {
   try {
-    const col = await db.query('SELECT id FROM collections WHERE id = $1 AND user_id = $2', [req.params.colId, req.user.id]);
-    if (col.rows.length === 0) throw new NotFoundError('Collection');
+    await assertCollectionAccess(req, req.params.colId);
     const { name, testDefinition, sortOrder, folderId } = req.body;
     const sets = []; const params = [];
     if (name) { params.push(name); sets.push(`name = $${params.length}`); }
@@ -224,8 +241,7 @@ router.patch('/:colId/tests/:testId', async (req, res, next) => {
 
 router.delete('/:colId/tests/:testId', async (req, res, next) => {
   try {
-    const col = await db.query('SELECT id FROM collections WHERE id = $1 AND user_id = $2', [req.params.colId, req.user.id]);
-    if (col.rows.length === 0) throw new NotFoundError('Collection');
+    await assertCollectionAccess(req, req.params.colId);
     await db.query('DELETE FROM collection_tests WHERE id = $1 AND collection_id = $2', [req.params.testId, req.params.colId]);
     res.json({ message: 'Test removed' });
   } catch (err) { next(err); }
@@ -234,8 +250,7 @@ router.delete('/:colId/tests/:testId', async (req, res, next) => {
 // POST /api/collections/:colId/tests/:testId/run — run a single test
 router.post('/:colId/tests/:testId/run', async (req, res, next) => {
   try {
-    const col = await db.query('SELECT id FROM collections WHERE id = $1 AND user_id = $2', [req.params.colId, req.user.id]);
-    if (col.rows.length === 0) throw new NotFoundError('Collection');
+    await assertCollectionAccess(req, req.params.colId);
 
     const t = await db.query(
       'SELECT id, name, test_type, test_definition FROM collection_tests WHERE id = $1 AND collection_id = $2',
@@ -411,7 +426,10 @@ async function runTestsParallel(tests, baseVars, executionService, userId, onPro
 // ============================
 router.post('/:id/run', async (req, res, next) => {
   try {
-    const col = await db.query('SELECT id, name FROM collections WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
+    const col = await db.query(
+      `SELECT id, name FROM collections WHERE id = $3 AND ${accessClause('collections')}`,
+      [...userScope(req), req.params.id]
+    );
     if (col.rows.length === 0) throw new NotFoundError('Collection');
 
     const { environmentId, folderId, testIds, notifyEmail } = req.body;
@@ -493,13 +511,16 @@ router.post('/:id/run', async (req, res, next) => {
 // ============================
 router.get('/:id/run-stream', async (req, res, next) => {
   try {
-    const col = await db.query('SELECT id, name FROM collections WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
+    const col = await db.query(
+      `SELECT id, name FROM collections WHERE id = $3 AND ${accessClause('collections')}`,
+      [...userScope(req), req.params.id]
+    );
     if (col.rows.length === 0) throw new NotFoundError('Collection');
 
     const { environmentId, folderId, testIds } = req.query;
     const parsedTestIds = testIds ? testIds.split(',').map(Number).filter(Boolean) : undefined;
 
-    const tests = await fetchTestsForRun(req.params.id, { folderId, parsedTestIds });
+    const tests = await fetchTestsForRun(req.params.id, { folderId, testIds: parsedTestIds });
     const baseVars = await envService.buildVariableContext(req.user.id, environmentId || null);
 
     // Create run report so the UI can link to /reports/:reportId
