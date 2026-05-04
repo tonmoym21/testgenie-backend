@@ -18,7 +18,7 @@ async function runMigration() {
   }
 
   const sslConfig =
-    databaseUrl.includes('railway') || databaseUrl.includes('neon')
+    /railway|neon|supabase\.com|sslmode=require|sslmode=no-verify/i.test(databaseUrl)
       ? { rejectUnauthorized: false }
       : false;
 
