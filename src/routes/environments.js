@@ -9,8 +9,10 @@ const envService = require('../services/environmentService');
 const router = Router();
 router.use(authenticate);
 
-function accessClause(alias) {
-  return `(${alias}.user_id = $1 OR (${alias}.organization_id IS NOT NULL AND ${alias}.organization_id = $2))`;
+// Platform-wide: any authenticated user can read/modify any environment.
+// Tautology references $1/$2 to keep node-pg parameter alignment.
+function accessClause(_alias) {
+  return `($1::int IS NOT NULL OR $2::int IS NULL)`;
 }
 function userScope(req) { return [req.user.id, req.user.orgId || null]; }
 

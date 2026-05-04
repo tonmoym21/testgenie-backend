@@ -1,21 +1,9 @@
 const db = require('../db');
 const { NotFoundError } = require('../utils/apiError');
 
-async function verifyProjectAccess(userId, projectId, orgId) {
-  let result;
-  if (orgId) {
-    result = await db.query(
-      `SELECT p.id FROM projects p
-       JOIN users u ON u.id = p.user_id
-       WHERE p.id = $1 AND (p.user_id = $2 OR u.organization_id = $3)`,
-      [projectId, userId, orgId]
-    );
-  } else {
-    result = await db.query(
-      'SELECT id FROM projects WHERE id = $1 AND user_id = $2',
-      [projectId, userId]
-    );
-  }
+// Platform-wide visibility: any authenticated user may access any project.
+async function verifyProjectAccess(_userId, projectId, _orgId) {
+  const result = await db.query('SELECT id FROM projects WHERE id = $1', [projectId]);
   if (result.rows.length === 0) throw new NotFoundError('Project');
 }
 

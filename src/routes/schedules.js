@@ -16,13 +16,15 @@ router.use(authenticate);
 // Store active cron jobs in memory
 const activeJobs = new Map();
 
-// Org-wide visibility helpers (owner OR same organization)
-function accessClause(alias) {
-  return `(${alias}.user_id = $1 OR (${alias}.organization_id IS NOT NULL AND ${alias}.organization_id = $2))`;
+// Platform-wide visibility: any authenticated user can read/modify any
+// schedule or referenced collection. Tautology references $1/$2 for
+// node-pg parameter alignment.
+function accessClause(_alias) {
+  return `($1::int IS NOT NULL OR $2::int IS NULL)`;
 }
 function userScope(req) { return [req.user.id, req.user.orgId || null]; }
-function colAccessClause(alias) {
-  return `(${alias}.user_id = $1 OR (${alias}.organization_id IS NOT NULL AND ${alias}.organization_id = $2))`;
+function colAccessClause(_alias) {
+  return `($1::int IS NOT NULL OR $2::int IS NULL)`;
 }
 
 const scheduleSchema = z.object({

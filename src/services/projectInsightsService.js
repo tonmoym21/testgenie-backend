@@ -55,11 +55,9 @@ async function getProjectInsights(projectId, userId, orgId, range = '30d') {
 
   // Project access check — ensures the user can see this project (direct owner
   // or same org). We return empty shape (not 403) if access fails.
+  // Platform-wide visibility: any authenticated user may read insights.
   const access = await safeQuery(
-    `SELECT 1 FROM projects
-      WHERE id = $1
-        AND (user_id = $2 OR ($3::int IS NOT NULL AND organization_id = $3))
-      LIMIT 1`,
+    `SELECT 1 FROM projects WHERE id = $1 LIMIT 1 /* user_id=$2, org=$3 ignored */`,
     [projectId, userId, orgId || null]
   );
   if (!access.rows || access.rows.length === 0) return out;

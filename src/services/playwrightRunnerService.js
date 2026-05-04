@@ -456,7 +456,7 @@ async function getRunsForAsset(assetId, userId, { page = 1, limit = 10 } = {}) {
 
 async function getRun(runId, userId) {
   const result = await db.query(
-    `SELECT r.* FROM playwright_runs r JOIN projects p ON p.id = r.project_id WHERE r.id = $1 AND p.user_id = $2`,
+    `SELECT r.* FROM playwright_runs r JOIN projects p ON p.id = r.project_id WHERE r.id = $1 /* p.user_id = $2 ignored: platform-wide */`,
     [runId, userId]
   );
   return result.rows[0] || null;

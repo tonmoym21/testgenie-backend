@@ -2,21 +2,14 @@ const db = require('../db');
 const { NotFoundError } = require('../utils/apiError');
 
 /**
- * Build WHERE clause for org-wide visibility:
- * - Project owner can see/access their own projects
- * - Any member of the same organization can see/access org projects
- * Returns { clause, params } where params start with [userId, orgIdOrNull].
+ * Platform-wide visibility: any authenticated user can see and modify
+ * any project. The clause is a tautology that still references both
+ * params so node-pg parameter alignment stays stable.
  */
-function orgScopedWhere(userId, orgId, alias = 'p') {
-  if (orgId) {
-    return {
-      clause: `(${alias}.user_id = $1 OR ${alias}.organization_id = $2)`,
-      params: [userId, orgId],
-    };
-  }
+function orgScopedWhere(userId, orgId, _alias = 'p') {
   return {
-    clause: `${alias}.user_id = $1`,
-    params: [userId],
+    clause: `($1::int IS NOT NULL OR $2::int IS NULL)`,
+    params: [userId, orgId || null],
   };
 }
 

@@ -13,12 +13,15 @@ const router = Router();
 router.use(authenticate);
 
 // ============================
-// Org-wide visibility helpers
+// Platform-wide visibility
 // ============================
-// A user can access a collection if they own it OR it belongs to their org.
-// First two params for any query using this MUST be (userId, orgId).
-function accessClause(alias) {
-  return `(${alias}.user_id = $1 OR (${alias}.organization_id IS NOT NULL AND ${alias}.organization_id = $2))`;
+// Any authenticated user can read/modify any collection. The first two
+// query params still carry [userId, orgId] for stamping ownership/org_id
+// on inserts and for log/audit context, but the SELECT/UPDATE/DELETE
+// predicates ignore them. Tautology references both placeholders so
+// node-pg's parameter list always lines up.
+function accessClause(_alias) {
+  return `($1::int IS NOT NULL OR $2::int IS NULL)`;
 }
 function userScope(req) { return [req.user.id, req.user.orgId || null]; }
 

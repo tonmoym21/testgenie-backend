@@ -97,7 +97,7 @@ async function getCombinedMetrics(userId) {
          COUNT(*) FILTER (WHERE status = 'failed')::int AS failed,
          COUNT(*) FILTER (WHERE status = 'running')::int AS running,
          COALESCE(AVG(duration_ms), 0)::int AS avg_duration
-       FROM test_executions WHERE user_id = $1`,
+       FROM test_executions WHERE ($1::int IS NOT NULL) /* platform-wide */`,
       [userId],
       { rows: [{ total_runs: 0, passed: 0, failed: 0, running: 0, avg_duration: 0 }] }
     );
@@ -107,7 +107,7 @@ async function getCombinedMetrics(userId) {
       `SELECT test_type AS type, COUNT(*)::int AS count,
               COUNT(*) FILTER (WHERE status = 'passed')::int AS passed,
               COUNT(*) FILTER (WHERE status = 'failed')::int AS failed
-       FROM test_executions WHERE user_id = $1
+       FROM test_executions WHERE ($1::int IS NOT NULL) /* platform-wide */
        GROUP BY test_type`,
       [userId]
     );
@@ -119,7 +119,7 @@ async function getCombinedMetrics(userId) {
               COUNT(*) FILTER (WHERE status = 'passed')::int AS passed,
               COUNT(*) FILTER (WHERE status = 'failed')::int AS failed
        FROM test_executions
-       WHERE user_id = $1 AND created_at > NOW() - INTERVAL '30 days'
+       WHERE ($1::int IS NOT NULL) /* platform-wide */ AND created_at > NOW() - INTERVAL '30 days'
        GROUP BY DATE(created_at)
        ORDER BY date`,
       [userId]
@@ -130,7 +130,7 @@ async function getCombinedMetrics(userId) {
       `SELECT id, test_name AS "testName", test_type AS "testType", status,
               duration_ms AS "durationMs", completed_at AS "completedAt", error
        FROM test_executions
-       WHERE user_id = $1
+       WHERE ($1::int IS NOT NULL) /* platform-wide */
        ORDER BY created_at DESC LIMIT 10`,
       [userId]
     );
@@ -140,7 +140,7 @@ async function getCombinedMetrics(userId) {
       `SELECT id, test_name AS "testName", test_type AS "testType", error,
               duration_ms AS "durationMs", completed_at AS "completedAt"
        FROM test_executions
-       WHERE user_id = $1 AND status = 'failed'
+       WHERE ($1::int IS NOT NULL) /* platform-wide */ AND status = 'failed'
        ORDER BY created_at DESC LIMIT 5`,
       [userId]
     );
@@ -151,7 +151,7 @@ async function getCombinedMetrics(userId) {
       schedules = await safeQuery(
         `SELECT COUNT(*) FILTER (WHERE is_active = true)::int AS active,
                 COUNT(*)::int AS total
-         FROM scheduled_tests WHERE user_id = $1`,
+         FROM scheduled_tests WHERE ($1::int IS NOT NULL) /* platform-wide */`,
         [userId],
         { rows: [{ active: 0, total: 0 }] }
       );
@@ -161,7 +161,7 @@ async function getCombinedMetrics(userId) {
     let collectionsCount = 0;
     if (await tableExists('collections')) {
       const collections = await safeQuery(
-        `SELECT COUNT(*)::int AS total FROM collections WHERE user_id = $1`,
+        `SELECT COUNT(*)::int AS total FROM collections WHERE ($1::int IS NOT NULL) /* platform-wide */`,
         [userId],
         { rows: [{ total: 0 }] }
       );
@@ -243,7 +243,7 @@ async function getApiDashboardMetrics(userId) {
          COALESCE(AVG(duration_ms), 0)::int AS avg_duration,
          COALESCE(MIN(duration_ms), 0)::int AS min_duration,
          COALESCE(MAX(duration_ms), 0)::int AS max_duration
-       FROM test_executions WHERE user_id = $1 AND test_type = 'api'`,
+       FROM test_executions WHERE ($1::int IS NOT NULL) /* platform-wide */ AND test_type = 'api'`,
       [userId],
       { rows: [emptyResponse.summary] }
     );
@@ -256,7 +256,7 @@ async function getApiDashboardMetrics(userId) {
               COUNT(*) FILTER (WHERE status = 'failed')::int AS failed,
               COALESCE(AVG(duration_ms), 0)::int AS avg_duration
        FROM test_executions
-       WHERE user_id = $1 AND test_type = 'api' AND created_at > NOW() - INTERVAL '30 days'
+       WHERE ($1::int IS NOT NULL) /* platform-wide */ AND test_type = 'api' AND created_at > NOW() - INTERVAL '30 days'
        GROUP BY DATE(created_at)
        ORDER BY date`,
       [userId]
@@ -267,7 +267,7 @@ async function getApiDashboardMetrics(userId) {
       `SELECT EXTRACT(HOUR FROM created_at)::int AS hour,
               COUNT(*)::int AS count
        FROM test_executions
-       WHERE user_id = $1 AND test_type = 'api' AND created_at > NOW() - INTERVAL '7 days'
+       WHERE ($1::int IS NOT NULL) /* platform-wide */ AND test_type = 'api' AND created_at > NOW() - INTERVAL '7 days'
        GROUP BY EXTRACT(HOUR FROM created_at)
        ORDER BY hour`,
       [userId]
@@ -278,7 +278,7 @@ async function getApiDashboardMetrics(userId) {
       `SELECT id, test_name AS "testName", status, error,
               duration_ms AS "durationMs", completed_at AS "completedAt"
        FROM test_executions
-       WHERE user_id = $1 AND test_type = 'api'
+       WHERE ($1::int IS NOT NULL) /* platform-wide */ AND test_type = 'api'
        ORDER BY created_at DESC LIMIT 15`,
       [userId]
     );
@@ -287,7 +287,7 @@ async function getApiDashboardMetrics(userId) {
     const topFailures = await safeQuery(
       `SELECT test_name AS "testName", COUNT(*)::int AS failures
        FROM test_executions
-       WHERE user_id = $1 AND test_type = 'api' AND status = 'failed'
+       WHERE ($1::int IS NOT NULL) /* platform-wide */ AND test_type = 'api' AND status = 'failed'
          AND created_at > NOW() - INTERVAL '7 days'
        GROUP BY test_name
        ORDER BY failures DESC LIMIT 5`,
@@ -347,7 +347,7 @@ async function getAutomationDashboardMetrics(userId) {
          COUNT(*) FILTER (WHERE status = 'failed')::int AS failed,
          COUNT(*) FILTER (WHERE status = 'running')::int AS running,
          COALESCE(AVG(duration_ms), 0)::int AS avg_duration
-       FROM test_executions WHERE user_id = $1 AND test_type = 'ui'`,
+       FROM test_executions WHERE ($1::int IS NOT NULL) /* platform-wide */ AND test_type = 'ui'`,
       [userId],
       { rows: [{ total_runs: 0, passed: 0, failed: 0, running: 0, avg_duration: 0 }] }
     );
@@ -359,7 +359,7 @@ async function getAutomationDashboardMetrics(userId) {
               COUNT(*) FILTER (WHERE status = 'passed')::int AS passed,
               COUNT(*) FILTER (WHERE status = 'failed')::int AS failed
        FROM test_executions
-       WHERE user_id = $1 AND test_type = 'ui' AND created_at > NOW() - INTERVAL '30 days'
+       WHERE ($1::int IS NOT NULL) /* platform-wide */ AND test_type = 'ui' AND created_at > NOW() - INTERVAL '30 days'
        GROUP BY DATE(created_at)
        ORDER BY date`,
       [userId]
@@ -370,7 +370,7 @@ async function getAutomationDashboardMetrics(userId) {
       `SELECT id, test_name AS "testName", status, error,
               duration_ms AS "durationMs", completed_at AS "completedAt"
        FROM test_executions
-       WHERE user_id = $1 AND test_type = 'ui'
+       WHERE ($1::int IS NOT NULL) /* platform-wide */ AND test_type = 'ui'
        ORDER BY created_at DESC LIMIT 15`,
       [userId]
     );
@@ -382,7 +382,7 @@ async function getAutomationDashboardMetrics(userId) {
               COUNT(*) FILTER (WHERE status = 'passed')::int AS passed,
               COUNT(*) FILTER (WHERE status = 'failed')::int AS failed
        FROM test_executions
-       WHERE user_id = $1 AND test_type = 'ui' AND created_at > NOW() - INTERVAL '7 days'
+       WHERE ($1::int IS NOT NULL) /* platform-wide */ AND test_type = 'ui' AND created_at > NOW() - INTERVAL '7 days'
        GROUP BY test_name
        HAVING COUNT(*) FILTER (WHERE status = 'passed') > 0 
           AND COUNT(*) FILTER (WHERE status = 'failed') > 0
@@ -396,7 +396,7 @@ async function getAutomationDashboardMetrics(userId) {
       const assetStats = await safeQuery(
         `SELECT COALESCE(execution_readiness, 'unknown') AS status, COUNT(*)::int AS count
          FROM automation_assets
-         WHERE project_id IN (SELECT id FROM projects WHERE user_id = $1)
+         WHERE project_id IN (SELECT id FROM projects WHERE ($1::int IS NOT NULL) /* platform-wide */)
          GROUP BY execution_readiness`,
         [userId]
       );
@@ -500,7 +500,7 @@ async function getAlerts(userId) {
        FROM (
          SELECT test_name, status,
                 ROW_NUMBER() OVER (PARTITION BY test_name ORDER BY created_at DESC) AS rn
-         FROM test_executions WHERE user_id = $1
+         FROM test_executions WHERE ($1::int IS NOT NULL) /* platform-wide */
        ) sub
        WHERE rn <= 3 AND status = 'failed'
        GROUP BY test_name
@@ -523,7 +523,7 @@ async function getAlerts(userId) {
     const slowTests = await safeQuery(
       `SELECT test_name, AVG(duration_ms)::int AS avg_duration
        FROM test_executions
-       WHERE user_id = $1 AND created_at > NOW() - INTERVAL '7 days'
+       WHERE ($1::int IS NOT NULL) /* platform-wide */ AND created_at > NOW() - INTERVAL '7 days'
        GROUP BY test_name
        HAVING AVG(duration_ms) > 5000
        LIMIT 3`,

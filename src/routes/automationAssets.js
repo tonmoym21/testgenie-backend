@@ -252,7 +252,7 @@ router.get('/executions', async (req, res, next) => {
     const { projectId } = req.params;
     const { status, page = 1, limit = 20 } = req.query;
     const params = [parseInt(projectId, 10), req.user.id];
-    let where = 'WHERE r.project_id = $1 AND p.user_id = $2';
+    let where = 'WHERE r.project_id = $1 /* p.user_id = $2 ignored: platform-wide */';
     if (status) { params.push(status); where += ` AND r.status = $${params.length}`; }
     const countRes = await db.query(`SELECT COUNT(*) FROM playwright_runs r JOIN projects p ON p.id = r.project_id ${where}`, params);
     const offset = (parseInt(page) - 1) * parseInt(limit);

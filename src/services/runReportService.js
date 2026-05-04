@@ -100,10 +100,7 @@ async function getRunReport(userId, reportId) {
      LEFT JOIN collections c ON c.id = r.collection_id
      LEFT JOIN collection_folders f ON f.id = r.folder_id
      LEFT JOIN projects p ON p.id = r.project_id
-     WHERE r.id = $1
-       AND (r.user_id = $2
-            OR (r.organization_id IS NOT NULL
-                AND r.organization_id = (SELECT organization_id FROM users WHERE id = $2)))`,
+     WHERE r.id = $1 AND ($2::int IS NOT NULL)`,
     [reportId, userId]
   );
 
@@ -118,9 +115,7 @@ async function listRunReports(userId, options = {}) {
   const { runType, status, page = 1, limit = 20 } = options;
   const offset = (page - 1) * limit;
   const params = [userId];
-  let whereClause = `WHERE (r.user_id = $1
-       OR (r.organization_id IS NOT NULL
-           AND r.organization_id = (SELECT organization_id FROM users WHERE id = $1)))`;
+  let whereClause = `WHERE ($1::int IS NOT NULL)`;
 
   if (runType) {
     params.push(runType);
@@ -173,7 +168,7 @@ async function getApiRunsSummary(userId) {
        COALESCE(SUM(failed_count), 0)::int AS total_failed,
        COALESCE(AVG(total_duration_ms), 0)::int AS avg_duration
      FROM run_reports
-     WHERE (user_id = $1 OR (organization_id IS NOT NULL AND organization_id = (SELECT organization_id FROM users WHERE id = $1)))
+     WHERE ($1::int IS NOT NULL)
        AND run_type IN ('api', 'collection')`,
     [userId]
   );
@@ -182,7 +177,7 @@ async function getApiRunsSummary(userId) {
     `SELECT id, title, status, total_tests, passed_count, failed_count,
             total_duration_ms, started_at, completed_at
      FROM run_reports
-     WHERE (user_id = $1 OR (organization_id IS NOT NULL AND organization_id = (SELECT organization_id FROM users WHERE id = $1)))
+     WHERE ($1::int IS NOT NULL)
        AND run_type IN ('api', 'collection')
      ORDER BY created_at DESC LIMIT 10`,
     [userId]
@@ -194,7 +189,7 @@ async function getApiRunsSummary(userId) {
             SUM(passed_count)::int AS passed,
             SUM(failed_count)::int AS failed
      FROM run_reports
-     WHERE (user_id = $1 OR (organization_id IS NOT NULL AND organization_id = (SELECT organization_id FROM users WHERE id = $1)))
+     WHERE ($1::int IS NOT NULL)
        AND run_type IN ('api', 'collection')
        AND started_at > NOW() - INTERVAL '30 days'
      GROUP BY DATE(started_at)
@@ -224,7 +219,7 @@ async function getAutomationRunsSummary(userId) {
        COALESCE(SUM(failed_count), 0)::int AS total_failed,
        COALESCE(AVG(total_duration_ms), 0)::int AS avg_duration
      FROM run_reports
-     WHERE (user_id = $1 OR (organization_id IS NOT NULL AND organization_id = (SELECT organization_id FROM users WHERE id = $1)))
+     WHERE ($1::int IS NOT NULL)
        AND run_type = 'automation'`,
     [userId]
   );
@@ -233,7 +228,7 @@ async function getAutomationRunsSummary(userId) {
     `SELECT id, title, status, total_tests, passed_count, failed_count,
             total_duration_ms, started_at, completed_at
      FROM run_reports
-     WHERE (user_id = $1 OR (organization_id IS NOT NULL AND organization_id = (SELECT organization_id FROM users WHERE id = $1)))
+     WHERE ($1::int IS NOT NULL)
        AND run_type = 'automation'
      ORDER BY created_at DESC LIMIT 10`,
     [userId]
@@ -245,7 +240,7 @@ async function getAutomationRunsSummary(userId) {
             SUM(passed_count)::int AS passed,
             SUM(failed_count)::int AS failed
      FROM run_reports
-     WHERE (user_id = $1 OR (organization_id IS NOT NULL AND organization_id = (SELECT organization_id FROM users WHERE id = $1)))
+     WHERE ($1::int IS NOT NULL)
        AND run_type = 'automation'
        AND started_at > NOW() - INTERVAL '30 days'
      GROUP BY DATE(started_at)

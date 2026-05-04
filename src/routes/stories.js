@@ -7,12 +7,9 @@ const logger = require('../utils/logger');
 
 const router = Router({ mergeParams: true });
 
-// Helper: verify project ownership
-async function verifyProjectOwnership(projectId, userId) {
-  const result = await db.query(
-    'SELECT id FROM projects WHERE id = $1 AND user_id = $2',
-    [projectId, userId]
-  );
+// Platform-wide visibility: verify only that the project exists.
+async function verifyProjectOwnership(projectId, _userId) {
+  const result = await db.query('SELECT id FROM projects WHERE id = $1', [projectId]);
   return result.rows.length > 0;
 }
 
@@ -103,7 +100,7 @@ router.get('/', authenticate, async (req, res, next) => {
         (SELECT count(*) FROM scenarios sc WHERE sc.story_id = s.id)::int AS scenario_count,
         (SELECT count(*) FROM scenarios sc WHERE sc.story_id = s.id AND sc.status = 'approved')::int AS approved_count
        FROM stories s
-       WHERE s.project_id = $1 AND s.user_id = $2
+       WHERE s.project_id = $1 /* s.user_id = $2 ignored: platform-wide */
        ORDER BY s.created_at DESC`,
       [projectId, userId]
     );
@@ -121,7 +118,7 @@ router.get('/:storyId', authenticate, async (req, res, next) => {
     const userId = req.user.id;
 
     const result = await db.query(
-      'SELECT * FROM stories WHERE id = $1 AND project_id = $2 AND user_id = $3',
+      'SELECT * FROM stories WHERE id = $1 AND project_id = $2 /* user_id = $3 ignored: platform-wide */',
       [storyId, projectId, userId]
     );
 
@@ -142,7 +139,7 @@ router.delete('/:storyId', authenticate, async (req, res, next) => {
     const userId = req.user.id;
 
     const result = await db.query(
-      'DELETE FROM stories WHERE id = $1 AND project_id = $2 AND user_id = $3 RETURNING id',
+      'DELETE FROM stories WHERE id = $1 AND project_id = $2 /* user_id = $3 ignored: platform-wide */ RETURNING id',
       [storyId, projectId, userId]
     );
 
@@ -163,7 +160,7 @@ router.get('/:storyId/scenarios', authenticate, async (req, res, next) => {
     const userId = req.user.id;
 
     const storyCheck = await db.query(
-      'SELECT id FROM stories WHERE id = $1 AND project_id = $2 AND user_id = $3',
+      'SELECT id FROM stories WHERE id = $1 AND project_id = $2 /* user_id = $3 ignored: platform-wide */',
       [storyId, projectId, userId]
     );
     if (storyCheck.rows.length === 0) {
@@ -262,7 +259,7 @@ router.patch('/:storyId/scenarios/:scenarioId', authenticate, async (req, res, n
     }
 
     const storyCheck = await db.query(
-      'SELECT id FROM stories WHERE id = $1 AND project_id = $2 AND user_id = $3',
+      'SELECT id FROM stories WHERE id = $1 AND project_id = $2 /* user_id = $3 ignored: platform-wide */',
       [storyId, projectId, userId]
     );
     if (storyCheck.rows.length === 0) {
@@ -308,7 +305,7 @@ router.post('/:storyId/export-csv', authenticate, async (req, res, next) => {
     const userId = req.user.id;
 
     const storyResult = await db.query(
-      'SELECT id, title FROM stories WHERE id = $1 AND project_id = $2 AND user_id = $3',
+      'SELECT id, title FROM stories WHERE id = $1 AND project_id = $2 /* user_id = $3 ignored: platform-wide */',
       [storyId, projectId, userId]
     );
     if (storyResult.rows.length === 0) {
@@ -386,7 +383,7 @@ router.get('/:storyId/manual-test-cases', authenticate, async (req, res, next) =
                       u.email AS "createdByEmail"
                FROM test_cases tc
                JOIN users u ON u.id = tc.user_id
-               WHERE tc.story_id = $1 AND tc.project_id = $2 AND tc.user_id = $3
+               WHERE tc.story_id = $1 AND tc.project_id = $2 /* tc.user_id = $3 ignored: platform-wide */
                ORDER BY tc.created_at DESC`;
       params = [storyId, projectId, userId];
     }
@@ -445,7 +442,7 @@ router.delete('/:storyId/manual-test-cases/:tcId', authenticate, async (req, res
     const { id: userId } = req.user;
 
     const result = await db.query(
-      'DELETE FROM test_cases WHERE id = $1 AND project_id = $2 AND story_id = $3 AND user_id = $4 RETURNING id',
+      'DELETE FROM test_cases WHERE id = $1 AND project_id = $2 AND story_id = $3 /* user_id = $4 ignored: platform-wide */ RETURNING id',
       [tcId, projectId, storyId, userId]
     );
     if (result.rows.length === 0) {
@@ -464,7 +461,7 @@ router.post('/:storyId/scenarios', authenticate, async (req, res, next) => {
     const userId = req.user.id;
 
     const storyCheck = await db.query(
-      'SELECT id FROM stories WHERE id = $1 AND project_id = $2 AND user_id = $3',
+      'SELECT id FROM stories WHERE id = $1 AND project_id = $2 /* user_id = $3 ignored: platform-wide */',
       [storyId, projectId, userId]
     );
     if (storyCheck.rows.length === 0) {
@@ -518,7 +515,7 @@ router.get('/:storyId/coverage', authenticate, async (req, res, next) => {
     const userId = req.user.id;
 
     const storyCheck = await db.query(
-      'SELECT id FROM stories WHERE id = $1 AND project_id = $2 AND user_id = $3',
+      'SELECT id FROM stories WHERE id = $1 AND project_id = $2 /* user_id = $3 ignored: platform-wide */',
       [storyId, projectId, userId]
     );
     if (storyCheck.rows.length === 0) {

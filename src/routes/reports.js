@@ -14,7 +14,7 @@ router.get('/summary', async (req, res, next) => {
     // Total counts by status
     const statusCounts = await db.query(
       `SELECT status, COUNT(*)::int AS count
-       FROM test_executions WHERE user_id = $1
+       FROM test_executions WHERE ($1::int IS NOT NULL) /* platform-wide */
        GROUP BY status`,
       [userId]
     );
@@ -22,7 +22,7 @@ router.get('/summary', async (req, res, next) => {
     // Total counts by type
     const typeCounts = await db.query(
       `SELECT test_type AS type, COUNT(*)::int AS count
-       FROM test_executions WHERE user_id = $1
+       FROM test_executions WHERE ($1::int IS NOT NULL) /* platform-wide */
        GROUP BY test_type`,
       [userId]
     );
@@ -30,7 +30,7 @@ router.get('/summary', async (req, res, next) => {
     // Average duration by type
     const avgDuration = await db.query(
       `SELECT test_type AS type, ROUND(AVG(duration_ms))::int AS "avgDurationMs"
-       FROM test_executions WHERE user_id = $1
+       FROM test_executions WHERE ($1::int IS NOT NULL) /* platform-wide */
        GROUP BY test_type`,
       [userId]
     );
@@ -43,7 +43,7 @@ router.get('/summary', async (req, res, next) => {
           COUNT(*) FILTER (WHERE status = 'passed')::int AS passed,
           COUNT(*) FILTER (WHERE status = 'failed')::int AS failed
        FROM test_executions
-       WHERE user_id = $1 AND created_at > NOW() - INTERVAL '30 days'
+       WHERE ($1::int IS NOT NULL) /* platform-wide */ AND created_at > NOW() - INTERVAL '30 days'
        GROUP BY DATE(created_at)
        ORDER BY date`,
       [userId]
@@ -54,7 +54,7 @@ router.get('/summary', async (req, res, next) => {
       `SELECT id, test_name AS "testName", test_type AS "testType", error,
               duration_ms AS "durationMs", completed_at AS "completedAt"
        FROM test_executions
-       WHERE user_id = $1 AND status = 'failed'
+       WHERE ($1::int IS NOT NULL) /* platform-wide */ AND status = 'failed'
        ORDER BY created_at DESC LIMIT 5`,
       [userId]
     );
@@ -63,7 +63,7 @@ router.get('/summary', async (req, res, next) => {
     const totalResult = await db.query(
       `SELECT COUNT(*)::int AS total,
               COUNT(*) FILTER (WHERE status = 'passed')::int AS passed
-       FROM test_executions WHERE user_id = $1`,
+       FROM test_executions WHERE ($1::int IS NOT NULL) /* platform-wide */`,
       [userId]
     );
 
@@ -98,7 +98,7 @@ router.get('/export', async (req, res, next) => {
           duration_ms AS "durationMs",
           completed_at AS "completedAt"
        FROM test_executions
-       WHERE user_id = $1
+       WHERE ($1::int IS NOT NULL) /* platform-wide */
        ORDER BY created_at DESC
        LIMIT 1000`,
       [req.user.id]

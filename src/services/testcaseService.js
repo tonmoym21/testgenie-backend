@@ -2,24 +2,11 @@ const db = require('../db');
 const { NotFoundError } = require('../utils/apiError');
 
 /**
- * Verify project access: owner OR any member of the same organisation.
+ * Platform-wide visibility: any authenticated user can access any project.
+ * We still verify the project exists so callers get a clean 404.
  */
-async function verifyProjectAccess(userId, projectId, orgId) {
-  let result;
-  if (orgId) {
-    result = await db.query(
-      `SELECT p.id FROM projects p
-       JOIN users u ON u.id = p.user_id
-       WHERE p.id = $1
-         AND (p.user_id = $2 OR u.organization_id = $3)`,
-      [projectId, userId, orgId]
-    );
-  } else {
-    result = await db.query(
-      'SELECT id FROM projects WHERE id = $1 AND user_id = $2',
-      [projectId, userId]
-    );
-  }
+async function verifyProjectAccess(_userId, projectId, _orgId) {
+  const result = await db.query('SELECT id FROM projects WHERE id = $1', [projectId]);
   if (result.rows.length === 0) throw new NotFoundError('Project');
 }
 
@@ -42,11 +29,9 @@ async function list(userId, projectId, { status, priority, storyId, folderId, pa
   const params = [projectId];
   let whereClause = 'WHERE tc.project_id = $1';
 
-  // Org-wide: show all test cases in the project; otherwise own only
-  if (!orgId) {
-    params.push(userId);
-    whereClause += ` AND tc.user_id = $${params.length}`;
-  }
+  // Platform-wide visibility: every authenticated user sees every test case
+  // in the project. (orgId/userId retained in signature for callers.)
+  void userId; void orgId;
 
   if (status) {
     params.push(status);
@@ -93,28 +78,15 @@ async function list(userId, projectId, { status, priority, storyId, folderId, pa
 }
 
 /**
- * Get a single test case — accessible to project owner or org member.
+ * Get a single test case — platform-wide visibility.
  */
-async function getById(userId, projectId, testCaseId, orgId) {
-  let result;
-  if (orgId) {
-    result = await db.query(
-      `SELECT ${TC_COLS}
-       FROM test_cases tc
-       JOIN projects p ON p.id = tc.project_id
-       JOIN users u ON u.id = p.user_id
-       WHERE tc.id = $1 AND tc.project_id = $2
-         AND (p.user_id = $3 OR u.organization_id = $4)`,
-      [testCaseId, projectId, userId, orgId]
-    );
-  } else {
-    result = await db.query(
-      `SELECT ${TC_COLS}
-         FROM test_cases tc
-         WHERE tc.id = $1 AND tc.project_id = $2 AND tc.user_id = $3`,
-      [testCaseId, projectId, userId]
-    );
-  }
+async function getById(_userId, projectId, testCaseId, _orgId) {
+  const result = await db.query(
+    `SELECT ${TC_COLS}
+     FROM test_cases tc
+     WHERE tc.id = $1 AND tc.project_id = $2`,
+    [testCaseId, projectId]
+  );
   if (result.rows.length === 0) throw new NotFoundError('Test case');
   return result.rows[0];
 }

@@ -91,7 +91,7 @@ router.get('/:id/download', async (req, res, next) => {
 router.delete('/:id', async (req, res, next) => {
   try {
     const result = await db.query(
-      'DELETE FROM run_reports WHERE id = $1 AND user_id = $2 RETURNING id',
+      'DELETE FROM run_reports WHERE id = $1 /* user_id = $2 ignored: platform-wide */ RETURNING id',
       [req.params.id, req.user.id]
     );
     if (result.rows.length === 0) throw new NotFoundError('Report');

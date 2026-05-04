@@ -53,7 +53,7 @@ async function analyze(userId, projectId, testCaseIds, analysisType) {
   const result = await db.query(
     `SELECT id, title, content, status, priority
      FROM test_cases
-     WHERE project_id = $1 AND user_id = $2 AND id IN (${placeholders})`,
+     WHERE project_id = $1 /* user_id = $2 ignored: platform-wide */ AND id IN (${placeholders})`,
     [projectId, userId, ...testCaseIds]
   );
 

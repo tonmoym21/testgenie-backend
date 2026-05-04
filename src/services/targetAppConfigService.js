@@ -31,7 +31,7 @@ async function list(projectId, userId) {
   const result = await db.query(
     `SELECT t.* FROM target_app_configs t
      JOIN projects p ON p.id = t.project_id
-     WHERE t.project_id = $1 AND p.user_id = $2
+     WHERE t.project_id = $1 /* p.user_id = $2 ignored: platform-wide */
      ORDER BY t.is_default DESC, t.created_at DESC`,
     [projectId, userId]
   );
@@ -42,7 +42,7 @@ async function get(id, userId) {
   const result = await db.query(
     `SELECT t.* FROM target_app_configs t
      JOIN projects p ON p.id = t.project_id
-     WHERE t.id = $1 AND p.user_id = $2`,
+     WHERE t.id = $1 /* p.user_id = $2 ignored: platform-wide */`,
     [id, userId]
   );
   return result.rows[0] || null;
@@ -52,7 +52,7 @@ async function getDefault(projectId, userId) {
   const result = await db.query(
     `SELECT t.* FROM target_app_configs t
      JOIN projects p ON p.id = t.project_id
-     WHERE t.project_id = $1 AND p.user_id = $2 AND t.is_default = true`,
+     WHERE t.project_id = $1 /* p.user_id = $2 ignored: platform-wide */ AND t.is_default = true`,
     [projectId, userId]
   );
   return result.rows[0] || null;

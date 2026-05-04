@@ -175,13 +175,10 @@ router.post('/export-csv', async (req, res) => {
 
     if (!projectId) return res.status(400).json({ error: 'Project ID is required' });
 
-    const projectResult = await db.query(
-      `SELECT p.id FROM projects p
-       JOIN users u ON u.id = p.user_id
-       WHERE p.id = $1 AND (p.user_id = $2 OR u.organization_id = (SELECT organization_id FROM users WHERE id = $2))`,
-      [projectId, userId]
-    );
-    if (projectResult.rows.length === 0) return res.status(403).json({ error: 'Access denied' });
+    // Platform-wide visibility: only verify the project exists.
+    const projectResult = await db.query('SELECT id FROM projects WHERE id = $1', [projectId]);
+    if (projectResult.rows.length === 0) return res.status(404).json({ error: 'Project not found' });
+    void userId;
 
     let query, params;
     if (testCaseIds && testCaseIds.length > 0) {
