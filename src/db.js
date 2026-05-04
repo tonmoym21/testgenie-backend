@@ -2,12 +2,15 @@ const { Pool } = require('pg');
 const config = require('./config');
 const logger = require('./utils/logger');
 
+const useSSL = /supabase\.com|sslmode=require|sslmode=no-verify/i.test(config.DATABASE_URL);
+
 const pool = new Pool({
   connectionString: config.DATABASE_URL,
   min: config.DB_POOL_MIN,
   max: config.DB_POOL_MAX,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
+  ssl: useSSL ? { rejectUnauthorized: false } : false,
 });
 
 pool.on('error', (err) => {
