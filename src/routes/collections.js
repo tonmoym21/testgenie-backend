@@ -118,6 +118,37 @@ router.get('/:id', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+const updateCollectionSchema = z.object({
+  name: z.string().min(1).max(200).optional(),
+  description: z.string().max(2000).nullable().optional(),
+});
+
+// PATCH /api/collections/:id
+router.patch('/:id', validate(updateCollectionSchema), async (req, res, next) => {
+  try {
+    await assertCollectionAccess(req, req.params.id);
+    const fields = [];
+    const values = [];
+    let i = 1;
+    if (req.body.name !== undefined) { fields.push(`name = $${i++}`); values.push(req.body.name); }
+    if (req.body.description !== undefined) { fields.push(`description = $${i++}`); values.push(req.body.description); }
+    if (fields.length === 0) {
+      const r = await db.query(
+        `SELECT id, name, description, created_at AS "createdAt" FROM collections WHERE id = $1`,
+        [req.params.id]
+      );
+      return res.json(r.rows[0]);
+    }
+    values.push(req.params.id);
+    const result = await db.query(
+      `UPDATE collections SET ${fields.join(', ')} WHERE id = $${i}
+       RETURNING id, name, description, created_at AS "createdAt"`,
+      values
+    );
+    res.json(result.rows[0]);
+  } catch (err) { next(err); }
+});
+
 // DELETE /api/collections/:id
 router.delete('/:id', async (req, res, next) => {
   try {
