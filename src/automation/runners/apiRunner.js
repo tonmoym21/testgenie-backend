@@ -16,12 +16,20 @@ async function runApiTest(config, envVars = null) {
   const logs = [];
   const log = (level, message) => logs.push({ level, message, timestamp: new Date().toISOString() });
 
-  log('info', `Starting API test: ${config.method} ${config.url}`);
+  // Tolerate both shapes:
+  //  - flat: { method, url, headers, ... }
+  //  - envelope: { name, type, config: { method, url, ... } }
+  // Collection / schedule runs hand us the envelope; direct calls hand us the flat config.
+  const inner = (config && typeof config === 'object' && config.config && typeof config.config === 'object')
+    ? config.config
+    : config;
+
+  log('info', `Starting API test: ${inner.method} ${inner.url}`);
 
   // Resolve all {{...}} tokens using the merged variable context
-  let resolvedConfig = config;
+  let resolvedConfig = inner;
   if (envVars && Object.keys(envVars).length > 0) {
-    resolvedConfig = envService.resolveObjectVariables(config, envVars);
+    resolvedConfig = envService.resolveObjectVariables(inner, envVars);
     log('debug', `Resolved ${Object.keys(envVars).length} variables`);
   }
 
