@@ -25,7 +25,7 @@ async function runApiTest(config, envVars = null) {
     log('debug', `Resolved ${Object.keys(envVars).length} variables`);
   }
 
-  const { method, url, headers = {}, body, assertions = [], timeout = 10000, extractors = [] } = resolvedConfig;
+  const { method, url, headers = {}, body, assertions = [], timeout = 10000, extractors = [], auth = null } = resolvedConfig;
 
   const startTime = Date.now();
   let rawResponse = null;
@@ -33,6 +33,30 @@ async function runApiTest(config, envVars = null) {
   let extractedVars = {};
 
   try {
+    // Optional pre-flight: POST Basic credentials to a login URL to capture session cookies.
+    let sessionCookie = null;
+    if (auth && auth.type === 'basic' && auth.loginUrl) {
+      try {
+        log('info', `Pre-flight basic auth login: POST ${auth.loginUrl}`);
+        const basicHeader = 'Basic ' + Buffer.from(`${auth.username || ''}:${auth.password || ''}`).toString('base64');
+        const loginRes = await fetch(auth.loginUrl, {
+          method: 'POST',
+          headers: { Authorization: basicHeader },
+          signal: AbortSignal.timeout(timeout),
+          redirect: 'manual',
+        });
+        const setCookie = loginRes.headers.get('set-cookie');
+        if (setCookie) {
+          sessionCookie = setCookie.split(/,(?=[^;]+=)/).map((c) => c.split(';')[0].trim()).join('; ');
+          log('info', `Captured session cookie from login response (${loginRes.status})`);
+        } else {
+          log('warn', `Login response (${loginRes.status}) returned no Set-Cookie header`);
+        }
+      } catch (loginErr) {
+        log('warn', `Login pre-flight failed: ${loginErr.message}`);
+      }
+    }
+
     log('info', `Sending ${method} request to ${url}`);
 
     const fetchOptions = {
@@ -40,6 +64,11 @@ async function runApiTest(config, envVars = null) {
       headers: { ...headers },
       signal: AbortSignal.timeout(timeout),
     };
+    if (sessionCookie) {
+      fetchOptions.headers['Cookie'] = fetchOptions.headers['Cookie']
+        ? `${fetchOptions.headers['Cookie']}; ${sessionCookie}`
+        : sessionCookie;
+    }
 
     // JSON-only: reject anything that isn't a plain object/array
     if (body !== undefined && body !== null && !['GET', 'HEAD'].includes(method.toUpperCase())) {
