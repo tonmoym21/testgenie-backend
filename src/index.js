@@ -128,6 +128,27 @@ logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backen
       `CREATE INDEX IF NOT EXISTS idx_run_reports_org ON run_reports(organization_id)`,
       `UPDATE run_reports r SET organization_id = u.organization_id FROM users u
          WHERE r.user_id = u.id AND u.organization_id IS NOT NULL AND r.organization_id IS NULL`,
+
+      // ── Migration 012: platform-wide audit log columns ──
+      `CREATE TABLE IF NOT EXISTS team_audit_logs (
+         id SERIAL PRIMARY KEY,
+         organization_id INTEGER NOT NULL,
+         actor_id INTEGER,
+         action TEXT NOT NULL,
+         target_type TEXT,
+         target_id TEXT,
+         details JSONB DEFAULT '{}'::jsonb,
+         ip_address TEXT,
+         user_agent TEXT,
+         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+       )`,
+      `ALTER TABLE team_audit_logs ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'success'`,
+      `ALTER TABLE team_audit_logs ADD COLUMN IF NOT EXISTS ip_address TEXT`,
+      `ALTER TABLE team_audit_logs ADD COLUMN IF NOT EXISTS user_agent TEXT`,
+      `CREATE INDEX IF NOT EXISTS idx_team_audit_logs_org ON team_audit_logs(organization_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_team_audit_logs_actor ON team_audit_logs(actor_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_team_audit_logs_action ON team_audit_logs(action)`,
+      `CREATE INDEX IF NOT EXISTS idx_team_audit_logs_created ON team_audit_logs(created_at DESC)`,
     ];
     for (const sql of statements) {
       try {
@@ -245,6 +266,10 @@ app.use((req, _res, next) => {
   logger.info({ method: req.method, url: req.url }, 'incoming request');
   next();
 });
+
+// Audit middleware — attaches req.audit() and auto-logs mutating CRUD calls.
+const { auditMiddleware } = require('./middleware/auditMiddleware');
+app.use(auditMiddleware);
 
 // ============================================================================
 // VERSION ENDPOINT — for deployment verification

@@ -4,6 +4,7 @@ const { validate } = require('../middleware/validate');
 const { authLimiter } = require('../middleware/rateLimiter');
 const { authenticate } = require('../middleware/auth');
 const authService = require('../services/authService');
+const auditService = require('../services/auditService');
 
 const router = Router();
 
@@ -79,10 +80,46 @@ router.post('/register-with-invite', authLimiter, validate(registerWithInviteSch
 
 // POST /api/auth/login
 router.post('/login', authLimiter, validate(loginSchema), async (req, res, next) => {
+  const email = (req.body && req.body.email) || null;
   try {
     const tokens = await authService.login(req.body.email, req.body.password);
+    if (tokens && tokens.user && tokens.user.organizationId) {
+      auditService.logEvent({
+        orgId: tokens.user.organizationId,
+        actorId: tokens.user.id,
+        action: 'auth.login',
+        targetType: 'user',
+        targetId: tokens.user.id,
+        details: { email },
+        status: 'success',
+        req,
+      });
+    }
     res.json(tokens);
   } catch (err) {
+    // Log failed login attempt — best-effort, look up org by user email if known.
+    try {
+      if (email) {
+        const db = require('../db');
+        const r = await db.query(
+          'SELECT id, organization_id FROM users WHERE email = $1',
+          [String(email).toLowerCase().trim()]
+        );
+        const u = r.rows[0];
+        if (u && u.organization_id) {
+          auditService.logEvent({
+            orgId: u.organization_id,
+            actorId: u.id,
+            action: 'auth.login_failed',
+            targetType: 'user',
+            targetId: u.id,
+            details: { email, reason: err.message },
+            status: 'failure',
+            req,
+          });
+        }
+      }
+    } catch { /* swallow */ }
     next(err);
   }
 });
@@ -100,7 +137,36 @@ router.post('/refresh', validate(refreshSchema), async (req, res, next) => {
 // POST /api/auth/logout
 router.post('/logout', validate(logoutSchema), async (req, res, next) => {
   try {
+    // Look up the user owning this refresh token before deleting it, so we can
+    // attribute the audit event.
+    let actor = null;
+    try {
+      const crypto = require('crypto');
+      const db = require('../db');
+      const tokenHash = crypto.createHash('sha256').update(req.body.refreshToken).digest('hex');
+      const r = await db.query(
+        `SELECT u.id, u.organization_id FROM refresh_tokens rt
+           JOIN users u ON rt.user_id = u.id
+          WHERE rt.token_hash = $1 LIMIT 1`,
+        [tokenHash]
+      );
+      actor = r.rows[0] || null;
+    } catch { /* ignore */ }
+
     await authService.logout(req.body.refreshToken);
+
+    if (actor && actor.organization_id) {
+      auditService.logEvent({
+        orgId: actor.organization_id,
+        actorId: actor.id,
+        action: 'auth.logout',
+        targetType: 'user',
+        targetId: actor.id,
+        details: {},
+        status: 'success',
+        req,
+      });
+    }
     res.json({ message: 'Logged out' });
   } catch (err) {
     next(err);

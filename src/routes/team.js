@@ -4,6 +4,7 @@ const { validate } = require('../middleware/validate');
 const { authenticate, optionalAuth } = require('../middleware/auth');
 const { requireRole, attachOrgContext } = require('../middleware/rbac');
 const teamService = require('../services/teamService');
+const auditService = require('../services/auditService');
 
 const router = Router();
 
@@ -400,16 +401,38 @@ router.delete('/domains/:domainId', authenticate, requireRole(['owner', 'admin']
 // AUDIT LOGS ROUTE
 // ─────────────────────────────────────────────────────────────────────────────
 
+function buildAuditOptions(query) {
+  return {
+    action: query.action || undefined,
+    actorId: query.actorId ? parseInt(query.actorId, 10) : undefined,
+    status: query.status || undefined,
+    search: query.search || undefined,
+    dateFrom: query.dateFrom || undefined,
+    dateTo: query.dateTo || undefined,
+    limit: query.limit ? parseInt(query.limit, 10) : 50,
+    offset: query.offset ? parseInt(query.offset, 10) : 0,
+  };
+}
+
 router.get('/audit-logs', authenticate, requireRole(['owner', 'admin']), async (req, res, next) => {
   try {
-    const options = {
-      action: req.query.action,
-      actorId: req.query.actorId ? parseInt(req.query.actorId, 10) : undefined,
-      limit: req.query.limit ? parseInt(req.query.limit, 10) : 50,
-      offset: req.query.offset ? parseInt(req.query.offset, 10) : 0,
-    };
-    const logs = await teamService.getAuditLogs(req.organization.id, options);
-    res.json({ logs });
+    const { logs, total } = await auditService.listEvents(req.organization.id, buildAuditOptions(req.query));
+    res.json({ logs, total });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/audit-logs.csv', authenticate, requireRole(['owner', 'admin']), async (req, res, next) => {
+  try {
+    const opts = buildAuditOptions(req.query);
+    opts.limit = Math.min(parseInt(req.query.limit, 10) || 5000, 10000);
+    opts.offset = 0;
+    const { logs } = await auditService.listEvents(req.organization.id, opts);
+    const csv = auditService.logsToCsv(logs);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="audit-logs-${new Date().toISOString().slice(0, 10)}.csv"`);
+    res.send(csv);
   } catch (err) {
     next(err);
   }
