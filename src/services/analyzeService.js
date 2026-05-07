@@ -4,6 +4,7 @@ const config = require('../config');
 const { retry } = require('../utils/retry');
 const { NotFoundError, AiProviderError } = require('../utils/apiError');
 const logger = require('../utils/logger');
+const { classifyAiError } = require('../utils/aiMetrics');
 
 const openai = new OpenAI({ apiKey: config.OPENAI_API_KEY });
 
@@ -70,6 +71,7 @@ async function analyze(userId, projectId, testCaseIds, analysisType) {
   const userPrompt = `Here are ${result.rows.length} test cases to analyze:\n\n${testCaseText}\n\nRespond ONLY with valid JSON. No markdown, no backticks.`;
 
   // Call OpenAI with retry
+  const aiStart = Date.now();
   let completion;
   try {
     completion = await retry(
@@ -95,7 +97,21 @@ async function analyze(userId, projectId, testCaseIds, analysisType) {
       }
     );
   } catch (err) {
-    logger.error({ err, analysisType, projectId }, 'AI analysis failed after retries');
+    const { reason, status } = classifyAiError(err);
+    logger.error(
+      {
+        event: 'ai.analysis.failure',
+        reason,
+        status,
+        durationMs: Date.now() - aiStart,
+        model: config.OPENAI_MODEL,
+        analysisType,
+        projectId,
+        userId,
+        err,
+      },
+      'AI analysis failed after retries'
+    );
     throw new AiProviderError('AI analysis failed. Please try again later.');
   }
 
@@ -106,7 +122,19 @@ async function analyze(userId, projectId, testCaseIds, analysisType) {
   try {
     analysisResult = JSON.parse(rawContent);
   } catch {
-    logger.error({ rawContent }, 'Failed to parse AI response as JSON');
+    logger.error(
+      {
+        event: 'ai.analysis.failure',
+        reason: 'invalid_response',
+        durationMs: Date.now() - aiStart,
+        model: config.OPENAI_MODEL,
+        analysisType,
+        projectId,
+        userId,
+        rawContentSample: typeof rawContent === 'string' ? rawContent.slice(0, 200) : null,
+      },
+      'Failed to parse AI response as JSON'
+    );
     throw new AiProviderError('AI returned an invalid response format');
   }
 
@@ -115,6 +143,20 @@ async function analyze(userId, projectId, testCaseIds, analysisType) {
     completion: completion.usage?.completion_tokens || 0,
     total: completion.usage?.total_tokens || 0,
   };
+
+  logger.info(
+    {
+      event: 'ai.analysis.success',
+      durationMs: Date.now() - aiStart,
+      model: config.OPENAI_MODEL,
+      analysisType,
+      projectId,
+      userId,
+      testCasesAnalyzed: result.rows.length,
+      tokenUsage,
+    },
+    'AI analysis succeeded'
+  );
 
   // Log the analysis
   await db.query(

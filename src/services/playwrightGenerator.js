@@ -5,6 +5,7 @@
 const OpenAI = require('openai');
 const config = require('../config');
 const logger = require('../utils/logger') || console;
+const { classifyAiError } = require('../utils/aiMetrics');
 
 const openai = new OpenAI({ apiKey: config.OPENAI_API_KEY });
 
@@ -123,19 +124,52 @@ async function generatePlaywrightFiles(scenarios, categories = [], targetConfig 
   }));
 
   const prompt = buildGenerationPrompt(slim, categories, targetConfig);
+  const aiStart = Date.now();
+  const model = 'gpt-4o';
 
-  const response = await openai.chat.completions.create({
-    model: 'gpt-4o',
-    temperature: 0.2,
-    max_tokens: 4096,
-    messages: [
-      { role: 'system', content: SYSTEM_PROMPT },
-      { role: 'user', content: prompt },
-    ],
-  });
+  let response;
+  try {
+    response = await openai.chat.completions.create({
+      model,
+      temperature: 0.2,
+      max_tokens: 4096,
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: prompt },
+      ],
+    });
+  } catch (err) {
+    const { reason, status } = classifyAiError(err);
+    logger.error(
+      {
+        event: 'ai.playwright_generation.failure',
+        reason,
+        status,
+        durationMs: Date.now() - aiStart,
+        model,
+        scenarioCount: scenarios.length,
+        hasTargetConfig: !!targetConfig,
+        err: err.message,
+      },
+      'Playwright generation failed'
+    );
+    throw err;
+  }
 
   const raw = response.choices[0]?.message?.content;
-  if (!raw) throw new Error('Empty response from OpenAI');
+  if (!raw) {
+    logger.error(
+      {
+        event: 'ai.playwright_generation.failure',
+        reason: 'empty_response',
+        durationMs: Date.now() - aiStart,
+        model,
+        scenarioCount: scenarios.length,
+      },
+      'Empty response from OpenAI'
+    );
+    throw new Error('Empty response from OpenAI');
+  }
 
   const cleaned = raw.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
 
@@ -143,20 +177,30 @@ async function generatePlaywrightFiles(scenarios, categories = [], targetConfig 
   try {
     parsed = JSON.parse(cleaned);
   } catch (err) {
-    logger.error({ raw }, 'Failed to parse OpenAI Playwright response');
+    logger.error(
+      {
+        event: 'ai.playwright_generation.failure',
+        reason: 'invalid_response',
+        durationMs: Date.now() - aiStart,
+        model,
+        rawSample: raw.slice(0, 200),
+      },
+      'Failed to parse OpenAI Playwright response'
+    );
     throw new Error('OpenAI returned invalid JSON for Playwright generation');
   }
 
-  const usage = response.usage;
-  if (usage) {
-    logger.info({
-      promptTokens: usage.prompt_tokens,
-      completionTokens: usage.completion_tokens,
-      totalTokens: usage.total_tokens,
+  logger.info(
+    {
+      event: 'ai.playwright_generation.success',
+      durationMs: Date.now() - aiStart,
+      model,
       scenarioCount: scenarios.length,
       hasTargetConfig: !!targetConfig,
-    }, 'Playwright generation token usage');
-  }
+      tokenUsage: response.usage || null,
+    },
+    'Playwright generation succeeded'
+  );
 
   return parsed;
 }

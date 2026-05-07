@@ -5,6 +5,7 @@
 const OpenAI = require('openai');
 const config = require('../config');
 const logger = require('../utils/logger');
+const { classifyAiError } = require('../utils/aiMetrics');
 
 const openai = new OpenAI({ apiKey: config.OPENAI_API_KEY });
 
@@ -164,6 +165,8 @@ function validateScenario(s, storyTitle) {
  */
 async function generateScenarios(story) {
   const { title, description } = story;
+  const aiStart = Date.now();
+  const model = config.OPENAI_MODEL || 'gpt-4o';
 
   // If description is too short, fall back to enhanced rule-based
   if (!description || description.trim().length < 30) {
@@ -171,8 +174,9 @@ async function generateScenarios(story) {
     return generateFallbackScenarios(title, description || '');
   }
 
+  let response;
   try {
-    const response = await openai.chat.completions.create({
+    response = await openai.chat.completions.create({
       model: config.OPENAI_MODEL || 'gpt-4o',
       temperature: 0.4,
       max_tokens: config.OPENAI_MAX_TOKENS || 12000,
@@ -231,16 +235,52 @@ async function generateScenarios(story) {
 
     // If AI gave us at least 10 valid scenarios, use them
     if (validated.length >= 10) {
-      logger.info({ count: validated.length, storyTitle: title }, 'AI scenario generation successful');
+      logger.info(
+        {
+          event: 'ai.scenario_generation.success',
+          durationMs: Date.now() - aiStart,
+          model,
+          storyTitle: title,
+          validCount: validated.length,
+          tokenUsage: response.usage || null,
+        },
+        'AI scenario generation successful'
+      );
       return validated;
     }
 
-    // Otherwise, fall back
-    logger.warn({ validCount: validated.length, storyTitle: title }, 'Too few valid AI scenarios, using fallback');
+    // Validated < 10 — usable but degraded; counts as a soft failure for metrics
+    logger.warn(
+      {
+        event: 'ai.scenario_generation.failure',
+        reason: 'insufficient_valid_scenarios',
+        durationMs: Date.now() - aiStart,
+        model,
+        storyTitle: title,
+        validCount: validated.length,
+      },
+      'Too few valid AI scenarios, using fallback'
+    );
     return generateFallbackScenarios(title, description);
 
   } catch (err) {
-    logger.error({ err: err.message, storyTitle: title }, 'AI scenario generation failed, using fallback');
+    // Distinguish provider errors (network/rate-limit/etc.) from response-shape errors
+    const isProviderError = err && (err.status || err.response || err.code);
+    const { reason, status } = isProviderError
+      ? classifyAiError(err)
+      : { reason: 'invalid_response', status: null };
+    logger.error(
+      {
+        event: 'ai.scenario_generation.failure',
+        reason,
+        status,
+        durationMs: Date.now() - aiStart,
+        model,
+        storyTitle: title,
+        err: err.message,
+      },
+      'AI scenario generation failed, using fallback'
+    );
     return generateFallbackScenarios(title, description);
   }
 }
