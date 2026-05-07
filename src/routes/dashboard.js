@@ -143,7 +143,7 @@ router.get('/activity', async (req, res) => {
   }
 
   try {
-    const limit = parseInt(req.query.limit) || 10;
+    const limit = Math.min(Math.max(1, parseInt(req.query.limit, 10) || 10), 100);
     const activities = await dashboardService.getTeamActivity(userId, limit);
     return res.json({ data: activities || [] });
   } catch (err) {

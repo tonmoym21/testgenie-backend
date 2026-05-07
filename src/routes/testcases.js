@@ -5,6 +5,7 @@ const { authenticate } = require('../middleware/auth');
 const testcaseService = require('../services/testcaseService');
 const db = require('../db');
 const logger = require('../utils/logger');
+const { parseListPagination } = require('../utils/pagination');
 
 const router = Router({ mergeParams: true });
 router.use(authenticate);
@@ -41,8 +42,7 @@ router.get('/', validateQuery(listQuerySchema), async (req, res) => {
   try {
     const { projectId } = req.params;
     const { id: userId, orgId } = req.user;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 100;
+    const { page, limit } = parseListPagination(req.query, { defaultLimit: 100, maxLimit: 100 });
     const status = req.query.status || null;
     const priority = req.query.priority || null;
     const storyId = req.query.storyId !== undefined

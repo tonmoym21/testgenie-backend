@@ -196,8 +196,8 @@ router.get('/members', authenticate, requireRole(['owner', 'admin']), async (req
       status: req.query.status,
       role: req.query.role,
       search: req.query.search,
-      limit: req.query.limit ? parseInt(req.query.limit, 10) : 50,
-      offset: req.query.offset ? parseInt(req.query.offset, 10) : 0,
+      limit: Math.min(Math.max(1, parseInt(req.query.limit, 10) || 50), 200),
+      offset: Math.max(0, parseInt(req.query.offset, 10) || 0),
     };
     const result = await teamService.listMembers(req.organization.id, options);
     res.json(result);
@@ -409,8 +409,8 @@ function buildAuditOptions(query) {
     search: query.search || undefined,
     dateFrom: query.dateFrom || undefined,
     dateTo: query.dateTo || undefined,
-    limit: query.limit ? parseInt(query.limit, 10) : 50,
-    offset: query.offset ? parseInt(query.offset, 10) : 0,
+    limit: Math.min(Math.max(1, parseInt(query.limit, 10) || 50), 200),
+    offset: Math.max(0, parseInt(query.offset, 10) || 0),
   };
 }
 

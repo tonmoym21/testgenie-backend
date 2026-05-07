@@ -6,6 +6,7 @@ const runReportService = require('../services/runReportService');
 const emailService = require('../services/emailService');
 const { NotFoundError } = require('../utils/apiError');
 const db = require('../db');
+const { parseListPagination } = require('../utils/pagination');
 
 const router = Router();
 router.use(authenticate);
@@ -13,9 +14,10 @@ router.use(authenticate);
 // GET /api/run-reports - list reports with pagination
 router.get('/', async (req, res, next) => {
   try {
-    const { runType, status, page = 1, limit = 20 } = req.query;
+    const { runType, status } = req.query;
+    const { page, limit } = parseListPagination(req.query, { defaultLimit: 20 });
     const reports = await runReportService.listRunReports(req.user.id, {
-      runType, status, page: parseInt(page), limit: parseInt(limit)
+      runType, status, page, limit,
     });
     res.json(reports);
   } catch (err) { next(err); }

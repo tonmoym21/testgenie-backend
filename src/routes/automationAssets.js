@@ -12,6 +12,7 @@ const preflightService = require('../services/preflightService');
 const targetAppConfigService = require('../services/targetAppConfigService');
 const readinessService = require('../services/readinessService');
 const db = require('../db');
+const { parseListPagination } = require('../utils/pagination');
 
 const router = Router({ mergeParams: true });
 router.use(authenticate);
@@ -51,9 +52,10 @@ router.post('/assets', validate(createSchema), async (req, res, next) => {
 router.get('/assets', async (req, res, next) => {
   try {
     const { projectId } = req.params;
-    const { status, category, search, page, limit } = req.query;
+    const { status, category, search } = req.query;
+    const { page, limit } = parseListPagination(req.query, { defaultLimit: 20 });
     const result = await automationAssetService.listAssets(parseInt(projectId, 10), req.user.id, {
-      status, category, search, page: page ? parseInt(page, 10) : 1, limit: limit ? parseInt(limit, 10) : 20,
+      status, category, search, page, limit,
     });
     res.json(result);
   } catch (err) { next(err); }
@@ -213,8 +215,8 @@ router.post('/bulk-run', validate(bulkRunSchema), async (req, res, next) => {
 // EXECUTION RUNS
 router.get('/assets/:assetId/runs', async (req, res, next) => {
   try {
-    const { page, limit } = req.query;
-    const result = await playwrightRunnerService.getRunsForAsset(parseInt(req.params.assetId, 10), req.user.id, { page: page ? parseInt(page, 10) : 1, limit: limit ? parseInt(limit, 10) : 10 });
+    const { page, limit } = parseListPagination(req.query, { defaultLimit: 10 });
+    const result = await playwrightRunnerService.getRunsForAsset(parseInt(req.params.assetId, 10), req.user.id, { page, limit });
     if (!result) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Asset not found' } });
     res.json(result);
   } catch (err) { next(err); }
@@ -250,16 +252,16 @@ router.get('/runs/:runId/logs', async (req, res, next) => {
 router.get('/executions', async (req, res, next) => {
   try {
     const { projectId } = req.params;
-    const { status, page = 1, limit = 20 } = req.query;
+    const { status } = req.query;
+    const { page, limit, offset } = parseListPagination(req.query, { defaultLimit: 20 });
     const params = [parseInt(projectId, 10), req.user.id];
     let where = 'WHERE r.project_id = $1 /* p.user_id = $2 ignored: platform-wide */';
     if (status) { params.push(status); where += ` AND r.status = $${params.length}`; }
     const countRes = await db.query(`SELECT COUNT(*) FROM playwright_runs r JOIN projects p ON p.id = r.project_id ${where}`, params);
-    const offset = (parseInt(page) - 1) * parseInt(limit);
-    params.push(parseInt(limit), offset);
+    params.push(limit, offset);
     const result = await db.query(
       `SELECT r.*, aa.name as asset_name FROM playwright_runs r JOIN projects p ON p.id = r.project_id LEFT JOIN automation_assets aa ON aa.id = r.automation_asset_id ${where} ORDER BY r.created_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`, params);
-    res.json({ data: result.rows, pagination: { page: parseInt(page), limit: parseInt(limit), total: parseInt(countRes.rows[0].count) } });
+    res.json({ data: result.rows, pagination: { page, limit, total: parseInt(countRes.rows[0].count) } });
   } catch (err) { next(err); }
 });
 
