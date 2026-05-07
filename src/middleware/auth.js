@@ -29,6 +29,12 @@ function authenticate(req, _res, next) {
 
   try {
     const decoded = jwt.verify(token, config.JWT_SECRET);
+    // Reject refresh tokens used as access tokens (same secret, different type
+    // claim). Without this check, a leaked refresh token grants full API
+    // access, not just refresh capability.
+    if (decoded.type && decoded.type !== 'access') {
+      return next(new UnauthorizedError('Invalid access token'));
+    }
     req.user = {
       id: decoded.sub,
       email: decoded.email,
@@ -60,6 +66,10 @@ function optionalAuth(req, _res, next) {
 
   try {
     const decoded = jwt.verify(token, config.JWT_SECRET);
+    if (decoded.type && decoded.type !== 'access') {
+      req.user = null;
+      return next();
+    }
     req.user = {
       id: decoded.sub,
       email: decoded.email,

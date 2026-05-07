@@ -296,9 +296,15 @@ app.use(pinoHttp({
       req.url === '/api/version',
   },
   // Surface request ID in responses for client/server log correlation.
-  customAttributeKeys: { req: 'req', res: 'res', err: 'err', responseTime: 'durationMs' },
+  customAttributeKeys: { responseTime: 'durationMs' },
   serializers: {
-    req: (req) => ({ id: req.id, method: req.method, url: req.url }),
+    // SSE/EventSource endpoints accept ?token=<jwt> in the query string. Scrub
+    // it before logging — otherwise JWTs land in production logs verbatim.
+    req: (req) => ({
+      id: req.id,
+      method: req.method,
+      url: typeof req.url === 'string' ? req.url.replace(/([?&]token=)[^&]+/g, '$1REDACTED') : req.url,
+    }),
     res: (res) => ({ statusCode: res.statusCode }),
   },
 }));
