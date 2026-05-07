@@ -462,6 +462,49 @@ async function getRun(runId, userId) {
   return result.rows[0] || null;
 }
 
+async function getRunItems(runId) {
+  const result = await db.query(
+    `SELECT eri.*, aa.name AS asset_name
+       FROM execution_run_items eri
+       JOIN automation_assets aa ON aa.id = eri.automation_asset_id
+      WHERE eri.execution_run_id = $1
+      ORDER BY eri.created_at`,
+    [runId]
+  );
+  return result.rows;
+}
+
+/**
+ * List Playwright runs for a project with optional status filter and pagination.
+ * Returns { data, total } so callers can build a pagination envelope.
+ */
+async function listExecutionsForProject(projectId, _userId, { status, limit, offset } = {}) {
+  const params = [projectId];
+  let where = 'WHERE r.project_id = $1';
+  if (status) {
+    params.push(status);
+    where += ` AND r.status = $${params.length}`;
+  }
+
+  const countRes = await db.query(
+    `SELECT COUNT(*)::int AS count FROM playwright_runs r ${where}`,
+    params
+  );
+
+  params.push(limit, offset);
+  const result = await db.query(
+    `SELECT r.*, aa.name AS asset_name
+       FROM playwright_runs r
+       LEFT JOIN automation_assets aa ON aa.id = r.automation_asset_id
+       ${where}
+       ORDER BY r.created_at DESC
+       LIMIT $${params.length - 1} OFFSET $${params.length}`,
+    params
+  );
+
+  return { data: result.rows, total: countRes.rows[0].count };
+}
+
 async function bulkRun(assetIds, userId, options = {}) {
   const runs = [];
   for (const id of assetIds) {
@@ -476,4 +519,4 @@ async function bulkRun(assetIds, userId, options = {}) {
   return runs;
 }
 
-module.exports = { runAsset, getRunsForAsset, getRun, bulkRun, bulkRunWithItems };
+module.exports = { runAsset, getRunsForAsset, getRun, getRunItems, listExecutionsForProject, bulkRun, bulkRunWithItems };

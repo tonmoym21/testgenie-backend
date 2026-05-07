@@ -272,6 +272,23 @@ async function logout(refreshToken) {
 }
 
 /**
+ * Look up the user owning a refresh token (for audit attribution).
+ * Returns { id, organization_id } or null.
+ */
+async function findActorByRefreshToken(refreshToken) {
+  const tokenHash = hashToken(refreshToken);
+  const r = await db.query(
+    `SELECT u.id, u.organization_id
+       FROM refresh_tokens rt
+       JOIN users u ON rt.user_id = u.id
+      WHERE rt.token_hash = $1
+      LIMIT 1`,
+    [tokenHash]
+  );
+  return r.rows[0] || null;
+}
+
+/**
  * Generate access and refresh tokens for a user.
  */
 async function generateTokens(user) {
@@ -369,5 +386,6 @@ module.exports = {
   login,
   refresh,
   logout,
+  findActorByRefreshToken,
   getUserOrgInfo,
 };

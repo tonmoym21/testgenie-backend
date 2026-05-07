@@ -201,16 +201,7 @@ router.post('/logout', authLimiter, validate(logoutSchema), async (req, res, nex
     // attribute the audit event.
     let actor = null;
     try {
-      const crypto = require('crypto');
-      const db = require('../db');
-      const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-      const r = await db.query(
-        `SELECT u.id, u.organization_id FROM refresh_tokens rt
-           JOIN users u ON rt.user_id = u.id
-          WHERE rt.token_hash = $1 LIMIT 1`,
-        [tokenHash]
-      );
-      actor = r.rows[0] || null;
+      actor = await authService.findActorByRefreshToken(token);
     } catch (err) {
       logger.warn({ err }, 'logout: failed to look up actor for audit log');
     }

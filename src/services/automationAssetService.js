@@ -4,14 +4,14 @@
 const db = require('../db');
 const logger = require('../utils/logger');
 
-async function createAsset({ projectId, userId, storyId, name, description, categories, tags, generationType, sourceTestIds, filesManifest, configCode }) {
+async function createAsset({ projectId, userId, storyId, name, description, categories, tags, generationType, sourceTestIds, filesManifest, configCode, targetAppConfigId }) {
   const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
   const result = await db.query(
     `INSERT INTO automation_assets
-       (project_id, story_id, name, slug, description, categories, tags, generation_type, source_test_ids, generated_files_manifest, config_code, status, created_by)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'ready', $12)
+       (project_id, story_id, name, slug, description, categories, tags, generation_type, source_test_ids, generated_files_manifest, config_code, status, created_by, target_app_config_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'ready', $12, $13)
      RETURNING *`,
-    [projectId, storyId || null, name, slug, description || null, categories || [], tags || [], generationType || 'single', JSON.stringify(sourceTestIds || []), JSON.stringify(filesManifest || []), configCode || null, userId]
+    [projectId, storyId || null, name, slug, description || null, categories || [], tags || [], generationType || 'single', JSON.stringify(sourceTestIds || []), JSON.stringify(filesManifest || []), configCode || null, userId, targetAppConfigId || null]
   );
   logger.info({ assetId: result.rows[0].id, projectId, name }, 'Automation asset created');
   return result.rows[0];
