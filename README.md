@@ -145,11 +145,47 @@ __tests__/
 
 - Passwords hashed with bcrypt (cost 12)
 - Short-lived access tokens (15m) with refresh rotation
+- Refresh token stored in an HttpOnly `tg_refresh` cookie (not localStorage)
 - All input validated with zod
 - Parameterized SQL queries (no raw string interpolation)
 - Rate limiting on auth (20/15min) and analysis (10/min)
 - Helmet security headers
 - CORS restricted to configured origin
+
+### Auth cookie contract
+
+`POST /api/auth/login` and `POST /api/auth/refresh` set a `tg_refresh` cookie:
+
+| Attribute | Value |
+|---|---|
+| `HttpOnly` | yes (not accessible from JS) |
+| `Path` | `/api/auth` (only sent to auth endpoints) |
+| `SameSite` | `Lax` |
+| `Secure` | yes when `NODE_ENV=production` |
+| `Max-Age` | 2592000 (30 days) |
+
+`POST /api/auth/logout` clears the cookie (`Max-Age=0`).
+
+`/auth/refresh` and `/auth/logout` accept the token from the cookie OR a
+`refreshToken` field in the body, in that order. The body path is kept for
+backward compatibility but new clients should rely on the cookie.
+
+### Required env config in production
+
+| Var | Reason |
+|---|---|
+| `CORS_ORIGIN` | **Must** be a concrete allow-list, never `*`. The cookie requires credentialed CORS, which forbids wildcard origins. Use a comma-separated list, e.g. `https://app.example.com,https://*.vercel.app`. |
+| `NODE_ENV=production` | Required for the `Secure` cookie attribute. Without it, browsers will reject the cookie on HTTPS pages. |
+| `JWT_SECRET` | 32+ chars; rotating this invalidates every active session. |
+
+### Troubleshooting "users can't log in"
+
+1. **Browser dev tools → Application → Cookies** — is `tg_refresh` set after login? If no, the response Set-Cookie was rejected. Check:
+   - `Secure` flag mismatch (HTTPS in browser, `NODE_ENV` not `production` on server, or vice versa)
+   - SameSite policy (third-party context — different domain frontend ↔ backend without proper CORS)
+2. **Network tab → /auth/refresh** — does the request include the `Cookie: tg_refresh=...` header? If no, the cookie's `Path=/api/auth` isn't matching the request URL. Double-check your reverse proxy isn't rewriting the path.
+3. **Response missing `Access-Control-Allow-Credentials: true`** — `CORS_ORIGIN` is still `*` or the request origin isn't in the allow-list. Backend logs will say `CORS: origin not allowed`.
+4. **`401` on every refresh** — the `refresh_tokens` table may have been wiped, or `JWT_SECRET` rotated. Existing sessions need to re-login.
 
 ## License
 
