@@ -281,11 +281,27 @@ app.use(express.json({ limit: '10mb' }));
 // /health, /healthz, /api/health and /api/version automatically.
 app.use(rateLimiter);
 
-// Request logging
-app.use((req, _res, next) => {
-  logger.info({ method: req.method, url: req.url }, 'incoming request');
-  next();
-});
+// Request logging — pino-http auto-generates a req.id, captures method/url/
+// status/latency in a single completion log line, and exposes `req.log` for
+// downstream handlers to use (so per-request context propagates to error logs).
+const pinoHttp = require('pino-http');
+app.use(pinoHttp({
+  logger,
+  // Don't spam logs with healthcheck pings or version probes.
+  autoLogging: {
+    ignore: (req) =>
+      req.url === '/health' ||
+      req.url === '/healthz' ||
+      req.url === '/api/health' ||
+      req.url === '/api/version',
+  },
+  // Surface request ID in responses for client/server log correlation.
+  customAttributeKeys: { req: 'req', res: 'res', err: 'err', responseTime: 'durationMs' },
+  serializers: {
+    req: (req) => ({ id: req.id, method: req.method, url: req.url }),
+    res: (res) => ({ statusCode: res.statusCode }),
+  },
+}));
 
 // Audit middleware — attaches req.audit() and auto-logs mutating CRUD calls.
 const { auditMiddleware } = require('./middleware/auditMiddleware');
