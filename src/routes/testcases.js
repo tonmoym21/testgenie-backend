@@ -42,7 +42,9 @@ router.get('/', validateQuery(listQuerySchema), async (req, res) => {
   try {
     const { projectId } = req.params;
     const { id: userId, orgId } = req.user;
-    const { page, limit } = parseListPagination(req.query, { defaultLimit: 100, maxLimit: 100 });
+    // Bulk-selection UIs (test-run builder) fetch up to 500 cases at once;
+    // bound the ceiling there rather than silently truncating to 100.
+    const { page, limit } = parseListPagination(req.query, { defaultLimit: 100, maxLimit: 500 });
     const status = req.query.status || null;
     const priority = req.query.priority || null;
     const storyId = req.query.storyId !== undefined
