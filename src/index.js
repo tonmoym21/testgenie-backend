@@ -13,6 +13,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
 const path = require('path');
 
 const config = require('./config');
@@ -258,6 +259,17 @@ function buildCorsOptions() {
     maxAge: 86400,
   };
 }
+// Security headers. This is a JSON API, not an HTML site, so:
+//   - contentSecurityPolicy is disabled (no HTML/inline scripts to lock down).
+//   - crossOriginResourcePolicy is relaxed to 'cross-origin' so legitimate
+//     frontend consumers on a different origin can fetch responses.
+// Helmet still sets HSTS, X-Content-Type-Options, X-DNS-Prefetch-Control,
+// Referrer-Policy, and other safe defaults.
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+}));
+
 app.use(cors(buildCorsOptions()));
 // cors middleware automatically handles OPTIONS preflight for all routes.
 
