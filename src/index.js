@@ -227,12 +227,19 @@ const testRunRoutes = safeRequire('./routes/testRuns', 'testRuns');
 const projectInsightsRoutes = safeRequire('./routes/projectInsights', 'projectInsights');
 
 // ============================================================================
-// CORS — supports a single origin, '*' wildcard, or comma-separated allow list.
-// Credentials are disabled because auth is Bearer-token via header, not cookies.
+// CORS — credentials: true so the HttpOnly refresh cookie flows on /auth/refresh
+// and /auth/logout. This forbids origin: '*' — CORS_ORIGIN MUST be set to a
+// concrete allow-list in any environment that serves real users.
 // ============================================================================
 function buildCorsOptions() {
   const raw = process.env.CORS_ORIGIN || '*';
-  if (raw === '*') return { origin: '*', credentials: false };
+  if (raw === '*') {
+    // Wildcard mode is incompatible with credentialed requests. Keep it for
+    // unauthenticated dev/health pings only — credentialed fetches will fail
+    // and surface the misconfig immediately rather than silently leaking.
+    logger.warn('CORS_ORIGIN is "*" — credentialed requests will be rejected. Set an allow-list.');
+    return { origin: '*', credentials: false, maxAge: 86400 };
+  }
 
   const allowList = raw.split(',').map((s) => s.trim()).filter(Boolean);
   return {
@@ -247,7 +254,8 @@ function buildCorsOptions() {
       logger.warn({ origin }, 'CORS: origin not allowed');
       return cb(null, false);
     },
-    credentials: false,
+    credentials: true,
+    maxAge: 86400,
   };
 }
 app.use(cors(buildCorsOptions()));
