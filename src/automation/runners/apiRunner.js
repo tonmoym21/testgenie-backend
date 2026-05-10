@@ -1,8 +1,18 @@
 /**
- * API Test Runner — v2.3
- * JSON payload ONLY: form-data and raw string bodies are rejected.
- * Response body is always parsed as JSON when content-type allows.
+ * API Test Runner — v2.4
+ * Supports Postman-style body modes: none, json, raw, form-data, urlencoded, graphql.
+ * Response body is parsed as JSON when content-type allows.
  */
+
+function hasContentTypeHeader(headers) {
+  return Object.keys(headers || {}).some((k) => k.toLowerCase() === 'content-type');
+}
+
+function deleteContentTypeHeader(headers) {
+  for (const k of Object.keys(headers || {})) {
+    if (k.toLowerCase() === 'content-type') delete headers[k];
+  }
+}
 
 const envService = require('../../services/environmentService');
 
@@ -33,7 +43,13 @@ async function runApiTest(config, envVars = null) {
     log('debug', `Resolved ${Object.keys(envVars).length} variables`);
   }
 
-  const { method, url, headers = {}, body, assertions = [], timeout = 10000, extractors = [], auth = null } = resolvedConfig;
+  const {
+    method, url, headers = {}, body, assertions = [], timeout = 10000, extractors = [], auth = null,
+    bodyType, rawLanguage, formData: formDataFields, urlEncoded: urlEncodedFields, graphql,
+    binary,
+  } = resolvedConfig;
+  const effectiveBodyType = bodyType
+    || (body !== undefined && body !== null ? 'json' : 'none');
 
   const startTime = Date.now();
   let rawResponse = null;
@@ -78,23 +94,77 @@ async function runApiTest(config, envVars = null) {
         : sessionCookie;
     }
 
-    // JSON-only: reject anything that isn't a plain object/array
-    if (body !== undefined && body !== null && !['GET', 'HEAD'].includes(method.toUpperCase())) {
-      if (typeof body === 'string') {
-        // Disallow raw string bodies — must be valid JSON text representing an object/array
-        try {
-          const parsed = JSON.parse(body);
-          fetchOptions.body = JSON.stringify(parsed);
-        } catch {
-          throw new Error('Request body must be valid JSON. Raw string and form-data bodies are not supported.');
+    if (!['GET', 'HEAD'].includes(method.toUpperCase()) && effectiveBodyType !== 'none') {
+      if (effectiveBodyType === 'json') {
+        if (body !== undefined && body !== null) {
+          let payload;
+          if (typeof body === 'string') {
+            try { payload = JSON.stringify(JSON.parse(body)); }
+            catch { throw new Error('Request body must be valid JSON.'); }
+          } else if (typeof body === 'object') {
+            payload = JSON.stringify(body);
+          } else {
+            throw new Error('Request body must be a JSON object or array.');
+          }
+          fetchOptions.body = payload;
+          if (!hasContentTypeHeader(fetchOptions.headers)) {
+            fetchOptions.headers['Content-Type'] = 'application/json';
+          }
         }
-      } else if (typeof body === 'object') {
-        fetchOptions.body = JSON.stringify(body);
-      } else {
-        throw new Error('Request body must be a JSON object or array.');
+      } else if (effectiveBodyType === 'raw') {
+        const raw = typeof body === 'string' ? body : '';
+        fetchOptions.body = raw;
+        if (!hasContentTypeHeader(fetchOptions.headers)) {
+          const langMap = {
+            json: 'application/json',
+            xml: 'application/xml',
+            html: 'text/html',
+            javascript: 'application/javascript',
+            text: 'text/plain',
+          };
+          fetchOptions.headers['Content-Type'] = langMap[rawLanguage] || 'text/plain';
+        }
+      } else if (effectiveBodyType === 'urlencoded') {
+        const params = new URLSearchParams();
+        for (const f of urlEncodedFields || []) {
+          if (f && f.key && f.enabled !== false) params.append(f.key, f.value == null ? '' : String(f.value));
+        }
+        fetchOptions.body = params.toString();
+        if (!hasContentTypeHeader(fetchOptions.headers)) {
+          fetchOptions.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+        }
+      } else if (effectiveBodyType === 'form-data') {
+        const fd = new FormData();
+        for (const f of formDataFields || []) {
+          if (!f || !f.key || f.enabled === false) continue;
+          if (f.type === 'file' && f.file && f.file.data) {
+            const buf = Buffer.from(f.file.data, 'base64');
+            const blob = new Blob([buf], { type: f.file.mimeType || 'application/octet-stream' });
+            fd.append(f.key, blob, f.file.filename || 'file');
+          } else {
+            fd.append(f.key, f.value == null ? '' : String(f.value));
+          }
+        }
+        fetchOptions.body = fd;
+        // Let fetch set Content-Type with the multipart boundary.
+        deleteContentTypeHeader(fetchOptions.headers);
+      } else if (effectiveBodyType === 'binary') {
+        if (!binary || !binary.data) throw new Error('Binary body requires a file.');
+        fetchOptions.body = Buffer.from(binary.data, 'base64');
+        if (!hasContentTypeHeader(fetchOptions.headers)) {
+          fetchOptions.headers['Content-Type'] = binary.mimeType || 'application/octet-stream';
+        }
+      } else if (effectiveBodyType === 'graphql') {
+        const query = (graphql && graphql.query) || '';
+        let variables = (graphql && graphql.variables) || {};
+        if (typeof variables === 'string') {
+          try { variables = JSON.parse(variables); } catch { variables = {}; }
+        }
+        fetchOptions.body = JSON.stringify({ query, variables });
+        if (!hasContentTypeHeader(fetchOptions.headers)) {
+          fetchOptions.headers['Content-Type'] = 'application/json';
+        }
       }
-      // Always enforce JSON content-type
-      fetchOptions.headers['Content-Type'] = 'application/json';
     }
 
     const response = await fetch(url, fetchOptions);
