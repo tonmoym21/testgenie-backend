@@ -1,7 +1,7 @@
 const { Router } = require('express');
 const { z } = require('zod');
 const { validate } = require('../middleware/validate');
-const { authLimiter } = require('../middleware/rateLimiter');
+const { authLimiter, refreshLimiter } = require('../middleware/rateLimiter');
 const { authenticate } = require('../middleware/auth');
 const authService = require('../services/authService');
 const auditService = require('../services/auditService');
@@ -27,11 +27,15 @@ function readRefreshCookie(req) {
 
 function setRefreshCookie(res, token) {
   const isProd = process.env.NODE_ENV === 'production';
+  // In prod the SPA is on a different origin than the API, so the refresh
+  // cookie needs SameSite=None to ride along on cross-site fetch (and that
+  // requires Secure). In dev keep Lax so http://localhost works.
+  const sameSite = isProd ? 'None' : 'Lax';
   const parts = [
     `${REFRESH_COOKIE}=${encodeURIComponent(token)}`,
     'HttpOnly',
     `Path=${REFRESH_COOKIE_PATH}`,
-    'SameSite=Lax',
+    `SameSite=${sameSite}`,
     'Max-Age=2592000', // 30 days
   ];
   if (isProd) parts.push('Secure');
@@ -40,11 +44,12 @@ function setRefreshCookie(res, token) {
 
 function clearRefreshCookie(res) {
   const isProd = process.env.NODE_ENV === 'production';
+  const sameSite = isProd ? 'None' : 'Lax';
   const parts = [
     `${REFRESH_COOKIE}=`,
     'HttpOnly',
     `Path=${REFRESH_COOKIE_PATH}`,
-    'SameSite=Lax',
+    `SameSite=${sameSite}`,
     'Max-Age=0',
   ];
   if (isProd) parts.push('Secure');
@@ -171,7 +176,7 @@ router.post('/login', authLimiter, validate(loginSchema), async (req, res, next)
 });
 
 // POST /api/auth/refresh
-router.post('/refresh', authLimiter, validate(refreshSchema), async (req, res, next) => {
+router.post('/refresh', refreshLimiter, validate(refreshSchema), async (req, res, next) => {
   try {
     const token = (req.body && req.body.refreshToken) || readRefreshCookie(req);
     if (!token) {
