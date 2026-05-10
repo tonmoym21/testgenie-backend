@@ -2,12 +2,16 @@ const rateLimit = require('express-rate-limit');
 const config = require('../config');
 
 /**
- * Rate limiter for auth routes (register, login).
- * 20 requests per 15 minutes per IP.
+ * Rate limiter for auth routes (register, login, logout).
+ *
+ * Only *failed* attempts count against the bucket — successful logins should
+ * never lock a user out. This prevents legitimate users behind a NAT or
+ * corporate proxy from sharing one IP and exhausting each other's quota.
  */
 const authLimiter = rateLimit({
   windowMs: config.AUTH_RATE_LIMIT_WINDOW_MS,
   max: config.AUTH_RATE_LIMIT_MAX,
+  skipSuccessfulRequests: true,
   standardHeaders: true,
   legacyHeaders: false,
   message: {
