@@ -423,12 +423,16 @@ async function executeScheduledRun(scheduleId, userId, config) {
     triggeredBy: 'scheduled'
   });
 
-  // Execute tests
+  // Execute tests sequentially. Accumulate chain vars from each result so
+  // {{response.prev.FIELD}} tokens resolve in the next test (mirrors the
+  // collection run-stream behaviour — without this, scheduled collection
+  // runs with chained tests would silently break).
   const results = [];
+  let chainVars = {};
   for (const test of tests) {
     try {
-      // Resolve environment variables in test definition
-      const resolvedDef = envService.resolveObjectVariables(test.testDefinition, envVars);
+      const vars = { ...envVars, ...chainVars };
+      const resolvedDef = envService.resolveObjectVariables(test.testDefinition, vars);
       // executeTest expects name + type at top level; collection_tests store
       // type in a separate column, and resolvedDef may not have either.
       const fullTest = {
@@ -438,6 +442,17 @@ async function executeScheduledRun(scheduleId, userId, config) {
         ...resolvedDef,
       };
       const result = await executionService.executeTest(userId, null, fullTest);
+
+      // Roll forward chain vars from extractors / response body
+      if (result.extractedVars && Object.keys(result.extractedVars).length) {
+        const newChain = envService.buildChainVars(result.rawResponse?.body || {});
+        for (const [k, v] of Object.entries(result.extractedVars)) {
+          newChain[`response.prev.${k}`] = v;
+        }
+        chainVars = { ...chainVars, ...newChain };
+      } else if (result.rawResponse?.body) {
+        chainVars = { ...chainVars, ...envService.buildChainVars(result.rawResponse.body) };
+      }
 
       await runReportService.addTestResult(report.id, {
         testId: test.id,
