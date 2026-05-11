@@ -250,9 +250,7 @@ test('user can log in', async ({ page }) => {
 
   // Show the actual diff that landed on the branch.
   git(work, 'checkout', result.branchName);
-  const onBranch = fs.readFileSync(path.join(work, 'tests', 'login.spec.ts'), 'utf8');
   banner('6. diff that landed on the agent branch');
-  // Real git diff against main to make the change concrete.
   try {
     const diff = git(work, 'diff', 'main..' + result.branchName, '--', 'tests/login.spec.ts');
     console.log(diff || '(no diff?)');
@@ -260,6 +258,22 @@ test('user can log in', async ({ page }) => {
     console.log('(could not compute diff)', err.message);
   }
   git(work, 'checkout', 'main');
+
+  // -------------------------------------------------------------------------
+  // Stage 7: verify (the strategist's "yes I want this" gate)
+  // -------------------------------------------------------------------------
+  banner('7. autoFixVerifyService.verifyFix (simulated Playwright pass)');
+  const { verifyFix } = require('../src/services/autoFixVerifyService');
+  // The demo can't actually run Playwright (no @playwright/test in the temp
+  // repo, no Chromium install), so we inject a deterministic fake. The
+  // production CLI scripts/autofix-verify.js does the real spawn.
+  const fakePlaywright = (_cwd, _args) => ({ exitCode: 0, stdout: '1 passed (1.2s)', stderr: '' });
+  const verifyResult = await verifyFix(
+    { fixAttemptId, repo: work, base: 'main' },
+    { runPlaywright: fakePlaywright },
+  );
+  console.log(`  status=${verifyResult.status} exit=${verifyResult.exitCode}`);
+  console.log('  (Playwright stubbed — see scripts/autofix-verify.js for the real spawn.)');
 
   // -------------------------------------------------------------------------
   // Cleanup or keep
@@ -274,7 +288,7 @@ test('user can log in', async ({ page }) => {
   console.log(`\nClosed loop completed in DB ${args.dbUrl}:`);
   console.log(`  - story ${storyId} -> spec ${testId}`);
   console.log(`  - run ${run.id} -> 1 playwright_run_results row -> test_failure ${failureId}`);
-  console.log(`  - fix_attempt ${fixAttemptId} (status: ${result.status})`);
+  console.log(`  - fix_attempt ${fixAttemptId} (post-apply: ${result.status}, post-verify: ${verifyResult.status})`);
   console.log(`  - real git commit on branch: ${result.branchName}`);
 
   await db.pool.end().catch(() => {});
