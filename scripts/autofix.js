@@ -65,7 +65,7 @@ async function main() {
     console.log(`\nError: ${result.error}`);
   }
 
-  process.exit(result.status === 'pr_opened' ? 0 : 1);
+  process.exit(result.status === 'proposed' ? 0 : 1);
 }
 
 main()

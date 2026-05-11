@@ -78,8 +78,9 @@ async function proposeFix(failureId, opts = {}) {
   }
 
   await finalizeAttempt(attemptId, {
-    status: 'pr_opened',  // logical state; no real PR yet — opening is Phase 4b
+    status: 'proposed',
     patchDiff: diff,
+    newCode: patched.newCode,
   });
 
   // Mark the failure as having a fix proposed so the dashboard can filter it out.
@@ -93,7 +94,7 @@ async function proposeFix(failureId, opts = {}) {
 
   return {
     fixAttemptId: attemptId,
-    status: 'pr_opened',
+    status: 'proposed',
     diff,
     newCode: patched.newCode,
     explanation: patched.explanation,
@@ -197,15 +198,16 @@ async function insertAttempt({ failureId, triggeredBy, model, branchName, prompt
   return r.rows[0].id;
 }
 
-async function finalizeAttempt(id, { status, patchDiff, errorMessage }) {
+async function finalizeAttempt(id, { status, patchDiff, errorMessage, newCode }) {
   await db.query(
     `UPDATE fix_attempts SET
        status = $2,
        patch_diff = COALESCE($3, patch_diff),
        error_message = COALESCE($4, error_message),
+       new_code = COALESCE($5, new_code),
        finished_at = NOW()
      WHERE id = $1`,
-    [id, status, patchDiff || null, errorMessage || null]
+    [id, status, patchDiff || null, errorMessage || null, newCode || null]
   );
 }
 
