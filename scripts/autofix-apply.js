@@ -25,7 +25,7 @@
 
 const path = require('path');
 const fs = require('fs');
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
 
 process.chdir(path.join(__dirname, '..'));
 const db = require('../src/db');
@@ -117,8 +117,11 @@ function walk(dir, fn) {
 // Step 3: git operations
 // ---------------------------------------------------------------------------
 
+// Run git WITHOUT a shell. Each element of `args` is passed verbatim — no
+// quoting, no interpolation, no metacharacter risk. Paths with spaces or
+// quotes pass through unchanged.
 function gitOk(cwd, ...args) {
-  return execSync(`git ${args.join(' ')}`, { cwd, stdio: 'pipe', encoding: 'utf8' }).trim();
+  return execFileSync('git', args, { cwd, stdio: 'pipe', encoding: 'utf8' }).trim();
 }
 
 function gitTry(cwd, ...args) {
@@ -127,7 +130,7 @@ function gitTry(cwd, ...args) {
 
 function assertCleanFor(repo, absFile) {
   const rel = path.relative(repo, absFile).replace(/\\/g, '/');
-  const status = gitOk(repo, 'status', '--porcelain', '--', `"${rel}"`);
+  const status = gitOk(repo, 'status', '--porcelain', '--', rel);
   if (status) {
     throw new Error(`Target file has uncommitted changes:\n${status}\nCommit or stash before running autofix-apply.`);
   }
@@ -156,12 +159,18 @@ function rollback(repo, baseBranch, newBranch) {
 // ---------------------------------------------------------------------------
 
 function openPr(repo, { branch, base, title, body }) {
-  // gh exits non-zero with stderr; surface that as the thrown error
+  // Invoke gh without a shell so DB-sourced title/body/branch values can't
+  // inject through quote handling.
   const bodyFile = path.join(repo, `.autofix-pr-body-${Date.now()}.tmp`);
   fs.writeFileSync(bodyFile, body, 'utf8');
   try {
-    const out = execSync(
-      `gh pr create --head "${branch}" --base "${base}" --title "${title.replace(/"/g, '\\"')}" --body-file "${bodyFile}"`,
+    const out = execFileSync(
+      'gh',
+      ['pr', 'create',
+        '--head', branch,
+        '--base', base,
+        '--title', title,
+        '--body-file', bodyFile],
       { cwd: repo, encoding: 'utf8', stdio: 'pipe' }
     ).trim();
     const url = out.split('\n').find((l) => /github\.com\//.test(l)) || out;
@@ -258,12 +267,12 @@ async function main() {
 
   try {
     fs.writeFileSync(target, row.new_code, 'utf8');
-    gitOk(repo, 'add', '--', `"${targetRel}"`);
+    gitOk(repo, 'add', '--', targetRel);
     // -F a tmp file to keep newlines clean across platforms
     const msgFile = path.join(repo, `.autofix-commit-msg-${Date.now()}.tmp`);
     fs.writeFileSync(msgFile, buildCommitMessage(row), 'utf8');
     try {
-      gitOk(repo, 'commit', '-F', `"${msgFile}"`);
+      gitOk(repo, 'commit', '-F', msgFile);
     } finally {
       try { fs.unlinkSync(msgFile); } catch { /* ignore */ }
     }
