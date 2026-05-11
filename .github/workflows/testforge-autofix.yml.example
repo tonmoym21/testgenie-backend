@@ -1,0 +1,126 @@
+# TestForge auto-fix workflow (example)
+#
+# Drop this into .github/workflows/ in YOUR test repository (rename it to
+# testforge-autofix.yml). It periodically asks the TestForge agent to
+# propose patches for open test failures and opens a PR per patch.
+#
+# Required secrets (Settings -> Secrets and variables -> Actions):
+#   TESTFORGE_DATABASE_URL   Same connection string TestForge uses.
+#   OPENAI_API_KEY           Used by the proposal step. BYO key.
+#   GH_PR_TOKEN              A PAT or fine-grained token with `pull-requests:
+#                            write` and `contents: write` on this repo.
+#                            (GITHUB_TOKEN sometimes works, but PRs opened by
+#                            it don't fire other workflows — usually not
+#                            what you want here.)
+#
+# Required variable (Settings -> Variables):
+#   TESTFORGE_PROJECT_ID     The TestForge project id to scan.
+#
+# What this does NOT do:
+#   - Merge anything. Every patch goes through a PR for human review.
+#   - Force-push. Branches are net-new per fix_attempt.
+#   - Touch failures already in fix_status='fix_proposed' / 'fix_merged'.
+
+name: TestForge auto-fix
+
+on:
+  schedule:
+    - cron: '0 */2 * * *'  # every 2 hours
+  workflow_dispatch:
+    inputs:
+      max_fixes:
+        description: 'Max failures to process this run'
+        required: false
+        default: '3'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  autofix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DATABASE_URL: ${{ secrets.TESTFORGE_DATABASE_URL }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GH_TOKEN: ${{ secrets.GH_PR_TOKEN }}
+      PROJECT_ID: ${{ vars.TESTFORGE_PROJECT_ID }}
+      MAX_FIXES: ${{ github.event.inputs.max_fixes || '3' }}
+      # Path to a checkout of the testforge-backend repo where these scripts
+      # live. Pinned by the action below.
+      TESTFORGE_DIR: ${{ github.workspace }}/.testforge
+
+    steps:
+      - name: Check out the test repo (the one with the .spec.ts files)
+        uses: actions/checkout@v4
+        with:
+          # Full history so the autofix branch isn't a shallow clone.
+          fetch-depth: 0
+          token: ${{ secrets.GH_PR_TOKEN }}
+
+      - name: Check out TestForge scripts
+        uses: actions/checkout@v4
+        with:
+          repository: YOUR-ORG/testforge-backend  # <-- change me
+          path: .testforge
+          ref: main
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install TestForge dependencies
+        working-directory: ${{ env.TESTFORGE_DIR }}
+        run: npm ci
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "testforge-autofix[bot]"
+          git config user.email "testforge-autofix[bot]@users.noreply.github.com"
+
+      - name: Find open failures
+        id: list
+        working-directory: ${{ env.TESTFORGE_DIR }}
+        run: |
+          node scripts/list-failures.js \
+            --project "$PROJECT_ID" --status open --max "$MAX_FIXES" --json \
+            > "$GITHUB_WORKSPACE/.failures.json"
+          echo "count=$(jq 'length' < "$GITHUB_WORKSPACE/.failures.json")" >> "$GITHUB_OUTPUT"
+
+      - name: Propose + open PRs
+        if: steps.list.outputs.count != '0'
+        working-directory: ${{ env.TESTFORGE_DIR }}
+        run: |
+          set -euo pipefail
+          for fid in $(jq -r '.[].failure_id' < "$GITHUB_WORKSPACE/.failures.json"); do
+            echo "::group::failure #$fid"
+            # 1. Ask the LLM for a patch. Exit code 0 means a proposal was stored.
+            if ! node scripts/autofix.js "$fid"; then
+              echo "::warning::No patch produced for failure #$fid"
+              echo "::endgroup::"
+              continue
+            fi
+
+            # 2. Look up the freshly inserted fix_attempt.
+            fix_id=$(node -e "
+              const db = require('./src/db');
+              db.query(\"SELECT id FROM fix_attempts WHERE test_failure_id=\$1 AND status='proposed' ORDER BY id DESC LIMIT 1\", [$fid])
+                .then(r => { console.log(r.rows[0]?.id || ''); db.pool.end(); });
+            ")
+            if [ -z "$fix_id" ]; then
+              echo "::warning::No proposed fix_attempt for failure #$fid"
+              echo "::endgroup::"
+              continue
+            fi
+
+            # 3. Apply, push, open PR (in the test repo, not the TestForge repo).
+            node scripts/autofix-apply.js "$fix_id" \
+              --repo "$GITHUB_WORKSPACE" \
+              --base "${{ github.ref_name }}" \
+              --open-pr \
+              || echo "::warning::apply step failed for fix_attempt #$fix_id"
+
+            echo "::endgroup::"
+          done
