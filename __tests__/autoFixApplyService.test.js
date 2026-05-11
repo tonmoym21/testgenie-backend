@@ -284,10 +284,15 @@ describe('autoFixApplyService.applyFix', () => {
       { db, fs, logger: silentLogger, runGit, runGh },
     )).rejects.toThrow(/pre-commit/);
 
-    // Rollback issued `checkout -- tests/login.spec.ts` to discard the write
-    // BEFORE running `checkout main`. We assert both ran AND the order.
+    // Rollback issued `restore --staged --worktree -- tests/login.spec.ts`
+    // to undo the write+stage BEFORE running `checkout main`. The integration
+    // suite caught that the old `checkout -- <file>` was insufficient: it
+    // only undoes WORKING-TREE changes, not staged ones, so after `git add`
+    // had landed the file was still marked M in `git status`.
     const idxDiscard = runGit.calls.findIndex(
-      (c) => c.args[0] === 'checkout' && c.args[1] === '--' && c.args[2] === 'tests/login.spec.ts'
+      (c) => c.args[0] === 'restore' &&
+             c.args.includes('--staged') && c.args.includes('--worktree') &&
+             c.args[c.args.length - 1] === 'tests/login.spec.ts'
     );
     const idxBaseCheckout = runGit.calls.findIndex(
       (c) => c.args[0] === 'checkout' && c.args.includes('--quiet')

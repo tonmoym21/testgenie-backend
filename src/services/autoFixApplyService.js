@@ -133,15 +133,23 @@ function assertCleanFor(runGit, repo, absFile) {
 
 /**
  * Unwind a partial apply. Order matters and each step is best-effort:
- *  1. Discard working-tree edits to the target file — otherwise the
- *     `checkout` in step 3 fails with "would be overwritten" and we
- *     leak a dirty checkout into the next run's assertCleanFor().
+ *  1. Restore the target file from HEAD on BOTH the index and the working
+ *     tree. `git checkout -- <file>` alone only undoes WORKING-TREE
+ *     changes; if `git add` had already run before the commit blew up,
+ *     the new content is staged and the working-tree-only checkout
+ *     leaves the file marked `M` in `git status`. Use `git restore
+ *     --staged --worktree` so the file goes back to its HEAD state
+ *     regardless of how far the apply got.
  *  2. If we already pushed the branch, delete the remote ref so a future
  *     proposal with the same branch_name doesn't collide with an orphan.
  *  3. Switch off the bad branch and delete it locally.
  */
 function rollback(git, repo, baseBranch, newBranch, { targetRel, pushed, remote }) {
-  if (targetRel) git.tri(repo, 'checkout', '--', targetRel);
+  if (targetRel) {
+    // git 2.23+. The two-flag form covers both `git reset HEAD --` and
+    // `git checkout --` in one call.
+    git.tri(repo, 'restore', '--staged', '--worktree', '--', targetRel);
+  }
   if (pushed && remote) git.tri(repo, 'push', remote, '--delete', newBranch);
   git.tri(repo, 'checkout', '--quiet', baseBranch);
   git.tri(repo, 'branch', '-D', newBranch);
@@ -225,8 +233,10 @@ async function recordApply(db, id, { status, prUrl, prNumber, errorMessage }) {
  *   prNumber: number|null,
  * }>}
  */
-async function applyFix(opts, deps = defaultDeps()) {
-  const { db, fs, logger, runGit, runGh } = deps;
+async function applyFix(opts, deps = {}) {
+  // Merge with defaults so tests can override just `runGh` (or any subset)
+  // without losing db / fs / runGit / logger.
+  const { db, fs, logger, runGit, runGh } = { ...defaultDeps(), ...deps };
   const git = makeGit(runGit);
 
   const repo = path.resolve(opts.repo);
