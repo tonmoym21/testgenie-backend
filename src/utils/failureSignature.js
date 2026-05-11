@@ -22,11 +22,17 @@ function normalizeError(message, stack) {
   const top = topStackFrame(stack || '');
   const text = `${message || ''}\n${top}`.trim();
   if (!text) return null;
+  // File-shaped paths only: the last segment MUST have a file extension.
+  // Earlier versions ate any `/foo/bar` token, which collapsed unrelated
+  // failures whose error messages happened to contain different URL paths.
+  const winFile = /[A-Z]:\\(?:[^\s:\\]+\\)*[^\s:\\]+\.[a-z0-9]+/gi;
+  const posixFile = /\/(?:[^\s:/]+\/)*[^\s:/]+\.[a-z0-9]+/gi;
   return text
-    .replace(/[A-Z]:\\[^\s:]+|\/[^\s:]+/g, '<PATH>')  // win + posix paths
-    .replace(/:\d+:\d+/g, ':L:C')                     // line:col
-    .replace(/\b\d+ms\b/g, '<MS>')                    // timings
-    .replace(/\brun-\d+\b/g, 'run-N')                 // our run dirs
+    .replace(winFile, '<PATH>')
+    .replace(posixFile, '<PATH>')
+    .replace(/:\d+:\d+/g, ':L:C')
+    .replace(/\b\d+ms\b/g, '<MS>')
+    .replace(/\brun-\d+\b/g, 'run-N')
     .replace(/\s+/g, ' ')
     .toLowerCase();
 }

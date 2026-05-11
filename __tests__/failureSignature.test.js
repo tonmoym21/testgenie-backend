@@ -38,6 +38,20 @@ describe('failureSignature', () => {
     const b = failureSignature('Network request failed', 'at /t.ts:1:1');
     expect(a).not.toBe(b);
   });
+
+  it('keeps URL paths (no file extension) intact — different routes must hash differently', () => {
+    // Regression: an earlier regex ate any `/foo/bar` token, so two failures
+    // hitting different REST routes collapsed into one test_failures bucket.
+    const a = failureSignature('Got 500 at /api/users/42', 'at /app/t.ts:1:1');
+    const b = failureSignature('Got 500 at /api/orders/7', 'at /app/t.ts:1:1');
+    expect(a).not.toBe(b);
+  });
+
+  it('still strips file-shaped paths (with extension) for line-number stability', () => {
+    const a = failureSignature('Element not found', 'at /var/runs/a/login.spec.ts:10:1');
+    const b = failureSignature('Element not found', 'at C:\\runs\\b\\login.spec.ts:10:1');
+    expect(a).toBe(b);
+  });
 });
 
 describe('normalizeError', () => {

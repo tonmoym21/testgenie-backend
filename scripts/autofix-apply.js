@@ -148,8 +148,18 @@ function currentBranch(repo) {
   return gitOk(repo, 'rev-parse', '--abbrev-ref', 'HEAD');
 }
 
-function rollback(repo, baseBranch, newBranch) {
-  // best-effort; never throw out of cleanup
+/**
+ * Unwind a partial apply. Order matters and each step is best-effort:
+ *  1. Discard working-tree edits to the target file — otherwise the
+ *     `checkout` in step 3 fails with "would be overwritten" and we leak
+ *     a dirty checkout into the next run's assertCleanFor().
+ *  2. If we already pushed the branch, delete the remote ref so a future
+ *     proposal with the same branch_name doesn't collide with an orphan.
+ *  3. Switch off the bad branch and delete it locally.
+ */
+function rollback(repo, baseBranch, newBranch, { targetRel, pushed, remote }) {
+  if (targetRel) gitTry(repo, 'checkout', '--', targetRel);
+  if (pushed && remote) gitTry(repo, 'push', remote, '--delete', newBranch);
   gitTry(repo, 'checkout', '--quiet', baseBranch);
   gitTry(repo, 'branch', '-D', newBranch);
 }
@@ -265,6 +275,9 @@ async function main() {
 
   gitOk(repo, 'checkout', '-b', newBranch);
 
+  // Track which side-effects landed so rollback can unwind only what's real.
+  let pushed = false;
+
   try {
     fs.writeFileSync(target, row.new_code, 'utf8');
     gitOk(repo, 'add', '--', targetRel);
@@ -278,7 +291,10 @@ async function main() {
     }
 
     let prInfo = null;
-    if (args.push) gitOk(repo, 'push', '-u', args.remote, newBranch);
+    if (args.push) {
+      gitOk(repo, 'push', '-u', args.remote, newBranch);
+      pushed = true;
+    }
     if (args.openPr) {
       prInfo = openPr(repo, {
         branch: newBranch,
@@ -300,8 +316,8 @@ async function main() {
     console.log(`\n[autofix-apply] done. status=${finalStatus}${prInfo ? '  pr=' + prInfo.url : ''}`);
     process.exit(0);
   } catch (err) {
-    logger.warn({ err: err.message, fixAttemptId: row.id }, 'autofix-apply: rolling back');
-    rollback(repo, baseBranch, newBranch);
+    logger.warn({ err: err.message, fixAttemptId: row.id, pushed }, 'autofix-apply: rolling back');
+    rollback(repo, baseBranch, newBranch, { targetRel, pushed, remote: args.remote });
     await recordApply(row.id, { status: 'failed', errorMessage: err.message });
     throw err;
   }

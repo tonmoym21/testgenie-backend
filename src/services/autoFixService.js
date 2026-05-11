@@ -46,6 +46,22 @@ async function proposeFix(failureId, opts = {}) {
     throw new Error(`Failure ${failureId} has no linked spec code — nothing to patch`);
   }
 
+  // Atomically claim the failure: only one caller can flip 'open' -> 'fix_proposed'.
+  // Stops the cron from racing a manual `node scripts/autofix.js` and paying the
+  // LLM twice for the same row. Re-run a manually-reverted failure by flipping
+  // fix_status back to 'open' in the DB first.
+  const claim = await db.query(
+    `UPDATE test_failures SET fix_status = 'fix_proposed'
+       WHERE id = $1 AND fix_status = 'open'
+       RETURNING id`,
+    [failureId]
+  );
+  if (claim.rowCount === 0) {
+    const err = new Error(`Failure ${failureId} is not in fix_status='open' — already claimed by another attempt`);
+    err.status = 409;
+    throw err;
+  }
+
   const branchName = buildBranchName(ctx);
 
   const attemptId = await insertAttempt({
@@ -57,6 +73,14 @@ async function proposeFix(failureId, opts = {}) {
     status: 'patching',
   });
 
+  // If anything below fails we must release the claim — otherwise this row
+  // stays stuck at 'fix_proposed' with no actual proposal behind it, and a
+  // human has to fix it by hand.
+  const releaseClaim = () => db.query(
+    `UPDATE test_failures SET fix_status = 'open' WHERE id = $1 AND fix_status = 'fix_proposed'`,
+    [failureId]
+  ).catch((relErr) => logger.warn({ failureId, err: relErr.message }, 'autofix: release claim failed'));
+
   let patched;
   try {
     patched = await callLlm({ ctx, model });
@@ -67,6 +91,7 @@ async function proposeFix(failureId, opts = {}) {
     logger.error({ event: 'autofix.llm_failure', failureId, reason, status, err: err.message },
       'Auto-fix LLM call failed');
     await finalizeAttempt(attemptId, { status: 'failed', errorMessage: `LLM: ${err.message}` });
+    await releaseClaim();
     return { fixAttemptId: attemptId, status: 'failed', diff: '', newCode: null, explanation: null, branchName, error: err.message };
   }
 
@@ -74,6 +99,7 @@ async function proposeFix(failureId, opts = {}) {
   if (!diff) {
     const msg = 'LLM returned an unchanged spec — no patch to apply';
     await finalizeAttempt(attemptId, { status: 'failed', errorMessage: msg });
+    await releaseClaim();
     return { fixAttemptId: attemptId, status: 'failed', diff: '', newCode: patched.newCode, explanation: patched.explanation, branchName, error: msg };
   }
 
@@ -82,12 +108,7 @@ async function proposeFix(failureId, opts = {}) {
     patchDiff: diff,
     newCode: patched.newCode,
   });
-
-  // Mark the failure as having a fix proposed so the dashboard can filter it out.
-  await db.query(
-    `UPDATE test_failures SET fix_status = 'fix_proposed' WHERE id = $1 AND fix_status = 'open'`,
-    [failureId]
-  );
+  // (test_failures.fix_status was already flipped to 'fix_proposed' by the claim.)
 
   logger.info({ event: 'autofix.proposed', failureId, fixAttemptId: attemptId, branch: branchName,
     diffLines: diff.split('\n').length }, 'Auto-fix proposed');
