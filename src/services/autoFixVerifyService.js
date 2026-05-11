@@ -161,4 +161,46 @@ async function verifyFix(opts, deps = {}) {
   return { fixAttemptId: row.id, status: 'verify_failed', exitCode: result.exitCode, stderrTail: errorTail };
 }
 
-module.exports = { verifyFix };
+// ---------------------------------------------------------------------------
+// Merge / resolve — closes the state machine
+// ---------------------------------------------------------------------------
+
+/**
+ * Mark a fix as merged. Closes the lifecycle: fix_attempts -> 'merged',
+ * test_failures -> 'resolved'. Called from a GitHub webhook handler or
+ * a manual CLI when the PR lands on main. Idempotent: refuses to act on
+ * anything that isn't 'verified' or 'pr_opened' (the two valid pre-merge
+ * states).
+ *
+ * @param {object} opts
+ * @param {number} opts.fixAttemptId
+ * @param {object?} deps
+ * @returns {Promise<{ fixAttemptId: number, status: 'merged', failureId: number }>}
+ */
+async function markMerged(opts, deps = {}) {
+  const { db, logger } = { ...defaultDeps(), ...deps };
+
+  const r = await db.query(
+    `SELECT id, test_failure_id, status FROM fix_attempts WHERE id = $1`,
+    [opts.fixAttemptId]
+  );
+  const row = r.rows[0];
+  if (!row) throw new Error(`fix_attempts ${opts.fixAttemptId} not found`);
+  if (!['verified', 'pr_opened'].includes(row.status)) {
+    throw new Error(`fix_attempts ${row.id} is in status="${row.status}" — markMerged needs "verified" or "pr_opened"`);
+  }
+
+  // Two writes; not wrapped in a transaction because both UPDATEs are
+  // idempotent and the second's WHERE clause prevents re-firing.
+  await db.query(`UPDATE fix_attempts SET status = 'merged', finished_at = NOW() WHERE id = $1`, [row.id]);
+  await db.query(
+    `UPDATE test_failures SET fix_status = 'resolved', resolved_at = NOW()
+       WHERE id = $1 AND fix_status IN ('fix_proposed', 'fix_merged')`,
+    [row.test_failure_id]
+  );
+
+  logger.info({ event: 'autofix.merged', fixAttemptId: row.id, failureId: row.test_failure_id }, 'Auto-fix merged');
+  return { fixAttemptId: row.id, status: 'merged', failureId: row.test_failure_id };
+}
+
+module.exports = { verifyFix, markMerged };

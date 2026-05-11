@@ -263,7 +263,7 @@ test('user can log in', async ({ page }) => {
   // Stage 7: verify (the strategist's "yes I want this" gate)
   // -------------------------------------------------------------------------
   banner('7. autoFixVerifyService.verifyFix (simulated Playwright pass)');
-  const { verifyFix } = require('../src/services/autoFixVerifyService');
+  const { verifyFix, markMerged } = require('../src/services/autoFixVerifyService');
   // The demo can't actually run Playwright (no @playwright/test in the temp
   // repo, no Chromium install), so we inject a deterministic fake. The
   // production CLI scripts/autofix-verify.js does the real spawn.
@@ -274,6 +274,19 @@ test('user can log in', async ({ page }) => {
   );
   console.log(`  status=${verifyResult.status} exit=${verifyResult.exitCode}`);
   console.log('  (Playwright stubbed — see scripts/autofix-verify.js for the real spawn.)');
+
+  // -------------------------------------------------------------------------
+  // Stage 8: PR merged (simulated) -> closes the lifecycle
+  // -------------------------------------------------------------------------
+  banner('8. autoFixVerifyService.markMerged (simulated PR merge)');
+  const mergeResult = await markMerged({ fixAttemptId });
+  const finalFailure = await db.query(
+    `SELECT fix_status, resolved_at FROM test_failures WHERE id = $1`,
+    [failureId]
+  );
+  console.log(`  fix_attempts.status=${mergeResult.status}`);
+  console.log(`  test_failures.fix_status=${finalFailure.rows[0].fix_status} resolved_at=${finalFailure.rows[0].resolved_at}`);
+  console.log('  (Production would call this from a GitHub webhook or a manual CLI.)');
 
   // -------------------------------------------------------------------------
   // Cleanup or keep
@@ -288,7 +301,8 @@ test('user can log in', async ({ page }) => {
   console.log(`\nClosed loop completed in DB ${args.dbUrl}:`);
   console.log(`  - story ${storyId} -> spec ${testId}`);
   console.log(`  - run ${run.id} -> 1 playwright_run_results row -> test_failure ${failureId}`);
-  console.log(`  - fix_attempt ${fixAttemptId} (post-apply: ${result.status}, post-verify: ${verifyResult.status})`);
+  console.log(`  - fix_attempt ${fixAttemptId}: ${result.status} -> ${verifyResult.status} -> ${mergeResult.status}`);
+  console.log(`  - test_failure ${failureId}.fix_status: open -> fix_proposed -> ${finalFailure.rows[0].fix_status}`);
   console.log(`  - real git commit on branch: ${result.branchName}`);
 
   await db.pool.end().catch(() => {});

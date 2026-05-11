@@ -16,7 +16,7 @@ jest.mock('pg', () => {
   return { Pool };
 });
 
-const { verifyFix } = require('../src/services/autoFixVerifyService');
+const { verifyFix, markMerged } = require('../src/services/autoFixVerifyService');
 
 // ---------------------------------------------------------------------------
 // Fakes
@@ -160,5 +160,62 @@ describe('autoFixVerifyService.verifyFix', () => {
       { db, logger: silentLogger, runGit, runPlaywright },
     )).rejects.toThrow(/verify needs/);
     expect(runPlaywright.calls).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// markMerged
+// ---------------------------------------------------------------------------
+
+describe('autoFixVerifyService.markMerged', () => {
+  it('verified -> merged: flips fix_attempts.status and test_failures.fix_status', async () => {
+    const db = makeDb([
+      [/SELECT id, test_failure_id, status FROM fix_attempts/, {
+        rows: [{ id: 99, test_failure_id: 42, status: 'verified' }], rowCount: 1,
+      }],
+      [/UPDATE fix_attempts SET status = 'merged'/, { rows: [], rowCount: 1 }],
+      [/UPDATE test_failures SET fix_status = 'resolved'/, { rows: [], rowCount: 1 }],
+    ]);
+    const out = await markMerged({ fixAttemptId: 99 }, { db, logger: silentLogger });
+    expect(out).toEqual({ fixAttemptId: 99, status: 'merged', failureId: 42 });
+
+    // Both UPDATEs fired with the right params.
+    const faUpdate = db.calls.find((c) => /UPDATE fix_attempts SET status = 'merged'/.test(c.sql));
+    expect(faUpdate.params).toEqual([99]);
+    const tfUpdate = db.calls.find((c) => /UPDATE test_failures SET fix_status = 'resolved'/.test(c.sql));
+    expect(tfUpdate.params).toEqual([42]);
+  });
+
+  it('pr_opened -> merged: also legal (skip-verify path)', async () => {
+    const db = makeDb([
+      [/SELECT id, test_failure_id, status FROM fix_attempts/, {
+        rows: [{ id: 99, test_failure_id: 42, status: 'pr_opened' }], rowCount: 1,
+      }],
+      [/UPDATE fix_attempts/, { rows: [], rowCount: 1 }],
+      [/UPDATE test_failures/, { rows: [], rowCount: 1 }],
+    ]);
+    const out = await markMerged({ fixAttemptId: 99 }, { db, logger: silentLogger });
+    expect(out.status).toBe('merged');
+  });
+
+  it('refuses to merge from a non-mergeable state', async () => {
+    const db = makeDb([
+      [/SELECT id, test_failure_id, status FROM fix_attempts/, {
+        rows: [{ id: 99, test_failure_id: 42, status: 'verify_failed' }], rowCount: 1,
+      }],
+    ]);
+    await expect(markMerged({ fixAttemptId: 99 }, { db, logger: silentLogger }))
+      .rejects.toThrow(/markMerged needs/);
+
+    // No UPDATEs.
+    expect(db.calls.some((c) => /UPDATE/.test(c.sql))).toBe(false);
+  });
+
+  it('throws on missing row', async () => {
+    const db = makeDb([
+      [/SELECT id, test_failure_id, status FROM fix_attempts/, { rows: [], rowCount: 0 }],
+    ]);
+    await expect(markMerged({ fixAttemptId: 999 }, { db, logger: silentLogger }))
+      .rejects.toThrow(/not found/);
   });
 });
