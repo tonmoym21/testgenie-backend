@@ -10,6 +10,7 @@ const logger = require('../utils/logger');
 const automationAssetService = require('./automationAssetService');
 const targetAppConfigService = require('./targetAppConfigService');
 const { maskSecretsInText, getSecretValues } = require('./environmentService');
+const lineageService = require('./lineageService');
 
 // Persisted runs (was os.tmpdir() — artifacts were lost on cleanup, killing the
 // trace/video/screenshot pipeline downstream features depend on).
@@ -300,10 +301,11 @@ async function executePlaywright(run, asset, targetConfig) {
   const durationMs = Date.now() - startMs;
 
   let parsed = { total: writtenFiles.length, passed: 0, failed: 0, skipped: 0 };
+  let report = null;
   const jsonReportPath = path.join(resultsDir, 'report.json');
   if (fs.existsSync(jsonReportPath)) {
     try {
-      const report = JSON.parse(fs.readFileSync(jsonReportPath, 'utf8'));
+      report = JSON.parse(fs.readFileSync(jsonReportPath, 'utf8'));
       if (report.stats) {
         parsed.total = report.stats.expected + (report.stats.unexpected || 0) + (report.stats.skipped || 0);
         parsed.passed = report.stats.expected || 0;
@@ -352,6 +354,15 @@ async function executePlaywright(run, asset, targetConfig) {
      WHERE execution_run_id = $1 AND automation_asset_id = $5`,
     [run.id, finalStatus, durationMs, combinedOutput.slice(0, 10000), run.automation_asset_id]
   );
+
+  // Closed-loop lineage: per-spec results + deduplicated failure signatures.
+  // Non-fatal — the run row is already final; lineage is best-effort.
+  try {
+    const counts = await lineageService.writeRunLineage(run, report);
+    logger.info({ runId: run.id, ...counts }, 'Lineage written');
+  } catch (err) {
+    logger.warn({ runId: run.id, err: err.message }, 'Lineage write failed');
+  }
 
   logger.info({ runId: run.id, status: finalStatus, duration: durationMs, dir: runDir, ...parsed }, 'Playwright run complete');
 }
