@@ -2,15 +2,16 @@
  * Jira Integration — /api/jira
  * OAuth2 flow (Atlassian Cloud), ticket linking, and results sync.
  *
- * Required env vars:
- *   JIRA_CLIENT_ID     — Atlassian OAuth2 app client ID
- *   JIRA_CLIENT_SECRET — Atlassian OAuth2 app secret
- *   JIRA_REDIRECT_URI  — must match what's registered in Atlassian developer console
+ * OAuth client credentials are resolved per-organisation from
+ * jira_oauth_config (admin-managed via /api/jira/oauth-config). The legacy
+ * env vars JIRA_CLIENT_ID/SECRET/REDIRECT_URI remain a process-wide fallback
+ * so single-tenant self-hosted deploys keep working without a DB row.
  */
 const { Router } = require('express');
 const { z } = require('zod');
 const { validate } = require('../middleware/validate');
 const { authenticate } = require('../middleware/auth');
+const { requireMinRole } = require('../middleware/rbac');
 const db = require('../db');
 const { NotFoundError } = require('../utils/apiError');
 const logger = require('../utils/logger');
@@ -21,12 +22,43 @@ const JIRA_AUTH_URL = 'https://auth.atlassian.com/authorize';
 const JIRA_TOKEN_URL = 'https://auth.atlassian.com/oauth/token';
 const JIRA_RESOURCES_URL = 'https://api.atlassian.com/oauth/token/accessible-resources';
 
-function jiraConfig() {
-  return {
-    clientId: process.env.JIRA_CLIENT_ID,
-    clientSecret: process.env.JIRA_CLIENT_SECRET,
-    redirectUri: process.env.JIRA_REDIRECT_URI || `${process.env.APP_URL || 'http://localhost:3000'}/api/jira/callback`,
-  };
+/**
+ * Resolve OAuth client credentials for an organisation.
+ * DB row wins; env vars are fallback. Returns null in every slot when nothing
+ * is configured — callers check `clientId` to decide whether to 503.
+ *
+ * @param {number|null} orgId
+ * @returns {Promise<{clientId:string|null, clientSecret:string|null, redirectUri:string, source:'db'|'env'|'none'}>}
+ */
+async function jiraConfig(orgId) {
+  const envRedirect = process.env.JIRA_REDIRECT_URI
+    || `${process.env.APP_URL || 'http://localhost:3000'}/api/jira/callback`;
+
+  if (orgId) {
+    const r = await db.query(
+      'SELECT client_id, client_secret, redirect_uri FROM jira_oauth_config WHERE organization_id = $1',
+      [orgId]
+    );
+    if (r.rows.length > 0) {
+      return {
+        clientId: r.rows[0].client_id,
+        clientSecret: r.rows[0].client_secret,
+        redirectUri: r.rows[0].redirect_uri || envRedirect,
+        source: 'db',
+      };
+    }
+  }
+
+  if (process.env.JIRA_CLIENT_ID && process.env.JIRA_CLIENT_SECRET) {
+    return {
+      clientId: process.env.JIRA_CLIENT_ID,
+      clientSecret: process.env.JIRA_CLIENT_SECRET,
+      redirectUri: envRedirect,
+      source: 'env',
+    };
+  }
+
+  return { clientId: null, clientSecret: null, redirectUri: envRedirect, source: 'none' };
 }
 
 // GET /api/jira/callback — OAuth2 callback (called by Atlassian, no JWT)
@@ -36,14 +68,16 @@ router.get('/callback', async (req, res, next) => {
     const { code, state } = req.query;
     if (!code) return res.status(400).send('Missing OAuth code');
 
-    let userId;
+    let userId, stateOrgId;
     try {
       const s = JSON.parse(Buffer.from(state || '', 'base64').toString('utf8'));
       userId = s.userId;
+      stateOrgId = s.orgId || null;
     } catch { return res.status(400).send('Invalid state'); }
     if (!userId) return res.status(400).send('Missing user in state');
 
-    const { clientId, clientSecret, redirectUri } = jiraConfig();
+    const { clientId, clientSecret, redirectUri } = await jiraConfig(stateOrgId);
+    if (!clientId) return res.status(503).send('Jira integration not configured');
     const tokenRes = await fetch(JIRA_TOKEN_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -107,21 +141,84 @@ router.get('/status', async (req, res, next) => {
 });
 
 // GET /api/jira/auth-url — start OAuth2 flow
-router.get('/auth-url', (req, res) => {
-  const { clientId, redirectUri } = jiraConfig();
-  if (!clientId) return res.status(503).json({ error: { code: 'NOT_CONFIGURED', message: 'Jira integration not configured' } });
+router.get('/auth-url', async (req, res, next) => {
+  try {
+    const orgId = req.user.orgId || null;
+    const { clientId, redirectUri, source } = await jiraConfig(orgId);
+    if (!clientId) return res.status(503).json({
+      error: { code: 'NOT_CONFIGURED', message: 'Jira integration not configured. Ask your admin to set the OAuth credentials under Jira → Admin Settings.' }
+    });
 
-  const state = Buffer.from(JSON.stringify({ userId: req.user.id, ts: Date.now() })).toString('base64');
-  const params = new URLSearchParams({
-    audience: 'api.atlassian.com',
-    client_id: clientId,
-    scope: 'read:jira-work write:jira-work read:jira-user offline_access',
-    redirect_uri: redirectUri,
-    state,
-    response_type: 'code',
-    prompt: 'consent',
-  });
-  res.json({ url: `${JIRA_AUTH_URL}?${params}` });
+    // orgId is carried in state so the (unauthenticated) /callback can look up
+    // the matching DB-stored credentials when env vars are unset.
+    const state = Buffer.from(JSON.stringify({ userId: req.user.id, orgId, ts: Date.now() })).toString('base64');
+    const params = new URLSearchParams({
+      audience: 'api.atlassian.com',
+      client_id: clientId,
+      scope: 'read:jira-work write:jira-work read:jira-user offline_access',
+      redirect_uri: redirectUri,
+      state,
+      response_type: 'code',
+      prompt: 'consent',
+    });
+    res.json({ url: `${JIRA_AUTH_URL}?${params}`, source });
+  } catch (err) { next(err); }
+});
+
+// ── Admin OAuth config endpoints ────────────────────────────────────────────
+// GET is open to any authenticated user so the connect flow can show a
+// "configured" indicator; never returns the secret in plaintext.
+router.get('/oauth-config', async (req, res, next) => {
+  try {
+    const orgId = req.user.orgId || null;
+    const { clientId, redirectUri, source } = await jiraConfig(orgId);
+    res.json({
+      configured: !!clientId,
+      source,                // 'db' (org row), 'env' (fallback), or 'none'
+      clientId: clientId || null,
+      redirectUri,
+      hasSecret: !!clientId,
+    });
+  } catch (err) { next(err); }
+});
+
+// PUT — upsert OAuth credentials for the caller's organisation. Admin+ only.
+const oauthConfigSchema = z.object({
+  clientId: z.string().min(1).max(200),
+  clientSecret: z.string().min(1).max(500),
+  redirectUri: z.string().url().max(500),
+});
+router.put('/oauth-config', requireMinRole('admin'), validate(oauthConfigSchema), async (req, res, next) => {
+  try {
+    const orgId = req.user.orgId;
+    if (!orgId) return res.status(400).json({
+      error: { code: 'NO_ORG', message: 'You must belong to an organisation to configure Jira OAuth.' }
+    });
+    const { clientId, clientSecret, redirectUri } = req.body;
+    await db.query(
+      `INSERT INTO jira_oauth_config (organization_id, client_id, client_secret, redirect_uri, updated_by, updated_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       ON CONFLICT (organization_id) DO UPDATE SET
+         client_id = EXCLUDED.client_id,
+         client_secret = EXCLUDED.client_secret,
+         redirect_uri = EXCLUDED.redirect_uri,
+         updated_by = EXCLUDED.updated_by,
+         updated_at = NOW()`,
+      [orgId, clientId, clientSecret, redirectUri, req.user.id]
+    );
+    logger.info({ orgId, userId: req.user.id }, 'Jira OAuth config saved');
+    res.json({ configured: true, source: 'db', clientId, redirectUri, hasSecret: true });
+  } catch (err) { next(err); }
+});
+
+router.delete('/oauth-config', requireMinRole('admin'), async (req, res, next) => {
+  try {
+    const orgId = req.user.orgId;
+    if (!orgId) return res.status(400).json({ error: { code: 'NO_ORG', message: 'No organisation' } });
+    await db.query('DELETE FROM jira_oauth_config WHERE organization_id = $1', [orgId]);
+    logger.info({ orgId, userId: req.user.id }, 'Jira OAuth config cleared');
+    res.json({ configured: false, source: 'none' });
+  } catch (err) { next(err); }
 });
 
 // DELETE /api/jira/disconnect — remove integration
@@ -135,17 +232,21 @@ router.delete('/disconnect', async (req, res, next) => {
 // Helper: refresh token if near expiry
 async function getValidToken(userId) {
   const row = await db.query(
-    'SELECT access_token, refresh_token, token_expires_at FROM jira_integrations WHERE user_id = $1 AND is_active = true',
+    `SELECT ji.access_token, ji.refresh_token, ji.token_expires_at, u.organization_id
+       FROM jira_integrations ji
+       JOIN users u ON u.id = ji.user_id
+      WHERE ji.user_id = $1 AND ji.is_active = true`,
     [userId]
   );
   if (row.rows.length === 0) throw new Error('No active Jira integration');
 
-  const { access_token, refresh_token, token_expires_at } = row.rows[0];
+  const { access_token, refresh_token, token_expires_at, organization_id } = row.rows[0];
   const expiresAt = new Date(token_expires_at);
 
   // Refresh if expires in < 5 minutes
   if (refresh_token && expiresAt.getTime() - Date.now() < 5 * 60 * 1000) {
-    const { clientId, clientSecret } = jiraConfig();
+    const { clientId, clientSecret } = await jiraConfig(organization_id);
+    if (!clientId) throw new Error('Jira OAuth credentials not configured for organisation');
     const tokenRes = await fetch(JIRA_TOKEN_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

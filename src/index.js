@@ -24,8 +24,8 @@ const rateLimiter = require('./middleware/rateLimiter'); // default export = gen
 const app = express();
 
 // Build info for deployment verification
-const BUILD_VERSION = '2.6.1';
-const BUILD_DATE = '2026-05-12T11:36:00Z';
+const BUILD_VERSION = '2.7.0';
+const BUILD_DATE = '2026-05-12T11:55:00Z';
 
 logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backend starting...');
 
@@ -153,6 +153,21 @@ logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backen
 
       // ── API request chaining: per-collection auto cookie jar toggle ──
       `ALTER TABLE collections ADD COLUMN IF NOT EXISTS auto_cookie_jar BOOLEAN NOT NULL DEFAULT false`,
+
+      // ── Migration 014: org-scoped Jira OAuth client credentials ──
+      // Lets each organisation register its own Atlassian OAuth2 (3LO) app
+      // from the admin UI instead of requiring a deploy-time env var. The
+      // env vars (JIRA_CLIENT_ID/SECRET/REDIRECT_URI) remain a fallback so
+      // self-hosted single-tenant deployments keep working unchanged.
+      `CREATE TABLE IF NOT EXISTS jira_oauth_config (
+         organization_id INTEGER PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
+         client_id TEXT NOT NULL,
+         client_secret TEXT NOT NULL,
+         redirect_uri TEXT NOT NULL,
+         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL
+       )`,
     ];
     for (const sql of statements) {
       try {
