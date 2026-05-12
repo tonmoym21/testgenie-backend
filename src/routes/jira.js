@@ -15,6 +15,7 @@ const { requireMinRole } = require('../middleware/rbac');
 const db = require('../db');
 const { NotFoundError } = require('../utils/apiError');
 const logger = require('../utils/logger');
+const { encryptSecret, decryptSecret, isEncryptionEnabled } = require('../utils/cryptoVault');
 
 const router = Router();
 
@@ -40,9 +41,12 @@ async function jiraConfig(orgId) {
       [orgId]
     );
     if (r.rows.length > 0) {
+      // client_secret is encrypted-at-rest when SECRETS_ENC_KEY is configured;
+      // decryptSecret transparently passes through legacy plaintext rows.
+      const decryptedSecret = decryptSecret(r.rows[0].client_secret);
       return {
         clientId: r.rows[0].client_id,
-        clientSecret: r.rows[0].client_secret,
+        clientSecret: decryptedSecret,
         redirectUri: r.rows[0].redirect_uri || envRedirect,
         source: 'db',
       };
@@ -178,6 +182,7 @@ router.get('/oauth-config', async (req, res, next) => {
       clientId: clientId || null,
       redirectUri,
       hasSecret: !!clientId,
+      encryptionAtRest: isEncryptionEnabled(),
     });
   } catch (err) { next(err); }
 });
@@ -195,6 +200,10 @@ router.put('/oauth-config', requireMinRole('admin'), validate(oauthConfigSchema)
       error: { code: 'NO_ORG', message: 'You must belong to an organisation to configure Jira OAuth.' }
     });
     const { clientId, clientSecret, redirectUri } = req.body;
+    // Encrypt the secret at rest if SECRETS_ENC_KEY is configured.
+    // encryptSecret falls back to plaintext (with a one-time warn log) when
+    // no key is set, so dev / single-tenant setups keep working.
+    const storedSecret = encryptSecret(clientSecret);
     await db.query(
       `INSERT INTO jira_oauth_config (organization_id, client_id, client_secret, redirect_uri, updated_by, updated_at)
        VALUES ($1, $2, $3, $4, $5, NOW())
@@ -204,7 +213,7 @@ router.put('/oauth-config', requireMinRole('admin'), validate(oauthConfigSchema)
          redirect_uri = EXCLUDED.redirect_uri,
          updated_by = EXCLUDED.updated_by,
          updated_at = NOW()`,
-      [orgId, clientId, clientSecret, redirectUri, req.user.id]
+      [orgId, clientId, storedSecret, redirectUri, req.user.id]
     );
     logger.info({ orgId, userId: req.user.id }, 'Jira OAuth config saved');
     res.json({ configured: true, source: 'db', clientId, redirectUri, hasSecret: true });
