@@ -8,17 +8,20 @@
 // either print it (--dry-run) or hand it to git apply. The GitHub Action
 // wrapper is a follow-up.
 
-const OpenAI = require('openai');
 const config = require('../config');
 const db = require('../db');
 const logger = require('../utils/logger');
 const { classifyAiError } = require('../utils/aiMetrics');
 const { unifiedDiff } = require('../utils/unifiedDiff');
 const { buildFixPrompt, FIX_SYSTEM_PROMPT } = require('./autoFixPrompt');
+const { getProvider } = require('./llm');
 
-const openai = new OpenAI({ apiKey: config.OPENAI_API_KEY });
-
-const DEFAULT_MODEL = 'gpt-4o';
+// Model defaults differ by provider — Ollama users don't have gpt-4o.
+// Honour explicit opts.model > env override > per-provider default.
+const DEFAULT_MODEL_BY_PROVIDER = {
+  openai: 'gpt-4o',
+  ollama: 'llama3.1',
+};
 
 /**
  * Run the agent against a single test_failures row.
@@ -38,7 +41,11 @@ const DEFAULT_MODEL = 'gpt-4o';
  * }>}
  */
 async function proposeFix(failureId, opts = {}) {
-  const model = opts.model || DEFAULT_MODEL;
+  const provider = getProvider(opts.provider);
+  const model = opts.model
+    || process.env.AUTOFIX_MODEL
+    || DEFAULT_MODEL_BY_PROVIDER[provider.name]
+    || DEFAULT_MODEL_BY_PROVIDER.openai;
 
   const ctx = await loadFailureContext(failureId);
   if (!ctx) throw Object.assign(new Error(`Failure ${failureId} not found`), { status: 404 });
@@ -67,6 +74,7 @@ async function proposeFix(failureId, opts = {}) {
   const attemptId = await insertAttempt({
     failureId,
     triggeredBy: opts.triggeredBy || null,
+    providerName: provider.name,
     model,
     branchName,
     promptExcerpt: null,
@@ -83,7 +91,7 @@ async function proposeFix(failureId, opts = {}) {
 
   let patched;
   try {
-    patched = await callLlm({ ctx, model });
+    patched = await callLlm({ ctx, model, provider });
     await db.query(`UPDATE fix_attempts SET prompt_excerpt = $2 WHERE id = $1`,
       [attemptId, truncate(patched.promptExcerpt, 4000)]);
   } catch (err) {
@@ -127,7 +135,7 @@ async function proposeFix(failureId, opts = {}) {
 // LLM call
 // ---------------------------------------------------------------------------
 
-async function callLlm({ ctx, model }) {
+async function callLlm({ ctx, model, provider }) {
   const userPrompt = buildFixPrompt({
     fileName: ctx.fileName,
     specCode: ctx.specCode,
@@ -136,19 +144,13 @@ async function callLlm({ ctx, model }) {
   });
 
   const aiStart = Date.now();
-  const response = await openai.chat.completions.create({
+  const { content: raw } = await provider.chatJson({
+    system: FIX_SYSTEM_PROMPT,
+    user: userPrompt,
     model,
     temperature: 0.1,
-    max_tokens: 4096,
-    response_format: { type: 'json_object' },
-    messages: [
-      { role: 'system', content: FIX_SYSTEM_PROMPT },
-      { role: 'user', content: userPrompt },
-    ],
+    maxTokens: 4096,
   });
-
-  const raw = response.choices[0]?.message?.content;
-  if (!raw) throw new Error('Empty LLM response');
 
   let parsed;
   try {
@@ -160,8 +162,8 @@ async function callLlm({ ctx, model }) {
     throw new Error('LLM response missing newCode');
   }
 
-  logger.info({ event: 'autofix.llm_ok', model, durationMs: Date.now() - aiStart,
-    newCodeLen: parsed.newCode.length }, 'Auto-fix LLM ok');
+  logger.info({ event: 'autofix.llm_ok', provider: provider.name, model,
+    durationMs: Date.now() - aiStart, newCodeLen: parsed.newCode.length }, 'Auto-fix LLM ok');
 
   return {
     newCode: parsed.newCode,
@@ -207,14 +209,14 @@ async function loadFailureContext(failureId) {
 // fix_attempts row management
 // ---------------------------------------------------------------------------
 
-async function insertAttempt({ failureId, triggeredBy, model, branchName, promptExcerpt, status }) {
+async function insertAttempt({ failureId, triggeredBy, providerName, model, branchName, promptExcerpt, status }) {
   const r = await db.query(
     `INSERT INTO fix_attempts
        (test_failure_id, triggered_by, model_provider, model_name,
         branch_name, prompt_excerpt, status, started_at)
-     VALUES ($1, $2, 'openai', $3, $4, $5, $6, NOW())
+     VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
      RETURNING id`,
-    [failureId, triggeredBy, model, branchName, promptExcerpt, status]
+    [failureId, triggeredBy, providerName || 'openai', model, branchName, promptExcerpt, status]
   );
   return r.rows[0].id;
 }
