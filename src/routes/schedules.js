@@ -9,6 +9,7 @@ const logger = require('../utils/logger');
 const envService = require('../services/environmentService');
 const runReportService = require('../services/runReportService');
 const emailService = require('../services/emailService');
+const cookieJarLib = require('../automation/cookieJar');
 
 const router = Router();
 router.use(authenticate);
@@ -343,6 +344,10 @@ async function executeScheduledRun(scheduleId, userId, config) {
 
   let tests = [];
   let title = 'Scheduled Run';
+  // Owning collection id used for the auto-cookie-jar lookup. For 'collection'
+  // schedules this is the schedule's collectionId; for 'folder' schedules it's
+  // resolved from the folder row below.
+  let chainCollectionId = null;
 
   // Normalize testIds — JSONB column may round-trip as array, string, or null
   let parsedTestIds = null;
@@ -377,6 +382,7 @@ async function executeScheduledRun(scheduleId, userId, config) {
 
     const col = await db.query('SELECT name FROM collections WHERE id = $1', [collectionId]);
     title = col.rows[0]?.name || 'Collection Run';
+    chainCollectionId = collectionId;
   } else if (scheduleType === 'folder' && folderId) {
     const testsResult = await db.query(
       `SELECT ct.id, ct.name, ct.test_type, ct.test_definition
@@ -392,8 +398,12 @@ async function executeScheduledRun(scheduleId, userId, config) {
       testDefinition: typeof t.test_definition === 'string' ? JSON.parse(t.test_definition) : t.test_definition
     }));
 
-    const folder = await db.query('SELECT name FROM collection_folders WHERE id = $1', [folderId]);
+    const folder = await db.query(
+      'SELECT name, collection_id FROM collection_folders WHERE id = $1',
+      [folderId]
+    );
     title = folder.rows[0]?.name || 'Folder Run';
+    chainCollectionId = folder.rows[0]?.collection_id || null;
   }
 
   if (tests.length === 0) {
@@ -423,6 +433,20 @@ async function executeScheduledRun(scheduleId, userId, config) {
     triggeredBy: 'scheduled'
   });
 
+  // If this scheduled run is rooted in a collection (or a folder inside one)
+  // and that collection has auto_cookie_jar enabled, create a per-run jar so
+  // Set-Cookie from each step is auto-attached to the next. Mirrors the
+  // collection /run path so scheduled and interactive runs behave the same.
+  let autoCookieJar = false;
+  if (chainCollectionId) {
+    const r = await db.query(
+      'SELECT auto_cookie_jar FROM collections WHERE id = $1',
+      [chainCollectionId]
+    );
+    autoCookieJar = !!r.rows[0]?.auto_cookie_jar;
+  }
+  const jar = autoCookieJar ? cookieJarLib.createJar() : null;
+
   // Execute tests sequentially. Accumulate chain vars from each result so
   // {{response.prev.FIELD}} tokens resolve in the next test (mirrors the
   // collection run-stream behaviour — without this, scheduled collection
@@ -433,6 +457,20 @@ async function executeScheduledRun(scheduleId, userId, config) {
     try {
       const vars = { ...envVars, ...chainVars };
       const resolvedDef = envService.resolveObjectVariables(test.testDefinition, vars);
+
+      // For API tests with an active jar, pre-compute the Cookie header for
+      // the resolved URL and stash chain hints onto config. apiRunner reads
+      // these via destructuring and ignores them when absent.
+      if (jar && (test.testType || resolvedDef.type) === 'api') {
+        const cfg = resolvedDef.config || resolvedDef;
+        const url = cfg.url;
+        if (url) {
+          const cookieHeader = await cookieJarLib.cookieHeaderFor(jar, url);
+          if (cookieHeader) cfg._chainCookieHeader = cookieHeader;
+          cfg._captureRedirectCookies = true;
+        }
+      }
+
       // executeTest expects name + type at top level; collection_tests store
       // type in a separate column, and resolvedDef may not have either.
       const fullTest = {
@@ -442,6 +480,13 @@ async function executeScheduledRun(scheduleId, userId, config) {
         ...resolvedDef,
       };
       const result = await executionService.executeTest(userId, null, fullTest);
+
+      // Ingest Set-Cookie from every hop (including redirects) into the jar.
+      if (jar && result.rawResponse?.setCookieRaw?.length) {
+        for (const { url: hopUrl, raw } of result.rawResponse.setCookieRaw) {
+          await cookieJarLib.ingestSetCookies(jar, hopUrl, [raw]);
+        }
+      }
 
       // Roll forward chain vars from extractors / response body
       if (result.extractedVars && Object.keys(result.extractedVars).length) {
@@ -454,16 +499,25 @@ async function executeScheduledRun(scheduleId, userId, config) {
         chainVars = { ...chainVars, ...envService.buildChainVars(result.rawResponse.body) };
       }
 
+      // Strip the heavy per-hop raw cookie list before persisting / returning.
+      // It exists only for the orchestrator to feed the jar.
+      let persistedRaw = result.rawResponse;
+      if (persistedRaw && persistedRaw.setCookieRaw) {
+        const { setCookieRaw, ...rest } = persistedRaw;
+        persistedRaw = rest;
+        void setCookieRaw;
+      }
+
       await runReportService.addTestResult(report.id, {
         testId: test.id,
         name: test.name,
         status: result.status,
         duration: result.duration,
         error: result.error,
-        rawResponse: result.rawResponse
+        rawResponse: persistedRaw
       });
 
-      results.push({ ...result, testId: test.id, name: test.name });
+      results.push({ ...result, rawResponse: persistedRaw, testId: test.id, name: test.name });
     } catch (err) {
       await runReportService.addTestResult(report.id, {
         testId: test.id,
