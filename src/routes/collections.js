@@ -41,6 +41,9 @@ async function assertCollectionAccess(req, colId) {
 const createCollectionSchema = z.object({
   name: z.string().min(1).max(200),
   description: z.string().max(2000).optional(),
+  // Default ON for new collections — modern API runners (Postman, Hoppscotch)
+  // assume cookie persistence; existing collections keep DB default (false).
+  autoCookieJar: z.boolean().optional().default(true),
 });
 
 const addTestSchema = z.object({
@@ -76,10 +79,10 @@ router.get('/', async (req, res, next) => {
 router.post('/', validate(createCollectionSchema), async (req, res, next) => {
   try {
     const result = await db.query(
-      `INSERT INTO collections (user_id, name, description, organization_id)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, name, description, created_at AS "createdAt"`,
-      [req.user.id, req.body.name, req.body.description || null, req.user.orgId || null]
+      `INSERT INTO collections (user_id, name, description, organization_id, auto_cookie_jar)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, name, description, auto_cookie_jar AS "autoCookieJar", created_at AS "createdAt"`,
+      [req.user.id, req.body.name, req.body.description || null, req.user.orgId || null, req.body.autoCookieJar !== false]
     );
     res.status(201).json({ ...result.rows[0], testCount: 0, folderCount: 0 });
   } catch (err) { next(err); }
@@ -89,7 +92,7 @@ router.post('/', validate(createCollectionSchema), async (req, res, next) => {
 router.get('/:id', async (req, res, next) => {
   try {
     const col = await db.query(
-      `SELECT id, name, description, created_at AS "createdAt" FROM collections
+      `SELECT id, name, description, auto_cookie_jar AS "autoCookieJar", created_at AS "createdAt" FROM collections
        WHERE id = $3 AND ${accessClause('collections')}`,
       [...userScope(req), req.params.id]
     );
@@ -121,6 +124,7 @@ router.get('/:id', async (req, res, next) => {
 const updateCollectionSchema = z.object({
   name: z.string().min(1).max(200).optional(),
   description: z.string().max(2000).nullable().optional(),
+  autoCookieJar: z.boolean().optional(),
 });
 
 // PATCH /api/collections/:id
@@ -132,9 +136,10 @@ router.patch('/:id', validate(updateCollectionSchema), async (req, res, next) =>
     let i = 1;
     if (req.body.name !== undefined) { fields.push(`name = $${i++}`); values.push(req.body.name); }
     if (req.body.description !== undefined) { fields.push(`description = $${i++}`); values.push(req.body.description); }
+    if (req.body.autoCookieJar !== undefined) { fields.push(`auto_cookie_jar = $${i++}`); values.push(req.body.autoCookieJar); }
     if (fields.length === 0) {
       const r = await db.query(
-        `SELECT id, name, description, created_at AS "createdAt" FROM collections WHERE id = $1`,
+        `SELECT id, name, description, auto_cookie_jar AS "autoCookieJar", created_at AS "createdAt" FROM collections WHERE id = $1`,
         [req.params.id]
       );
       return res.json(r.rows[0]);
@@ -142,7 +147,7 @@ router.patch('/:id', validate(updateCollectionSchema), async (req, res, next) =>
     values.push(req.params.id);
     const result = await db.query(
       `UPDATE collections SET ${fields.join(', ')} WHERE id = $${i}
-       RETURNING id, name, description, created_at AS "createdAt"`,
+       RETURNING id, name, description, auto_cookie_jar AS "autoCookieJar", created_at AS "createdAt"`,
       values
     );
     res.json(result.rows[0]);
@@ -346,22 +351,60 @@ async function fetchTestsForRun(collectionId, { folderId, testIds }) {
  * @param {Function} onProgress - Called after each test completes: (index, result)
  */
 const PARALLEL_LIMIT = 5;
+const cookieJarLib = require('../automation/cookieJar');
 
-async function runTestsParallel(tests, baseVars, executionService, userId, onProgress) {
+/**
+ * Decide whether this collection run needs chain semantics (= serial execution).
+ * Chain mode forces serial because:
+ *   - extractor outputs must be visible to subsequent tests at dispatch time
+ *   - the cookie jar must be updated between tests, not raced
+ */
+function detectChainMode(tests, options) {
+  if (options && options.autoCookieJar) return true;
+  for (const t of tests) {
+    const def = typeof t.test_definition === 'string'
+      ? safeParse(t.test_definition)
+      : t.test_definition;
+    if (!def) continue;
+    const cfg = def.config || def;
+    if (Array.isArray(cfg.extractors) && cfg.extractors.length > 0) return true;
+    // Heuristic: any {{response.prev.*}} reference in any string field
+    if (referencesPrevResponse(cfg)) return true;
+  }
+  return false;
+}
+
+function safeParse(s) { try { return JSON.parse(s); } catch { return null; } }
+
+function referencesPrevResponse(obj) {
+  if (!obj) return false;
+  if (typeof obj === 'string') return obj.includes('{{response.prev.');
+  if (Array.isArray(obj)) return obj.some(referencesPrevResponse);
+  if (typeof obj === 'object') return Object.values(obj).some(referencesPrevResponse);
+  return false;
+}
+
+/**
+ * Run a collection's tests.
+ *
+ * - When chain mode is on (extractors / autoCookieJar / {{response.prev}}
+ *   references), runs strictly serial. Correctness over throughput.
+ * - When `options.autoCookieJar` is on, maintains a per-run tough-cookie jar:
+ *   ingests Set-Cookie from every response (including redirect hops) and
+ *   auto-attaches matching Cookie headers on subsequent requests.
+ *
+ * @param {Array}    tests       - collection_test rows
+ * @param {Object}   baseVars    - merged env + global variables
+ * @param {Function} onProgress  - (index, resultRow) after each test
+ * @param {Object}   options     - { autoCookieJar?: boolean }
+ */
+async function runTestsParallel(tests, baseVars, executionService, userId, onProgress, options = {}) {
   const results = new Array(tests.length);
-
-  // We run all tests concurrently up to PARALLEL_LIMIT, but response chaining
-  // requires each test to see the previous test's extracted vars.
-  // Strategy: run in "waves" — within a wave tests are fully parallel;
-  // a test that depends on chain vars must wait for previous tests.
-  // Simplest correct approach: limited concurrency pool, in order.
+  const chainMode = detectChainMode(tests, options);
+  const effectiveLimit = chainMode ? 1 : PARALLEL_LIMIT;
+  const jar = options.autoCookieJar ? cookieJarLib.createJar() : null;
 
   let chainVars = {};
-
-  // Pool-based parallel runner: up to PARALLEL_LIMIT simultaneously,
-  // chain vars updated in completion order (ordered by original index).
-  const pending = tests.map((test, i) => ({ test, i }));
-  const inFlight = new Map(); // index → Promise
 
   const runOne = async ({ test, i }) => {
     const testDef = typeof test.test_definition === 'string'
@@ -373,7 +416,20 @@ async function runTestsParallel(tests, baseVars, executionService, userId, onPro
 
     try {
       const resolvedDef = envService.resolveObjectVariables(testDef, vars);
-      // executeTest expects a full test def with name + type at top level
+
+      // For API tests with an active jar, pre-compute the Cookie header for
+      // the resolved URL and stash chain hints onto config. apiRunner reads
+      // these via destructuring and ignores them when absent.
+      if (jar && test.test_type === 'api') {
+        const cfg = resolvedDef.config || resolvedDef;
+        const url = cfg.url;
+        if (url) {
+          const cookieHeader = await cookieJarLib.cookieHeaderFor(jar, url);
+          if (cookieHeader) cfg._chainCookieHeader = cookieHeader;
+          cfg._captureRedirectCookies = true;
+        }
+      }
+
       const fullTest = {
         name: test.name,
         type: test.test_type,
@@ -382,10 +438,16 @@ async function runTestsParallel(tests, baseVars, executionService, userId, onPro
       };
       const result = await executionService.executeTest(userId, null, fullTest);
 
+      // Ingest Set-Cookie from every hop into the jar.
+      if (jar && result.rawResponse?.setCookieRaw?.length) {
+        for (const { url: hopUrl, raw } of result.rawResponse.setCookieRaw) {
+          await cookieJarLib.ingestSetCookies(jar, hopUrl, [raw]);
+        }
+      }
+
       // Update chain vars from this test's extractors
       if (result.extractedVars && Object.keys(result.extractedVars).length) {
         const newChain = envService.buildChainVars(result.rawResponse?.body || {});
-        // Also inject named extractors directly
         for (const [k, v] of Object.entries(result.extractedVars)) {
           newChain[`response.prev.${k}`] = v;
         }
@@ -393,6 +455,16 @@ async function runTestsParallel(tests, baseVars, executionService, userId, onPro
       } else if (result.rawResponse?.body) {
         chainVars = { ...chainVars, ...envService.buildChainVars(result.rawResponse.body) };
       }
+
+      // Strip internal hints + heavy raw cookie list before returning to caller.
+      let cleanRaw = result.rawResponse;
+      if (cleanRaw && cleanRaw.setCookieRaw) {
+        const { setCookieRaw, ...rest } = cleanRaw;
+        cleanRaw = rest;
+        void setCookieRaw;
+      }
+
+      const chainCookiesSnapshot = jar ? await cookieJarLib.snapshot(jar) : null;
 
       const row = {
         testId: test.id,
@@ -402,10 +474,11 @@ async function runTestsParallel(tests, baseVars, executionService, userId, onPro
         status: result.status,
         error: result.error,
         duration: result.duration,
-        rawResponse: result.rawResponse,
+        rawResponse: cleanRaw,
         assertionResults: result.assertionResults || [],
         logs: result.logs || [],
         extractedVars: result.extractedVars || {},
+        chainCookies: chainCookiesSnapshot,
       };
       results[i] = row;
       onProgress && onProgress(i, row);
@@ -423,6 +496,7 @@ async function runTestsParallel(tests, baseVars, executionService, userId, onPro
         assertionResults: [],
         logs: [],
         extractedVars: {},
+        chainCookies: null,
       };
       results[i] = row;
       onProgress && onProgress(i, row);
@@ -430,26 +504,22 @@ async function runTestsParallel(tests, baseVars, executionService, userId, onPro
     }
   };
 
-  // Concurrency pool: dispatch up to PARALLEL_LIMIT, refill as slots open.
-  // We preserve ordering for chain vars by dispatching in sequence and
-  // using Promise.race to drain slots.
-  const queue = [...pending];
+  const queue = tests.map((test, i) => ({ test, i }));
   const active = new Set();
 
-  const dispatch = async (item) => {
+  const dispatch = (item) => {
     const p = runOne(item).finally(() => active.delete(p));
     active.add(p);
     return p;
   };
 
   for (const item of queue) {
-    if (active.size >= PARALLEL_LIMIT) {
+    if (active.size >= effectiveLimit) {
       await Promise.race(active);
     }
     dispatch(item);
   }
 
-  // Wait for all remaining
   await Promise.all(active);
 
   return results;
@@ -461,7 +531,7 @@ async function runTestsParallel(tests, baseVars, executionService, userId, onPro
 router.post('/:id/run', async (req, res, next) => {
   try {
     const col = await db.query(
-      `SELECT id, name FROM collections WHERE id = $3 AND ${accessClause('collections')}`,
+      `SELECT id, name, auto_cookie_jar AS "autoCookieJar" FROM collections WHERE id = $3 AND ${accessClause('collections')}`,
       [...userScope(req), req.params.id]
     );
     if (col.rows.length === 0) throw new NotFoundError('Collection');
@@ -515,7 +585,10 @@ router.post('/:id/run', async (req, res, next) => {
       ).catch(() => {});
     };
 
-    const results = await runTestsParallel(tests, baseVars, executionService, req.user.id, onProgress);
+    const results = await runTestsParallel(
+      tests, baseVars, executionService, req.user.id, onProgress,
+      { autoCookieJar: !!col.rows[0].autoCookieJar }
+    );
 
     const passed = results.filter((r) => r.status === 'passed').length;
     const failed = results.filter((r) => r.status !== 'passed').length;
@@ -546,7 +619,7 @@ router.post('/:id/run', async (req, res, next) => {
 router.get('/:id/run-stream', async (req, res, next) => {
   try {
     const col = await db.query(
-      `SELECT id, name FROM collections WHERE id = $3 AND ${accessClause('collections')}`,
+      `SELECT id, name, auto_cookie_jar AS "autoCookieJar" FROM collections WHERE id = $3 AND ${accessClause('collections')}`,
       [...userScope(req), req.params.id]
     );
     if (col.rows.length === 0) throw new NotFoundError('Collection');
@@ -625,7 +698,10 @@ router.get('/:id/run-stream', async (req, res, next) => {
       });
     };
 
-    await runTestsParallel(tests, baseVars, executionService, req.user.id, onProgress);
+    await runTestsParallel(
+      tests, baseVars, executionService, req.user.id, onProgress,
+      { autoCookieJar: !!col.rows[0].autoCookieJar }
+    );
 
     const passed = allResults.filter((r) => r.status === 'passed').length;
     const failed = allResults.length - passed;

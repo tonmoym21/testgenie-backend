@@ -47,6 +47,9 @@ async function runApiTest(config, envVars = null) {
     method, url, headers = {}, body, assertions = [], timeout = 10000, extractors = [], auth = null,
     bodyType, rawLanguage, formData: formDataFields, urlEncoded: urlEncodedFields, graphql,
     binary,
+    // Chain integration — set by the collection runner; never user-supplied.
+    _chainCookieHeader = null,
+    _captureRedirectCookies = false,
   } = resolvedConfig;
   const effectiveBodyType = bodyType
     || (body !== undefined && body !== null ? 'json' : 'none');
@@ -55,6 +58,9 @@ async function runApiTest(config, envVars = null) {
   let rawResponse = null;
   let assertionResults = [];
   let extractedVars = {};
+  // Aggregated Set-Cookie strings from every hop of any redirect chain we follow.
+  // The orchestrator ingests these into the chain jar.
+  const aggregatedSetCookies = [];
 
   try {
     // Optional pre-flight: POST Basic credentials to a login URL to capture session cookies.
@@ -88,10 +94,20 @@ async function runApiTest(config, envVars = null) {
       headers: { ...headers },
       signal: AbortSignal.timeout(timeout),
     };
-    if (sessionCookie) {
-      fetchOptions.headers['Cookie'] = fetchOptions.headers['Cookie']
-        ? `${fetchOptions.headers['Cookie']}; ${sessionCookie}`
-        : sessionCookie;
+    // Merge cookie sources, in precedence order (later wins on conflict):
+    //   1. user-supplied Cookie header (lowest)
+    //   2. basic-auth pre-flight sessionCookie
+    //   3. chain jar (highest — auto-managed)
+    {
+      const parts = [];
+      const existing = fetchOptions.headers['Cookie'] || fetchOptions.headers['cookie'];
+      if (existing) parts.push(existing);
+      if (sessionCookie) parts.push(sessionCookie);
+      if (_chainCookieHeader) parts.push(_chainCookieHeader);
+      if (parts.length) {
+        delete fetchOptions.headers['cookie'];
+        fetchOptions.headers['Cookie'] = parts.join('; ');
+      }
     }
 
     if (!['GET', 'HEAD'].includes(method.toUpperCase()) && effectiveBodyType !== 'none') {
@@ -167,7 +183,42 @@ async function runApiTest(config, envVars = null) {
       }
     }
 
-    const response = await fetch(url, fetchOptions);
+    // When chaining is active, follow redirects manually so we can capture
+    // Set-Cookie set on intermediate 3xx hops. Otherwise let fetch handle it.
+    let response;
+    if (_captureRedirectCookies) {
+      fetchOptions.redirect = 'manual';
+      let currentUrl = url;
+      let currentOpts = fetchOptions;
+      const maxHops = 10;
+      for (let hop = 0; hop < maxHops; hop++) {
+        response = await fetch(currentUrl, currentOpts);
+        const hopSetCookie = (typeof response.headers.getSetCookie === 'function')
+          ? response.headers.getSetCookie()
+          : (response.headers.get('set-cookie') ? response.headers.get('set-cookie').split(/,(?=[^;]+=)/) : []);
+        for (const sc of hopSetCookie) aggregatedSetCookies.push({ url: currentUrl, raw: sc });
+
+        // Follow 3xx with a Location header
+        const status = response.status;
+        const loc = response.headers.get('location');
+        const isRedirect = status >= 300 && status < 400 && loc;
+        if (!isRedirect) break;
+
+        const nextUrl = new URL(loc, currentUrl).toString();
+        // Per fetch spec: 301/302/303 downgrade to GET and drop body; 307/308 preserve.
+        const downgrade = (status === 301 || status === 302 || status === 303);
+        currentOpts = {
+          ...currentOpts,
+          method: downgrade ? 'GET' : currentOpts.method,
+          body: downgrade ? undefined : currentOpts.body,
+          headers: { ...currentOpts.headers },
+        };
+        if (downgrade) delete currentOpts.headers['Content-Type'];
+        currentUrl = nextUrl;
+      }
+    } else {
+      response = await fetch(url, fetchOptions);
+    }
     const responseTime = Date.now() - startTime;
 
     const contentType = response.headers.get('content-type') || '';
@@ -185,10 +236,35 @@ async function runApiTest(config, envVars = null) {
       log('warn', `Failed to parse response body: ${e.message}`);
     }
 
+    // Capture Set-Cookie from the final response — Headers.entries() collapses duplicates.
+    let finalSetCookieList = [];
+    if (typeof response.headers.getSetCookie === 'function') {
+      finalSetCookieList = response.headers.getSetCookie();
+    } else {
+      const raw = response.headers.get('set-cookie');
+      if (raw) finalSetCookieList = raw.split(/,(?=[^;]+=)/);
+    }
+    // If we followed redirects manually, the aggregated list already contains
+    // every hop including the final one. Otherwise seed it with the final hop.
+    if (!_captureRedirectCookies) {
+      for (const sc of finalSetCookieList) aggregatedSetCookies.push({ url, raw: sc });
+    }
+
+    // Flat name→value map of cookies parsed from the final response (UI display)
+    const cookies = {};
+    for (const sc of finalSetCookieList) {
+      const [pair] = sc.split(';');
+      const eq = pair.indexOf('=');
+      if (eq > 0) cookies[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim();
+    }
+
     rawResponse = {
       statusCode: response.status,
       statusText: response.statusText,
       headers: Object.fromEntries(response.headers.entries()),
+      cookies,
+      // Per-hop raw Set-Cookie strings for the chain jar to ingest. Not for UI.
+      setCookieRaw: aggregatedSetCookies,
       body: responseBody,
       responseTime,
       size: JSON.stringify(responseBody ?? '').length,
@@ -198,15 +274,28 @@ async function runApiTest(config, envVars = null) {
 
     assertionResults = evaluateAssertions(assertions, rawResponse, log);
 
-    // Run extractors for response chaining: [{name: "userId", path: "data.id"}]
-    if (extractors.length > 0 && responseBody && typeof responseBody === 'object') {
+    // Run extractors for response chaining.
+    // source: "body" (JSON path, default), "header" (header name), "cookie" (cookie name)
+    if (extractors.length > 0) {
       for (const ex of extractors) {
-        const val = getNestedValue(responseBody, ex.path);
-        if (val !== undefined) {
-          extractedVars[ex.name] = String(val);
-          log('debug', `Extracted ${ex.name} = ${extractedVars[ex.name]}`);
+        const source = ex.source || 'body';
+        let val;
+        if (source === 'header') {
+          // Header lookup is case-insensitive — Headers normalises to lower-case keys.
+          val = rawResponse.headers[ex.path.toLowerCase()];
+        } else if (source === 'cookie') {
+          val = rawResponse.cookies[ex.path];
         } else {
-          log('warn', `Extractor "${ex.name}": path "${ex.path}" not found in response`);
+          // body
+          if (responseBody && typeof responseBody === 'object') {
+            val = getNestedValue(responseBody, ex.path);
+          }
+        }
+        if (val !== undefined && val !== null) {
+          extractedVars[ex.name] = String(val);
+          log('debug', `Extracted ${ex.name} (${source}:${ex.path}) = ${extractedVars[ex.name]}`);
+        } else {
+          log('warn', `Extractor "${ex.name}": ${source} "${ex.path}" not found in response`);
         }
       }
     }

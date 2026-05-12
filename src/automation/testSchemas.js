@@ -41,9 +41,11 @@ const apiTestSchema = z.object({
       })
     ).min(1).max(20),
     timeout: z.number().default(10000),
-    // Response chaining extractors: [{name: "userId", path: "data.id"}]
+    // Response chaining extractors: [{name: "userId", source: "body", path: "data.id"}]
+    // source: "body" (JSON path), "header" (header name), or "cookie" (cookie name)
     extractors: z.array(z.object({
       name: z.string().min(1),
+      source: z.enum(['body', 'header', 'cookie']).optional().default('body'),
       path: z.string().min(1),
     })).optional(),
   }),
