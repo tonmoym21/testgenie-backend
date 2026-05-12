@@ -150,6 +150,9 @@ logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backen
       `CREATE INDEX IF NOT EXISTS idx_team_audit_logs_actor ON team_audit_logs(actor_id)`,
       `CREATE INDEX IF NOT EXISTS idx_team_audit_logs_action ON team_audit_logs(action)`,
       `CREATE INDEX IF NOT EXISTS idx_team_audit_logs_created ON team_audit_logs(created_at DESC)`,
+
+      // ── API request chaining: per-collection auto cookie jar toggle ──
+      `ALTER TABLE collections ADD COLUMN IF NOT EXISTS auto_cookie_jar BOOLEAN NOT NULL DEFAULT false`,
     ];
     for (const sql of statements) {
       try {
