@@ -226,6 +226,7 @@ const jiraRoutes = safeRequire('./routes/jira', 'jira');
 const folderRoutes = safeRequire('./routes/folders', 'folders');
 const testRunRoutes = safeRequire('./routes/testRuns', 'testRuns');
 const projectInsightsRoutes = safeRequire('./routes/projectInsights', 'projectInsights');
+const webhookRoutes = safeRequire('./routes/webhooks', 'webhooks');
 
 // ============================================================================
 // CORS — credentials: true so the HttpOnly refresh cookie flows on /auth/refresh
@@ -276,7 +277,17 @@ app.use(cors(buildCorsOptions()));
 // ============================================================================
 // BODY PARSING + GLOBAL RATE LIMIT
 // ============================================================================
-app.use(express.json({ limit: '10mb' }));
+// GitHub webhook handlers need the raw request body to recompute the HMAC
+// over the exact bytes GitHub signed. Stashing buf on req for /api/webhooks/*
+// only — keeps memory cost off every other request.
+app.use(express.json({
+  limit: '10mb',
+  verify: (req, _res, buf) => {
+    if (req.url && req.url.startsWith('/api/webhooks/')) {
+      req.rawBody = buf;
+    }
+  },
+}));
 // rateLimiter is the generalLimiter middleware (default export). It skips
 // /health, /healthz, /api/health and /api/version automatically.
 app.use(rateLimiter);
@@ -367,6 +378,9 @@ app.use('/api/jira', jiraRoutes);
 // Sharing is mounted as a sub-router on collections: /api/collections/:id/share
 // sharing router uses mergeParams to read req.params.id
 app.use('/api/collections/:id/share', sharingRoutes);
+
+// Webhooks — public (HMAC-verified inside the handler), no auth middleware.
+app.use('/api/webhooks', webhookRoutes);
 
 // Execute routes LAST — mounted at /api with `router.use(authenticate)` inside.
 app.use('/api', executeRoutes);
