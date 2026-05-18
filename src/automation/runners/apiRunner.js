@@ -294,28 +294,49 @@ async function runApiTest(config, envVars = null) {
           if (bag && typeof bag === 'object' && !Array.isArray(bag)) {
             // Unwrap CloudFront-style `{value, domain, expires, ...}` envelopes —
             // engagedly's login returns several cookies in this shape — so we
-            // store the actual cookie value, not `[object Object]`.
-            const toCookieValue = (v) => {
+            // store the actual cookie value, not `[object Object]`, and we
+            // honour the envelope's Domain so signed CDN cookies scope across
+            // subdomains correctly.
+            const toCookieFields = (v) => {
               if (v == null) return null;
               if (typeof v === 'object') {
-                if (v.value !== undefined) return v.value;
-                return null; // nested object with no .value isn't a cookie
+                if (v.value === undefined) return null;
+                return { value: v.value, domain: v.domain || null };
               }
-              return v;
+              return { value: v, domain: null };
             };
+            // For bare-string cookies (no envelope domain), default to the
+            // request URL's parent host so sibling subdomains of the same site
+            // receive them. APIs return their session expecting cross-subdomain
+            // use (eauth.example.com → app.example.com); without this default
+            // tough-cookie scopes the cookie to the auth host only and every
+            // downstream request 401s. Heuristic: drop the first label of a
+            // 3+ part hostname; pass through hostnames with <= 2 labels and
+            // raw IPs unchanged.
+            let defaultDomain = null;
+            try {
+              const host = new URL(url).hostname;
+              if (!/^[\d.]+$/.test(host) && !host.includes(':')) {
+                const parts = host.split('.');
+                defaultDomain = parts.length > 2 ? parts.slice(1).join('.') : null;
+              }
+            } catch { /* malformed url — leave domain unset */ }
+
             let pushed = 0;
-            for (const [name, raw] of Object.entries(bag)) {
-              const value = toCookieValue(raw);
-              if (value == null) continue;
-              // tough-cookie tolerates unquoted values; we leave any %-encoding
-              // intact so the cookie is sent exactly as the server emitted it.
-              const setCookie = `${name}=${String(value)}; Path=/`;
-              aggregatedSetCookies.push({ url, raw: setCookie });
+            for (const [name, rawValue] of Object.entries(bag)) {
+              const fields = toCookieFields(rawValue);
+              if (!fields) continue;
+              const domain = fields.domain || defaultDomain;
+              // tough-cookie tolerates unquoted values; %-encoding stays intact
+              // so the cookie is sent exactly as the server emitted it.
+              const parts = [`${name}=${String(fields.value)}`, 'Path=/'];
+              if (domain) parts.push(`Domain=${domain}`);
+              aggregatedSetCookies.push({ url, raw: parts.join('; ') });
               // Mirror into rawResponse.cookies so the UI Cookies tab surfaces them
-              rawResponse.cookies[name] = String(value);
+              rawResponse.cookies[name] = String(fields.value);
               pushed += 1;
             }
-            log('debug', `body-cookies extractor ingested ${pushed} cookie(s) from body.${ex.path}`);
+            log('debug', `body-cookies extractor ingested ${pushed} cookie(s) from body.${ex.path} (default domain: ${defaultDomain || 'none'})`);
           } else {
             log('warn', `Extractor "${ex.name || 'body-cookies'}": body path "${ex.path}" did not resolve to an object`);
           }
