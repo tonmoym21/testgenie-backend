@@ -214,6 +214,37 @@ async function runApiTest(config, envVars = null) {
       }
     }
 
+    // Dump the resolved outbound request to the logs so users can diff
+    // against an equivalent Postman / curl request when debugging auth or
+    // WAF rejections. We log every header (cookies included) — this is a
+    // test tool the user owns, and seeing the actual Cookie attached is
+    // exactly the kind of thing you need when an upstream is 401-ing.
+    {
+      const hdrLines = Object.entries(fetchOptions.headers || {})
+        .map(([k, v]) => `  ${k}: ${typeof v === 'string' && v.length > 400 ? v.slice(0, 400) + '… [+' + (v.length - 400) + ' chars]' : v}`)
+        .join('\n');
+      log('debug', `→ ${method} ${url}\n${hdrLines || '  (no headers)'}`);
+      if (fetchOptions.body != null) {
+        let bodyDesc;
+        if (typeof fetchOptions.body === 'string') {
+          bodyDesc = fetchOptions.body.length > 600
+            ? fetchOptions.body.slice(0, 600) + `… [+${fetchOptions.body.length - 600} chars]`
+            : fetchOptions.body;
+          log('debug', `→ body (${fetchOptions.body.length} chars): ${bodyDesc}`);
+        } else if (fetchOptions.body instanceof Buffer) {
+          log('debug', `→ body: <${fetchOptions.body.length} bytes binary>`);
+        } else if (typeof FormData !== 'undefined' && fetchOptions.body instanceof FormData) {
+          const parts = [];
+          for (const [k] of fetchOptions.body.entries()) parts.push(k);
+          log('debug', `→ body: multipart/form-data fields [${parts.join(', ')}]`);
+        } else {
+          log('debug', `→ body: <${typeof fetchOptions.body}>`);
+        }
+      } else {
+        log('debug', '→ body: (none)');
+      }
+    }
+
     // When chaining is active, follow redirects manually so we can capture
     // Set-Cookie set on intermediate 3xx hops. Otherwise let fetch handle it.
     let response;
