@@ -11,7 +11,24 @@ const { NotFoundError } = require('../utils/apiError');
  */
 
 // Matches: {{VAR}}, {{env:VAR}}, {{response.prev.field.nested}}
-const VAR_PATTERN = /\{\{(env:[A-Za-z_][A-Za-z0-9_]*|response\.prev\.[A-Za-z_][A-Za-z0-9_.]*|[A-Za-z_][A-Za-z0-9_]*)\}\}/g;
+// Plus user-friendly aliases that also resolve to response.prev.*:
+//   {{prev.X}}, {{previous.X}}, {{previous.prev.X}}, {{previous.rev.X}}
+// (`previous.rev` is a common typo for `previous.prev`/`response.prev` — we
+// just treat it as the same thing instead of silently passing the literal
+// `{{...}}` through to whatever HTTP header the user pasted it into.)
+const VAR_PATTERN = /\{\{(env:[A-Za-z_][A-Za-z0-9_]*|(?:response\.prev|previous\.prev|previous\.rev|previous|prev)\.[A-Za-z_][A-Za-z0-9_.]*|[A-Za-z_][A-Za-z0-9_]*)\}\}/g;
+
+const PREV_ALIAS_PREFIXES = ['previous.prev.', 'previous.rev.', 'previous.', 'prev.'];
+
+// Normalise any of the alias prefixes to the canonical `response.prev.` form
+// so callers don't need to store multiple keys in their chain-vars map.
+function canonicaliseToken(token) {
+  if (token.startsWith('env:')) return token;
+  for (const p of PREV_ALIAS_PREFIXES) {
+    if (token.startsWith(p)) return 'response.prev.' + token.slice(p.length);
+  }
+  return token;
+}
 
 async function getEnvironments(userId) {
   const result = await db.query(
@@ -68,12 +85,18 @@ async function createEnvironment(userId, data) {
 function resolveVariables(text, variables) {
   if (!text || typeof text !== 'string') return text;
   return text.replace(VAR_PATTERN, (match, token) => {
-    // Normalise env: prefix → bare key
-    const key = token.startsWith('env:') ? token.slice(4) : token;
-    if (key in variables) return variables[key];
-    // response.prev.* may be stored under full dotted key
+    // 1. env: prefix → strip
+    const envKey = token.startsWith('env:') ? token.slice(4) : null;
+    if (envKey && envKey in variables) return variables[envKey];
+
+    // 2. prev/previous/previous.rev/previous.prev → response.prev (alias)
+    const canonical = canonicaliseToken(token);
+    if (canonical in variables) return variables[canonical];
+
+    // 3. raw token (covers simple {{VAR}})
     if (token in variables) return variables[token];
-    logger.warn({ token }, 'Unresolved variable');
+
+    logger.warn({ token, canonical }, 'Unresolved variable');
     return match;
   });
 }

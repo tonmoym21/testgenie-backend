@@ -319,7 +319,32 @@ async function runApiTest(config, envVars = null) {
           // Header lookup is case-insensitive — Headers normalises to lower-case keys.
           val = rawResponse.headers[ex.path.toLowerCase()];
         } else if (source === 'cookie') {
+          // 1) Real Set-Cookie cookies first (the textbook case).
           val = rawResponse.cookies[ex.path];
+          // 2) Fallback for APIs that return their session in the JSON body
+          //    under a `cookie` / `cookies` field instead of Set-Cookie. Walk
+          //    the most common shapes so users with source=cookie aren't
+          //    silently empty-handed on engagedly-style APIs.
+          if ((val == null) && responseBody && typeof responseBody === 'object') {
+            const bodyBags = [
+              responseBody.cookie,
+              responseBody.cookies,
+              responseBody.data && responseBody.data.cookie,
+              responseBody.data && responseBody.data.cookies,
+            ];
+            for (const bag of bodyBags) {
+              if (bag && typeof bag === 'object') {
+                const candidate = getNestedValue(bag, ex.path);
+                if (candidate !== undefined && candidate !== null) {
+                  val = (typeof candidate === 'object' && candidate.value !== undefined)
+                    ? candidate.value
+                    : candidate;
+                  log('debug', `cookie extractor "${ex.name}" resolved from body fallback`);
+                  break;
+                }
+              }
+            }
+          }
         } else {
           // body
           if (responseBody && typeof responseBody === 'object') {
