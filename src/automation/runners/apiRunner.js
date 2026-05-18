@@ -14,6 +14,33 @@ function deleteContentTypeHeader(headers) {
   }
 }
 
+function hasHeaderCI(headers, name) {
+  const want = name.toLowerCase();
+  return Object.keys(headers || {}).some((k) => k.toLowerCase() === want);
+}
+
+/**
+ * Postman-mimicking client defaults: many APIs sit behind WAFs (CloudFront,
+ * Cloudflare, Akamai) that allowlist Postman / browser-shaped requests and
+ * 401 anything without a recognisable User-Agent + Accept pair. Apply these
+ * only when the user hasn't set the same header themselves.
+ *
+ * Bumping the PostmanRuntime version string here is fine — the user-agent
+ * pattern matters more than the exact version for WAF allow-lists.
+ */
+const DEFAULT_REQUEST_HEADERS = {
+  'User-Agent': 'PostmanRuntime/7.42.0',
+  'Accept': '*/*',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'Connection': 'keep-alive',
+};
+
+function applyClientDefaults(headers) {
+  for (const [k, v] of Object.entries(DEFAULT_REQUEST_HEADERS)) {
+    if (!hasHeaderCI(headers, k)) headers[k] = v;
+  }
+}
+
 const envService = require('../../services/environmentService');
 
 /**
@@ -94,6 +121,10 @@ async function runApiTest(config, envVars = null) {
       headers: { ...headers },
       signal: AbortSignal.timeout(timeout),
     };
+    // Apply Postman-like default headers (User-Agent, Accept, etc.) when the
+    // user hasn't set them. Several APIs behind CDN WAFs 401 anything that
+    // doesn't look like Postman/a browser.
+    applyClientDefaults(fetchOptions.headers);
     // Merge cookie sources, in precedence order (later wins on conflict):
     //   1. user-supplied Cookie header (lowest)
     //   2. basic-auth pre-flight sessionCookie
