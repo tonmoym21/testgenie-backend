@@ -42,12 +42,21 @@ const apiTestSchema = z.object({
     ).min(1).max(20),
     timeout: z.number().default(10000),
     // Response chaining extractors: [{name: "userId", source: "body", path: "data.id"}]
-    // source: "body" (JSON path), "header" (header name), or "cookie" (cookie name)
+    // source:
+    //   "body"          — JSON path on response body, bound to extractedVars[name]
+    //   "header"        — header name, bound to extractedVars[name]
+    //   "cookie"        — cookie name from Set-Cookie, bound to extractedVars[name]
+    //   "body-cookies"  — JSON path on body to an object; every key/value is
+    //                     ingested into the chain cookie jar as a synthetic
+    //                     Set-Cookie. `name` is unused for this source.
     extractors: z.array(z.object({
-      name: z.string().min(1),
-      source: z.enum(['body', 'header', 'cookie']).optional().default('body'),
+      name: z.string().optional().default(''),
+      source: z.enum(['body', 'header', 'cookie', 'body-cookies']).optional().default('body'),
       path: z.string().min(1),
-    })).optional(),
+    }).refine(
+      (ex) => (ex.source === 'body-cookies') || (ex.name && ex.name.length > 0),
+      { message: 'name is required unless source is body-cookies', path: ['name'] }
+    )).optional(),
   }),
 });
 

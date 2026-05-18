@@ -275,10 +275,45 @@ async function runApiTest(config, envVars = null) {
     assertionResults = evaluateAssertions(assertions, rawResponse, log);
 
     // Run extractors for response chaining.
-    // source: "body" (JSON path, default), "header" (header name), "cookie" (cookie name)
+    // source: "body" (JSON path, default), "header" (header name),
+    //         "cookie" (cookie name from Set-Cookie header),
+    //         "body-cookies" (path → object on body; each key/value is fed
+    //         into the chain cookie jar as a synthetic Set-Cookie — for APIs
+    //         that return their session as JSON instead of Set-Cookie).
     if (extractors.length > 0) {
       for (const ex of extractors) {
         const source = ex.source || 'body';
+
+        if (source === 'body-cookies') {
+          // `path` resolves to an object in the response body; each entry
+          // becomes a `name=value` cookie pushed onto the same aggregated
+          // Set-Cookie list the chain orchestrator already ingests.
+          const bag = (responseBody && typeof responseBody === 'object')
+            ? getNestedValue(responseBody, ex.path)
+            : null;
+          if (bag && typeof bag === 'object' && !Array.isArray(bag)) {
+            let pushed = 0;
+            for (const [name, value] of Object.entries(bag)) {
+              if (value == null) continue;
+              // Quote values containing characters that would break parsing;
+              // tough-cookie ingestSetCookies tolerates either form.
+              const raw = `${name}=${String(value)}; Path=/`;
+              aggregatedSetCookies.push({ url, raw });
+              pushed += 1;
+            }
+            // Mirror these into rawResponse.cookies so the UI Cookies tab
+            // shows them alongside any real Set-Cookie cookies.
+            for (const [name, value] of Object.entries(bag)) {
+              if (value == null) continue;
+              rawResponse.cookies[name] = String(value);
+            }
+            log('debug', `body-cookies extractor ingested ${pushed} cookie(s) from body.${ex.path}`);
+          } else {
+            log('warn', `Extractor "${ex.name || 'body-cookies'}": body path "${ex.path}" did not resolve to an object`);
+          }
+          continue;
+        }
+
         let val;
         if (source === 'header') {
           // Header lookup is case-insensitive — Headers normalises to lower-case keys.
