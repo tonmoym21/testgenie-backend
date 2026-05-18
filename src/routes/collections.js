@@ -8,6 +8,8 @@ const envService = require('../services/environmentService');
 const runReportService = require('../services/runReportService');
 const emailService = require('../services/emailService');
 const logger = require('../utils/logger');
+const chainSessions = require('../automation/chainSessions');
+const cookieJarLib = require('../automation/cookieJar');
 
 const router = Router();
 router.use(authenticate);
@@ -287,6 +289,11 @@ router.delete('/:colId/tests/:testId', async (req, res, next) => {
 });
 
 // POST /api/collections/:colId/tests/:testId/run — run a single test
+// Chains with previous individual runs in the same (user, collection) chain
+// session: cookies set + chainVars extracted by an earlier ▶️ click on
+// another step are carried into this run. Mirrors the orchestration the
+// Run-All / run-stream path applies for full-collection runs, so the
+// debug-one-step-at-a-time flow doesn't silently lose state between clicks.
 router.post('/:colId/tests/:testId/run', async (req, res, next) => {
   try {
     await assertCollectionAccess(req, req.params.colId);
@@ -299,9 +306,26 @@ router.post('/:colId/tests/:testId/run', async (req, res, next) => {
 
     const { environmentId } = req.body || {};
     const baseVars = await envService.buildVariableContext(req.user.id, environmentId || null);
+
+    const session = chainSessions.getOrCreate(req.user.id, parseInt(req.params.colId, 10));
+    const vars = { ...baseVars, ...session.chainVars };
+
     const row = t.rows[0];
     const testDef = typeof row.test_definition === 'string' ? JSON.parse(row.test_definition) : row.test_definition;
-    const resolvedDef = envService.resolveObjectVariables(testDef, baseVars);
+    const resolvedDef = envService.resolveObjectVariables(testDef, vars);
+
+    // For API tests, hand the session jar's matching Cookie header to the
+    // runner. Mirrors the collection runner's chain hint contract.
+    if (row.test_type === 'api') {
+      const cfg = resolvedDef.config || resolvedDef;
+      const url = cfg.url;
+      if (url) {
+        const cookieHeader = await cookieJarLib.cookieHeaderFor(session.jar, url);
+        if (cookieHeader) cfg._chainCookieHeader = cookieHeader;
+        cfg._captureRedirectCookies = true;
+      }
+    }
+
     const fullTest = {
       name: row.name,
       type: row.test_type,
@@ -311,6 +335,35 @@ router.post('/:colId/tests/:testId/run', async (req, res, next) => {
     const executionService = require('../automation/executionService');
     const result = await executionService.executeTest(req.user.id, null, fullTest);
 
+    // Ingest Set-Cookie from every hop (including synthetic body-cookies)
+    // back into the session jar so the next single-test run sees them.
+    if (result.rawResponse?.setCookieRaw?.length) {
+      for (const { url: hopUrl, raw } of result.rawResponse.setCookieRaw) {
+        await cookieJarLib.ingestSetCookies(session.jar, hopUrl, [raw]);
+      }
+    }
+
+    // Roll forward chain vars from extractors + response body.
+    if (result.extractedVars && Object.keys(result.extractedVars).length) {
+      const fresh = envService.buildChainVars(result.rawResponse?.body || {});
+      for (const [k, v] of Object.entries(result.extractedVars)) {
+        fresh[`response.prev.${k}`] = v;
+      }
+      session.chainVars = { ...session.chainVars, ...fresh };
+    } else if (result.rawResponse?.body) {
+      session.chainVars = { ...session.chainVars, ...envService.buildChainVars(result.rawResponse.body) };
+    }
+
+    // Strip internal-only setCookieRaw before returning to the caller.
+    let cleanRaw = result.rawResponse;
+    if (cleanRaw && cleanRaw.setCookieRaw) {
+      const { setCookieRaw, ...rest } = cleanRaw;
+      cleanRaw = rest;
+      void setCookieRaw;
+    }
+
+    const sessionStatus = await chainSessions.status(req.user.id, parseInt(req.params.colId, 10));
+
     res.json({
       testId: row.id,
       name: row.name,
@@ -319,11 +372,32 @@ router.post('/:colId/tests/:testId/run', async (req, res, next) => {
       status: result.status,
       duration: result.duration,
       error: result.error,
-      rawResponse: result.rawResponse,
+      rawResponse: cleanRaw,
       assertionResults: result.assertionResults || [],
       logs: result.logs || [],
       extractedVars: result.extractedVars || {},
+      session: sessionStatus,
     });
+  } catch (err) { next(err); }
+});
+
+// GET /api/collections/:colId/session — chain session status (cookie count,
+// var count, age). Used by the UI to render the session badge.
+router.get('/:colId/session', async (req, res, next) => {
+  try {
+    await assertCollectionAccess(req, req.params.colId);
+    res.json(await chainSessions.status(req.user.id, parseInt(req.params.colId, 10)));
+  } catch (err) { next(err); }
+});
+
+// DELETE /api/collections/:colId/session — drop the chain session so the
+// next individual run starts cold (clears cookies + chainVars). Doesn't
+// touch persistent data.
+router.delete('/:colId/session', async (req, res, next) => {
+  try {
+    await assertCollectionAccess(req, req.params.colId);
+    chainSessions.reset(req.user.id, parseInt(req.params.colId, 10));
+    res.json({ active: false });
   } catch (err) { next(err); }
 });
 
@@ -351,7 +425,6 @@ async function fetchTestsForRun(collectionId, { folderId, testIds }) {
  * @param {Function} onProgress - Called after each test completes: (index, result)
  */
 const PARALLEL_LIMIT = 5;
-const cookieJarLib = require('../automation/cookieJar');
 
 /**
  * Decide whether this collection run needs chain semantics (= serial execution).

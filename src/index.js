@@ -24,8 +24,8 @@ const rateLimiter = require('./middleware/rateLimiter'); // default export = gen
 const app = express();
 
 // Build info for deployment verification
-const BUILD_VERSION = '2.8.3';
-const BUILD_DATE = '2026-05-18T06:55:00Z';
+const BUILD_VERSION = '2.9.0';
+const BUILD_DATE = '2026-05-18T07:10:00Z';
 
 logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backend starting...');
 
