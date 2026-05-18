@@ -292,20 +292,28 @@ async function runApiTest(config, envVars = null) {
             ? getNestedValue(responseBody, ex.path)
             : null;
           if (bag && typeof bag === 'object' && !Array.isArray(bag)) {
+            // Unwrap CloudFront-style `{value, domain, expires, ...}` envelopes —
+            // engagedly's login returns several cookies in this shape — so we
+            // store the actual cookie value, not `[object Object]`.
+            const toCookieValue = (v) => {
+              if (v == null) return null;
+              if (typeof v === 'object') {
+                if (v.value !== undefined) return v.value;
+                return null; // nested object with no .value isn't a cookie
+              }
+              return v;
+            };
             let pushed = 0;
-            for (const [name, value] of Object.entries(bag)) {
+            for (const [name, raw] of Object.entries(bag)) {
+              const value = toCookieValue(raw);
               if (value == null) continue;
-              // Quote values containing characters that would break parsing;
-              // tough-cookie ingestSetCookies tolerates either form.
-              const raw = `${name}=${String(value)}; Path=/`;
-              aggregatedSetCookies.push({ url, raw });
-              pushed += 1;
-            }
-            // Mirror these into rawResponse.cookies so the UI Cookies tab
-            // shows them alongside any real Set-Cookie cookies.
-            for (const [name, value] of Object.entries(bag)) {
-              if (value == null) continue;
+              // tough-cookie tolerates unquoted values; we leave any %-encoding
+              // intact so the cookie is sent exactly as the server emitted it.
+              const setCookie = `${name}=${String(value)}; Path=/`;
+              aggregatedSetCookies.push({ url, raw: setCookie });
+              // Mirror into rawResponse.cookies so the UI Cookies tab surfaces them
               rawResponse.cookies[name] = String(value);
+              pushed += 1;
             }
             log('debug', `body-cookies extractor ingested ${pushed} cookie(s) from body.${ex.path}`);
           } else {
