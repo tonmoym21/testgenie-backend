@@ -35,6 +35,7 @@ function buildHandler(deps = {}) {
   const db = deps.db || require('../db');
   const logger = deps.logger || require('../utils/logger');
   const markMerged = deps.markMerged || require('../services/autoFixVerifyService').markMerged;
+  const repoConfig = deps.repoConfig || require('../services/repoConfigService');
   const getSecret = deps.getSecret || (() => process.env.GITHUB_WEBHOOK_SECRET);
 
   return async function handleGithubWebhook(req, res) {
@@ -70,16 +71,46 @@ function buildHandler(deps = {}) {
       return res.status(200).json({ status: 'ignored', reason: 'no_head_ref' });
     }
 
+    // GitHub gives us the merged PR's base repo as 'owner/name'. We use this
+    // to scope the lookup to one project's config — see below.
+    const githubRepo = payload.pull_request.base
+      && payload.pull_request.base.repo
+      && payload.pull_request.base.repo.full_name;
+
     // Look up the fix_attempt by branch_name. Auto-fix branches follow the
     // pattern 'testforge/autofix/failure-<id>-<shortsha>' (set in apply
-    // service) so unrelated PRs simply won't match.
+    // service) so unrelated PRs simply won't match. We also pull project_id
+    // (via test_failures) so the multi-tenant scope check below can run.
     const lookup = await db.query(
-      `SELECT id, status FROM fix_attempts WHERE branch_name = $1 ORDER BY id DESC LIMIT 1`,
+      `SELECT fa.id, fa.status, tf.project_id
+         FROM fix_attempts fa
+         JOIN test_failures tf ON tf.id = fa.test_failure_id
+        WHERE fa.branch_name = $1
+        ORDER BY fa.id DESC LIMIT 1`,
       [branch]
     );
     const row = lookup.rows[0];
     if (!row) {
       return res.status(200).json({ status: 'ignored', reason: 'no_fix_attempt_for_branch', branch });
+    }
+
+    // Defense in depth for multi-tenant deploys: if this incoming PR's
+    // GitHub repo is registered with a project_repo_configs row, the
+    // fix_attempt's project_id MUST match that config's project_id.
+    // Without this check, a customer who happens to name their branch
+    // identically to our autofix pattern could spoof a merge event into
+    // someone else's project. When no config exists for this repo
+    // (legacy single-tenant setup) we skip the check — current behaviour.
+    if (githubRepo) {
+      let cfg = null;
+      try { cfg = await repoConfig.getByGithubRepo(githubRepo, { db }); }
+      catch (err) { logger.warn({ err: err.message, githubRepo }, 'webhook: repo config lookup failed'); }
+      if (cfg && cfg.project_id !== row.project_id) {
+        logger.warn({ event: 'webhook.cross_tenant_attempt',
+          githubRepo, cfgProjectId: cfg.project_id, fixAttemptProjectId: row.project_id,
+          fixAttemptId: row.id, branch }, 'webhook: cross-tenant branch collision rejected');
+        return res.status(200).json({ status: 'ignored', reason: 'cross_tenant_mismatch' });
+      }
     }
 
     // If it's already merged, treat as idempotent success.

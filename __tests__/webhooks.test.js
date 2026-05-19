@@ -42,21 +42,32 @@ function makeDb(rowsByPattern = []) {
   };
 }
 
-function buildApp({ db, markMerged, getSecret = () => SECRET } = {}) {
+function buildApp({ db, markMerged, repoConfig, getSecret = () => SECRET } = {}) {
   const app = express();
   app.use(express.json({
     verify: (req, _res, buf) => {
       if (req.url && req.url.startsWith('/api/webhooks/')) req.rawBody = buf;
     },
   }));
-  const handler = buildHandler({ db, logger: silentLogger, markMerged, getSecret });
+  // Default repoConfig stub returns null for everything so legacy tests behave
+  // exactly as before — the scope check is a no-op when no config row exists.
+  const repoConfigStub = repoConfig || {
+    getByGithubRepo: jest.fn().mockResolvedValue(null),
+  };
+  const handler = buildHandler({
+    db, logger: silentLogger, markMerged, repoConfig: repoConfigStub, getSecret,
+  });
   app.post('/api/webhooks/github', handler);
   return app;
 }
 
-const mergedPrPayload = (branch = 'testforge/autofix/failure-42-abc12345') => ({
+const mergedPrPayload = (branch = 'testforge/autofix/failure-42-abc12345', repoFullName = 'acme/widgets') => ({
   action: 'closed',
-  pull_request: { merged: true, head: { ref: branch } },
+  pull_request: {
+    merged: true,
+    head: { ref: branch },
+    base: { repo: { full_name: repoFullName } },
+  },
 });
 
 describe('verifySignature', () => {
@@ -127,7 +138,7 @@ describe('POST /api/webhooks/github', () => {
 
   it('ignores merged PR whose branch does not match any fix_attempt', async () => {
     const db = makeDb([
-      [/FROM fix_attempts WHERE branch_name/, { rows: [], rowCount: 0 }],
+      [/FROM fix_attempts fa.*JOIN test_failures/s, { rows: [], rowCount: 0 }],
     ]);
     const markMerged = jest.fn();
     const app = buildApp({ db, markMerged });
@@ -144,8 +155,8 @@ describe('POST /api/webhooks/github', () => {
 
   it('calls markMerged for a matched verified fix_attempt and returns merged', async () => {
     const db = makeDb([
-      [/FROM fix_attempts WHERE branch_name/, {
-        rows: [{ id: 99, status: 'verified' }], rowCount: 1,
+      [/FROM fix_attempts fa.*JOIN test_failures/s, {
+        rows: [{ id: 99, status: 'verified', project_id: 5 }], rowCount: 1,
       }],
     ]);
     const markMerged = jest.fn().mockResolvedValue({ fixAttemptId: 99, status: 'merged', failureId: 42 });
@@ -168,8 +179,8 @@ describe('POST /api/webhooks/github', () => {
 
   it('returns already_merged (no second markMerged) when row.status is merged', async () => {
     const db = makeDb([
-      [/FROM fix_attempts WHERE branch_name/, {
-        rows: [{ id: 99, status: 'merged' }], rowCount: 1,
+      [/FROM fix_attempts fa.*JOIN test_failures/s, {
+        rows: [{ id: 99, status: 'merged', project_id: 5 }], rowCount: 1,
       }],
     ]);
     const markMerged = jest.fn();
@@ -187,8 +198,8 @@ describe('POST /api/webhooks/github', () => {
 
   it('swallows markMerged invalid-state errors as 200 ignored (no retry storm)', async () => {
     const db = makeDb([
-      [/FROM fix_attempts WHERE branch_name/, {
-        rows: [{ id: 99, status: 'verify_failed' }], rowCount: 1,
+      [/FROM fix_attempts fa.*JOIN test_failures/s, {
+        rows: [{ id: 99, status: 'verify_failed', project_id: 5 }], rowCount: 1,
       }],
     ]);
     const markMerged = jest.fn().mockRejectedValue(new Error('markMerged needs "verified" or "pr_opened"'));
@@ -202,5 +213,112 @@ describe('POST /api/webhooks/github', () => {
       .expect(200);
     expect(res.body.status).toBe('ignored');
     expect(res.body.reason).toBe('invalid_state');
+  });
+
+  // -------------------------------------------------------------------------
+  // Multi-tenant scope check: when a project_repo_configs row exists for the
+  // incoming github_repo, the fix_attempt's project_id MUST match. This is
+  // defense in depth against another customer naming a branch identically
+  // to our autofix pattern and spoofing a merge event into someone else's
+  // project. When no config exists (legacy single-tenant deploys) the
+  // check is a no-op — see the legacy tests above which all pass a stub
+  // repoConfig that returns null.
+  // -------------------------------------------------------------------------
+
+  it('rejects cross-tenant branch collision (config project ≠ fix_attempt project)', async () => {
+    const db = makeDb([
+      [/FROM fix_attempts fa.*JOIN test_failures/s, {
+        rows: [{ id: 99, status: 'verified', project_id: 7 }], rowCount: 1,
+      }],
+    ]);
+    const markMerged = jest.fn();
+    const repoConfig = {
+      getByGithubRepo: jest.fn().mockResolvedValue({ project_id: 999, github_repo: 'acme/widgets' }),
+    };
+    const app = buildApp({ db, markMerged, repoConfig });
+
+    const body = mergedPrPayload();  // base.repo.full_name = 'acme/widgets'
+    const res = await request(app)
+      .post('/api/webhooks/github')
+      .set('x-hub-signature-256', sign(body))
+      .set('x-github-event', 'pull_request')
+      .send(body)
+      .expect(200);
+
+    expect(res.body.reason).toBe('cross_tenant_mismatch');
+    expect(repoConfig.getByGithubRepo).toHaveBeenCalledWith('acme/widgets', expect.any(Object));
+    expect(markMerged).not.toHaveBeenCalled();
+  });
+
+  it('proceeds when config.project_id matches fix_attempt.project_id', async () => {
+    const db = makeDb([
+      [/FROM fix_attempts fa.*JOIN test_failures/s, {
+        rows: [{ id: 99, status: 'verified', project_id: 7 }], rowCount: 1,
+      }],
+    ]);
+    const markMerged = jest.fn().mockResolvedValue({ fixAttemptId: 99, status: 'merged', failureId: 42 });
+    const repoConfig = {
+      getByGithubRepo: jest.fn().mockResolvedValue({ project_id: 7, github_repo: 'acme/widgets' }),
+    };
+    const app = buildApp({ db, markMerged, repoConfig });
+
+    const body = mergedPrPayload();
+    const res = await request(app)
+      .post('/api/webhooks/github')
+      .set('x-hub-signature-256', sign(body))
+      .set('x-github-event', 'pull_request')
+      .send(body)
+      .expect(200);
+
+    expect(res.body.status).toBe('merged');
+    expect(markMerged).toHaveBeenCalledTimes(1);
+  });
+
+  it('proceeds when no config exists for the repo (legacy single-tenant)', async () => {
+    const db = makeDb([
+      [/FROM fix_attempts fa.*JOIN test_failures/s, {
+        rows: [{ id: 99, status: 'verified', project_id: 7 }], rowCount: 1,
+      }],
+    ]);
+    const markMerged = jest.fn().mockResolvedValue({ fixAttemptId: 99, status: 'merged', failureId: 42 });
+    const repoConfig = { getByGithubRepo: jest.fn().mockResolvedValue(null) };
+    const app = buildApp({ db, markMerged, repoConfig });
+
+    const body = mergedPrPayload();
+    await request(app)
+      .post('/api/webhooks/github')
+      .set('x-hub-signature-256', sign(body))
+      .set('x-github-event', 'pull_request')
+      .send(body)
+      .expect(200);
+
+    expect(repoConfig.getByGithubRepo).toHaveBeenCalled();
+    expect(markMerged).toHaveBeenCalledTimes(1);
+  });
+
+  it('proceeds when payload has no base.repo.full_name (skips scope check)', async () => {
+    const db = makeDb([
+      [/FROM fix_attempts fa.*JOIN test_failures/s, {
+        rows: [{ id: 99, status: 'verified', project_id: 7 }], rowCount: 1,
+      }],
+    ]);
+    const markMerged = jest.fn().mockResolvedValue({ fixAttemptId: 99, status: 'merged', failureId: 42 });
+    const repoConfig = { getByGithubRepo: jest.fn() };
+    const app = buildApp({ db, markMerged, repoConfig });
+
+    // Hand-built payload with no base.repo
+    const body = {
+      action: 'closed',
+      pull_request: { merged: true, head: { ref: 'testforge/autofix/failure-42-abc12345' } },
+    };
+    await request(app)
+      .post('/api/webhooks/github')
+      .set('x-hub-signature-256', sign(body))
+      .set('x-github-event', 'pull_request')
+      .send(body)
+      .expect(200);
+
+    expect(repoConfig.getByGithubRepo).not.toHaveBeenCalled();
+    expect(markMerged).toHaveBeenCalledTimes(1);
   });
 });
