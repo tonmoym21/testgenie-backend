@@ -42,6 +42,7 @@ function applyClientDefaults(headers) {
 }
 
 const envService = require('../../services/environmentService');
+const { getRegistrableDomain } = require('../../utils/domainUtils');
 
 /**
  * Run an API test.
@@ -368,21 +369,16 @@ async function runApiTest(config, envVars = null) {
               return { value: v, domain: null };
             };
             // For bare-string cookies (no envelope domain), default to the
-            // request URL's parent host so sibling subdomains of the same site
-            // receive them. APIs return their session expecting cross-subdomain
-            // use (eauth.example.com → app.example.com); without this default
-            // tough-cookie scopes the cookie to the auth host only and every
-            // downstream request 401s. Heuristic: drop the first label of a
-            // 3+ part hostname; pass through hostnames with <= 2 labels and
-            // raw IPs unchanged.
-            let defaultDomain = null;
-            try {
-              const host = new URL(url).hostname;
-              if (!/^[\d.]+$/.test(host) && !host.includes(':')) {
-                const parts = host.split('.');
-                defaultDomain = parts.length > 2 ? parts.slice(1).join('.') : null;
-              }
-            } catch { /* malformed url — leave domain unset */ }
+            // request URL's registrable domain (eTLD+1) so sibling subdomains
+            // of the same site receive them. APIs return their session
+            // expecting cross-subdomain use (eauth.example.com →
+            // app.example.com); without this default tough-cookie scopes the
+            // cookie to the auth host only and every downstream request 401s.
+            //
+            // Uses the Public-Suffix-Aware util so `api.foo.co.uk` → `foo.co.uk`
+            // (and not the wrong `co.uk`), and apex hosts like `engagedly.com`
+            // → `engagedly.com` so cookies still flow to their subdomains.
+            const defaultDomain = getRegistrableDomain(url);
 
             // When the body cookie value already contains URL-encoded
             // sequences (e.g. engagedly's `JUEYW%2Fl5...%0AmH1B%0A`), the

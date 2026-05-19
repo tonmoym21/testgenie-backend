@@ -307,7 +307,8 @@ router.post('/:colId/tests/:testId/run', async (req, res, next) => {
     const { environmentId } = req.body || {};
     const baseVars = await envService.buildVariableContext(req.user.id, environmentId || null);
 
-    const session = chainSessions.getOrCreate(req.user.id, parseInt(req.params.colId, 10));
+    const colIdInt = parseInt(req.params.colId, 10);
+    const session = await chainSessions.getOrCreate(req.user.id, colIdInt);
     const vars = { ...baseVars, ...session.chainVars };
 
     const row = t.rows[0];
@@ -362,7 +363,12 @@ router.post('/:colId/tests/:testId/run', async (req, res, next) => {
       void setCookieRaw;
     }
 
-    const sessionStatus = await chainSessions.status(req.user.id, parseInt(req.params.colId, 10));
+    // Write-through to DB so the jar + chainVars survive backend restarts.
+    // Failures here log a warning and continue — the in-memory session stays
+    // usable for the duration of the user's tab.
+    await chainSessions.persist(req.user.id, colIdInt);
+
+    const sessionStatus = await chainSessions.status(req.user.id, colIdInt);
 
     res.json({
       testId: row.id,
@@ -391,12 +397,12 @@ router.get('/:colId/session', async (req, res, next) => {
 });
 
 // DELETE /api/collections/:colId/session — drop the chain session so the
-// next individual run starts cold (clears cookies + chainVars). Doesn't
-// touch persistent data.
+// next individual run starts cold (clears cookies + chainVars). Also
+// deletes the persisted row so a restart doesn't bring stale state back.
 router.delete('/:colId/session', async (req, res, next) => {
   try {
     await assertCollectionAccess(req, req.params.colId);
-    chainSessions.reset(req.user.id, parseInt(req.params.colId, 10));
+    await chainSessions.reset(req.user.id, parseInt(req.params.colId, 10));
     res.json({ active: false });
   } catch (err) { next(err); }
 });

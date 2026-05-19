@@ -24,8 +24,8 @@ const rateLimiter = require('./middleware/rateLimiter'); // default export = gen
 const app = express();
 
 // Build info for deployment verification
-const BUILD_VERSION = '2.9.3';
-const BUILD_DATE = '2026-05-19T00:00:00Z';
+const BUILD_VERSION = '3.0.0';
+const BUILD_DATE = '2026-05-19T06:30:00Z';
 
 logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backend starting...');
 
@@ -168,6 +168,22 @@ logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backen
          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
          updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL
        )`,
+
+      // ── Migration 015: persistent chain sessions ──
+      // Keeps the per-(user, collection) cookie jar + chainVars across
+      // backend restarts so individual ▶ debugging doesn't lose state when
+      // Render redeploys a dyno. The in-memory cache stays the hot path;
+      // this table is hydrated on miss and written-through on mutation.
+      `CREATE TABLE IF NOT EXISTS chain_sessions (
+         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+         collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+         jar_json JSONB NOT NULL,
+         chain_vars JSONB NOT NULL DEFAULT '{}'::jsonb,
+         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         PRIMARY KEY (user_id, collection_id)
+       )`,
+      `CREATE INDEX IF NOT EXISTS idx_chain_sessions_updated ON chain_sessions(updated_at)`,
     ];
     for (const sql of statements) {
       try {
