@@ -130,6 +130,46 @@ logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backen
       `UPDATE run_reports r SET organization_id = u.organization_id FROM users u
          WHERE r.user_id = u.id AND u.organization_id IS NOT NULL AND r.organization_id IS NULL`,
 
+      // ── Reconcile 006 team-mgmt columns/tables ──
+      // Migration 006 used CREATE TABLE IF NOT EXISTS for `organizations`
+      // assuming the table didn't yet exist. On any DB where the table was
+      // already present (1711756800000_initial-schema.sql created it), the
+      // new columns silently never landed. These idempotent ALTERs close
+      // that gap so register/login work on a DB that's been live since
+      // the early schema without needing a manual backfill.
+      `ALTER TABLE organizations ADD COLUMN IF NOT EXISTS logo_url TEXT`,
+      `ALTER TABLE organizations ADD COLUMN IF NOT EXISTS settings JSONB DEFAULT '{}'::jsonb`,
+      `ALTER TABLE organizations ADD COLUMN IF NOT EXISTS domain_restriction_enabled BOOLEAN NOT NULL DEFAULT false`,
+      `ALTER TABLE organizations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS deactivated_at TIMESTAMPTZ`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS deactivated_by INTEGER REFERENCES users(id) ON DELETE SET NULL`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMPTZ`,
+      `CREATE TABLE IF NOT EXISTS organization_members (
+         id SERIAL PRIMARY KEY,
+         organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+         role TEXT NOT NULL DEFAULT 'member',
+         invited_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+         joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         UNIQUE(organization_id, user_id)
+       )`,
+      `CREATE INDEX IF NOT EXISTS idx_organization_members_org ON organization_members(organization_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_organization_members_user ON organization_members(user_id)`,
+      `CREATE TABLE IF NOT EXISTS allowed_email_domains (
+         id SERIAL PRIMARY KEY,
+         organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+         domain TEXT NOT NULL,
+         created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         UNIQUE(organization_id, domain)
+       )`,
+      `CREATE INDEX IF NOT EXISTS idx_allowed_email_domains_org ON allowed_email_domains(organization_id)`,
+
       // ── Migration 012: platform-wide audit log columns ──
       `CREATE TABLE IF NOT EXISTS team_audit_logs (
          id SERIAL PRIMARY KEY,

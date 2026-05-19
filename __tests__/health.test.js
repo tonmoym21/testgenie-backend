@@ -12,9 +12,12 @@ afterAll(async () => {
   await teardown();
 });
 
-describe('GET /health', () => {
+// /health is the lightweight Railway healthcheck that NEVER touches the DB
+// (see index.js: 'always passes regardless of DB/route state'). The
+// DB-aware variant is /api/health — that's what this test targets.
+describe('GET /api/health', () => {
   it('should return ok status with db connected', async () => {
-    const res = await request(app).get('/health').expect(200);
+    const res = await request(app).get('/api/health').expect(200);
 
     expect(res.body.status).toBe('ok');
     expect(res.body.db).toBe('connected');
