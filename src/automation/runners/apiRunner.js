@@ -384,17 +384,35 @@ async function runApiTest(config, envVars = null) {
               }
             } catch { /* malformed url — leave domain unset */ }
 
+            // When the body cookie value already contains URL-encoded
+            // sequences (e.g. engagedly's `JUEYW%2Fl5...%0AmH1B%0A`), the
+            // value as stored in the auth backend is that encoded form —
+            // not the decoded form. Browsers / Postman send it back through
+            // the Cookie header URL-encoded again (`%2F` → `%252F`) so that
+            // after the server's normal Cookie-header decode pass it still
+            // sees the same `%2F`. If we transmit the value as-is, the
+            // server decodes once, gets `/`, and 401s.
+            //
+            // Heuristic: only re-encode if the value looks already-encoded
+            // (contains at least one `%XX` hex pair). Bare values like
+            // `subdomain=performanceautomation` or `force_reset_on_login=
+            // false` stay untouched.
+            const reencodeIfNeeded = (s) =>
+              (typeof s === 'string' && /%[0-9A-Fa-f]{2}/.test(s))
+                ? s.replace(/%/g, '%25')
+                : s;
+
             let pushed = 0;
             for (const [name, rawValue] of Object.entries(bag)) {
               const fields = toCookieFields(rawValue);
               if (!fields) continue;
               const domain = fields.domain || defaultDomain;
-              // tough-cookie tolerates unquoted values; %-encoding stays intact
-              // so the cookie is sent exactly as the server emitted it.
-              const parts = [`${name}=${String(fields.value)}`, 'Path=/'];
+              const wireValue = reencodeIfNeeded(String(fields.value));
+              const parts = [`${name}=${wireValue}`, 'Path=/'];
               if (domain) parts.push(`Domain=${domain}`);
               aggregatedSetCookies.push({ url, raw: parts.join('; ') });
-              // Mirror into rawResponse.cookies so the UI Cookies tab surfaces them
+              // Mirror into rawResponse.cookies so the UI Cookies tab surfaces
+              // the original (single-encoded) value, not the wire form.
               rawResponse.cookies[name] = String(fields.value);
               pushed += 1;
             }
