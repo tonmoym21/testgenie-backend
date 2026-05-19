@@ -22,6 +22,7 @@ const { execFileSync, spawnSync } = require('child_process');
 const defaultDeps = () => ({
   db: require('../db'),
   logger: require('../utils/logger'),
+  repoConfig: require('./repoConfigService'),
   runGit: (cwd, args) => {
     try {
       return execFileSync('git', args, { cwd, stdio: 'pipe', encoding: 'utf8' }).trim();
@@ -110,7 +111,7 @@ async function recordVerifyFailed(db, fixAttemptId, failureId, errorTail) {
  * }>}
  */
 async function verifyFix(opts, deps = {}) {
-  const { db, logger, runGit, runPlaywright } = { ...defaultDeps(), ...deps };
+  const { db, logger, runGit, runPlaywright, repoConfig } = { ...defaultDeps(), ...deps };
 
   const row = await loadFixAttempt(db, opts.fixAttemptId);
   if (!row) throw new Error(`fix_attempts ${opts.fixAttemptId} not found`);
@@ -119,8 +120,27 @@ async function verifyFix(opts, deps = {}) {
   }
   if (!row.branch_name) throw new Error(`fix_attempts ${row.id} has no branch_name to verify`);
 
-  const repo = path.resolve(opts.repo);
-  const specRel = opts.specPath || (row.test_file_name ? path.join('tests', row.test_file_name) : null);
+  // Per-project config fallback for {repo, specPath base dir}. Caller's
+  // opts always win; only consult the table when something is missing.
+  let cfg = null;
+  if (!opts.repo || !opts.specPath) {
+    try {
+      cfg = await repoConfig.getByFixAttemptId(opts.fixAttemptId, { db });
+    } catch (err) {
+      logger.warn({ err: err.message, fixAttemptId: opts.fixAttemptId },
+        'autofix-verify: repo config lookup failed (continuing with opts)');
+    }
+  }
+
+  const repoArg = opts.repo || (cfg && cfg.repo_path);
+  if (!repoArg) {
+    throw new Error(
+      `No repo path supplied and no project_repo_configs row for fix_attempts ${opts.fixAttemptId}`
+    );
+  }
+  const repo = path.resolve(repoArg);
+  const specDir = (cfg && cfg.spec_dir) || 'tests';
+  const specRel = opts.specPath || (row.test_file_name ? path.join(specDir, row.test_file_name) : null);
   if (!specRel) throw new Error('Cannot verify: no specPath and no test_file_name in DB');
 
   // Capture the current branch so we can return regardless of outcome.

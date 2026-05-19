@@ -24,6 +24,7 @@ const defaultDeps = () => ({
   db: require('../db'),
   fs: require('fs'),
   logger: require('../utils/logger'),
+  repoConfig: require('./repoConfigService'),
   runGit: (cwd, args) => {
     try {
       return execFileSync('git', args, { cwd, stdio: 'pipe', encoding: 'utf8' }).trim();
@@ -235,11 +236,32 @@ async function recordApply(db, id, { status, prUrl, prNumber, errorMessage }) {
  */
 async function applyFix(opts, deps = {}) {
   // Merge with defaults so tests can override just `runGh` (or any subset)
-  // without losing db / fs / runGit / logger.
-  const { db, fs, logger, runGit, runGh } = { ...defaultDeps(), ...deps };
+  // without losing db / fs / runGit / logger / repoConfig.
+  const { db, fs, logger, runGit, runGh, repoConfig } = { ...defaultDeps(), ...deps };
   const git = makeGit(runGit);
 
-  const repo = path.resolve(opts.repo);
+  // Resolve {repo, base, remote} from the per-project config table when the
+  // caller didn't provide an override. This is what makes a cron / API
+  // endpoint able to call applyFix({ fixAttemptId }) and have everything
+  // resolve. Explicit opts always win — keeps the CLI flag shape working.
+  let cfg = null;
+  if (!opts.repo || !opts.base || !opts.remote) {
+    try {
+      cfg = await repoConfig.getByFixAttemptId(opts.fixAttemptId, { db });
+    } catch (err) {
+      logger.warn({ err: err.message, fixAttemptId: opts.fixAttemptId },
+        'autofix-apply: repo config lookup failed (continuing with opts)');
+    }
+  }
+
+  const repoArg = opts.repo || (cfg && cfg.repo_path);
+  if (!repoArg) {
+    throw new Error(
+      `No repo path supplied and no project_repo_configs row for fix_attempts ${opts.fixAttemptId} — ` +
+      `pass --repo or run: INSERT INTO project_repo_configs ...`
+    );
+  }
+  const repo = path.resolve(repoArg);
   ensureGitRepo(fs, runGit, repo);
 
   const row = await loadFixAttempt(db, opts.fixAttemptId);
@@ -258,9 +280,11 @@ async function applyFix(opts, deps = {}) {
   const targetRel = path.relative(repo, target).replace(/\\/g, '/');
   assertCleanFor(runGit, repo, target);
 
-  const baseBranch = opts.base || git.ok(repo, 'rev-parse', '--abbrev-ref', 'HEAD');
+  const baseBranch = opts.base
+    || (cfg && cfg.base_branch)
+    || git.ok(repo, 'rev-parse', '--abbrev-ref', 'HEAD');
   const newBranch = row.branch_name;
-  const remote = opts.remote || 'origin';
+  const remote = opts.remote || (cfg && cfg.remote_name) || 'origin';
 
   // Refuse to overwrite a branch that already exists.
   if (git.tri(repo, 'rev-parse', '--verify', `refs/heads/${newBranch}`)) {
