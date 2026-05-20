@@ -9,6 +9,14 @@ const postman = require('../src/services/apiSources/adapters/postman');
 const curl = require('../src/services/apiSources/adapters/curl');
 const { isPrivateIPv4, isPrivateIPv6 } = require('../src/services/apiSources/fetcher');
 
+// apiSourceService transitively requires src/db.js, which requires src/config.js,
+// which validates env vars and process.exit(1)s when DATABASE_URL/JWT_SECRET/
+// OPENAI_API_KEY are missing. Stub minimal values before the require.
+process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgres://test:test@localhost:5432/test';
+process.env.JWT_SECRET = process.env.JWT_SECRET || '0'.repeat(32);
+process.env.OPENAI_API_KEY = process.env.OPENAI_API_KEY || 'sk-test';
+const { testDefinitionFromEndpoint } = require('../src/services/apiSourceService');
+
 // ──────────────────────────── detector ────────────────────────────
 
 describe('detectFromText', () => {
@@ -261,5 +269,61 @@ describe('fetcher private-IP detection', () => {
   it('allows IPv4-mapped public addresses', () => {
     expect(isPrivateIPv6('::ffff:8.8.8.8')).toBe(false);
     expect(isPrivateIPv6('::ffff:0808:0808')).toBe(false);
+  });
+});
+
+// ──────────────────────────── envelope shape ────────────────────────────
+
+describe('testDefinitionFromEndpoint', () => {
+  const ep = {
+    method: 'POST',
+    path: '/pet',
+    summary: 'Add a new pet',
+    sampleRequest: {
+      method: 'POST',
+      url: '{{baseUrl}}/pet',
+      headers: { 'Content-Type': 'application/json' },
+      body: { name: 'doggo', status: 'available' },
+      assertions: [{ type: 'status', operator: 'lt', value: 400 }],
+      extractors: [],
+      timeout: 10000,
+    },
+  };
+
+  it('emits the envelope shape the CollectionDetail UI reads from', () => {
+    const def = testDefinitionFromEndpoint(ep);
+    expect(def).toHaveProperty('name');
+    expect(def).toHaveProperty('type', 'api');
+    expect(def).toHaveProperty('config');
+    // Fields must live inside config — the UI's editors all read def.config.*
+    expect(def.config.method).toBe('POST');
+    expect(def.config.url).toBe('{{baseUrl}}/pet');
+    expect(def.config.headers).toEqual({ 'Content-Type': 'application/json' });
+    expect(def.config.body).toEqual({ name: 'doggo', status: 'available' });
+    expect(def.config.bodyType).toBe('json');
+    expect(def.config.timeout).toBe(10000);
+  });
+
+  it('uses canonical assertion field names (target/operator/expected)', () => {
+    const def = testDefinitionFromEndpoint(ep);
+    const a = def.config.assertions[0];
+    expect(a).toHaveProperty('target', 'status');
+    expect(a).toHaveProperty('operator', 'lt');
+    expect(a).toHaveProperty('expected', 400);
+    // None of the old field names:
+    expect(a).not.toHaveProperty('type');
+    expect(a).not.toHaveProperty('value');
+  });
+
+  it('falls back to default 2xx-ish assertion when sample has none', () => {
+    const def = testDefinitionFromEndpoint({ ...ep, sampleRequest: { ...ep.sampleRequest, assertions: [] } });
+    expect(def.config.assertions).toEqual([{ target: 'status', operator: 'lt', expected: 400 }]);
+  });
+
+  it('omits body and bodyType when there is no sample body', () => {
+    const noBody = { ...ep, sampleRequest: { ...ep.sampleRequest, body: undefined } };
+    const def = testDefinitionFromEndpoint(noBody);
+    expect(def.config.body).toBeUndefined();
+    expect(def.config.bodyType).toBeUndefined();
   });
 });

@@ -276,21 +276,60 @@ async function getEndpoints(_user, endpointIds) {
   return r.rows;
 }
 
-// Build a TestForge `test_definition` from a stored endpoint. The shape
-// matches what apiRunner consumes: { method, url, headers, body,
-// assertions, timeout, extractors, auth }.
+// Build a TestForge `test_definition` from a stored endpoint.
+//
+// The CollectionDetail UI and the existing executor read tests in the
+// envelope shape:
+//   { name, type: 'api', config: { method, url, headers, body, bodyType,
+//     assertions, extractors, timeout, auth } }
+//
+// Earlier this function returned the flat shape. The runner accepts both,
+// but the UI's body/headers/assertions editors only read from `.config.*`,
+// so imported tests showed up blank in the collection detail screen.
+// Wrapping in the envelope makes both the runner and the UI happy.
 function testDefinitionFromEndpoint(ep) {
   const s = ep.sampleRequest || {};
-  return {
-    method: s.method || ep.method,
+  const name = ep.summary || `${ep.method} ${ep.path}`;
+
+  const config = {
+    method: (s.method || ep.method || 'GET').toUpperCase(),
     url: s.url || '',
-    headers: s.headers || {},
-    body: s.body,
-    assertions: Array.isArray(s.assertions) && s.assertions.length
-      ? s.assertions
-      : [{ type: 'status', operator: 'lt', value: 400 }],
-    extractors: Array.isArray(s.extractors) ? s.extractors : [],
+    headers: s.headers && typeof s.headers === 'object' ? s.headers : {},
     timeout: s.timeout || 10000,
+    // Assertion shape used everywhere else in the app:
+    //   { target, operator, expected, path? }
+    // (we previously emitted { type, operator, value } which the UI
+    // silently ignored and the assertion-evaluator couldn't match.)
+    assertions: Array.isArray(s.assertions) && s.assertions.length
+      ? s.assertions.map((a) => normaliseAssertion(a))
+      : [{ target: 'status', operator: 'lt', expected: 400 }],
+    extractors: Array.isArray(s.extractors) ? s.extractors : [],
+  };
+
+  // Body needs `bodyType` so the UI knows which editor to render. JSON is
+  // the only body the API runner natively executes today — formData / binary
+  // are deferred. We stringify objects so the body field is always either
+  // a string (raw mode) or an object the runner can JSON.stringify.
+  if (s.body !== undefined && s.body !== null) {
+    config.bodyType = 'json';
+    config.body = s.body;
+  }
+
+  return { name: name.slice(0, 200), type: 'api', config };
+}
+
+// Normalise legacy or import-pipeline assertions to the canonical
+// { target, operator, expected, path? } shape the UI + evaluator share.
+function normaliseAssertion(a) {
+  if (!a || typeof a !== 'object') return { target: 'status', operator: 'lt', expected: 400 };
+  // Already in canonical shape.
+  if (a.target) return a;
+  // Old shape from this service's first implementation.
+  return {
+    target: a.type || 'status',
+    operator: a.operator || 'eq',
+    expected: a.value !== undefined ? a.value : a.expected,
+    ...(a.path ? { path: a.path } : {}),
   };
 }
 
@@ -328,21 +367,26 @@ async function commitToCollection(user, { collectionId, endpointIds, authProfile
     const created = [];
     for (const ep of endpoints) {
       const def = testDefinitionFromEndpoint(ep);
-      // Apply a bulk auth template if supplied. Keeps the import-and-go UX
-      // working: user picks 30 endpoints, says "Bearer from {{authToken}}",
-      // every generated test gets the header pre-wired.
+
+      // Apply a bulk auth template if supplied. The header lands inside
+      // config.headers — same path the UI's auth-config tab writes to.
       if (authProfile && authProfile.type === 'bearer' && authProfile.tokenVar) {
-        def.headers = { ...(def.headers || {}), Authorization: `Bearer {{${authProfile.tokenVar}}}` };
+        def.config.headers = {
+          ...(def.config.headers || {}),
+          Authorization: `Bearer {{${authProfile.tokenVar}}}`,
+        };
       } else if (authProfile && authProfile.type === 'apiKey' && authProfile.headerName && authProfile.tokenVar) {
-        def.headers = { ...(def.headers || {}), [authProfile.headerName]: `{{${authProfile.tokenVar}}}` };
+        def.config.headers = {
+          ...(def.config.headers || {}),
+          [authProfile.headerName]: `{{${authProfile.tokenVar}}}`,
+        };
       }
 
-      const name = ep.summary || `${ep.method} ${ep.path}`;
       const inserted = await client.query(
         `INSERT INTO collection_tests (collection_id, name, test_type, test_definition, sort_order)
          VALUES ($1, $2, 'api', $3::jsonb, 0)
          RETURNING id, name, test_type AS "testType"`,
-        [collectionId, name.slice(0, 200), JSON.stringify(def)]
+        [collectionId, def.name, JSON.stringify(def)]
       );
       created.push({ ...inserted.rows[0], endpointId: ep.id });
     }
