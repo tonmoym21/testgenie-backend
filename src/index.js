@@ -295,6 +295,75 @@ logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backen
       `CREATE INDEX IF NOT EXISTS idx_api_endpoints_org    ON api_endpoints(organization_id)`,
       `CREATE INDEX IF NOT EXISTS idx_api_endpoints_fp     ON api_endpoints(fingerprint)`,
       `CREATE INDEX IF NOT EXISTS idx_api_endpoints_method ON api_endpoints(method)`,
+
+      // ── Migration 018: repair stories/scenarios FK types ──
+      // Original migration 001 declared stories.project_id and user_id as
+      // UUID, but projects.id and users.id are SERIAL (integer). The
+      // CREATE TABLE failed in production due to FK type incompatibility,
+      // leaving stories/scenarios missing and breaking GET /stories with
+      // 500. This block:
+      //   1. Drops the legacy tables ONLY if they exist with UUID columns
+      //      (idempotent — won't touch correct schemas on subsequent runs).
+      //   2. Recreates with INTEGER FKs.
+      //   3. Replays migration 010's test_cases.story_id ADD COLUMN that
+      //      would have failed when stories was missing.
+      `DO $mig018$
+       BEGIN
+         IF EXISTS (
+           SELECT 1 FROM information_schema.columns
+           WHERE table_name = 'stories'
+             AND column_name = 'project_id'
+             AND data_type = 'uuid'
+         ) THEN
+           DROP TABLE IF EXISTS scenarios CASCADE;
+           DROP TABLE IF EXISTS stories CASCADE;
+         END IF;
+       END
+       $mig018$`,
+      `CREATE TABLE IF NOT EXISTS stories (
+         id SERIAL PRIMARY KEY,
+         project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+         title TEXT NOT NULL,
+         description TEXT NOT NULL,
+         source_type TEXT NOT NULL DEFAULT 'text' CHECK (source_type IN ('text','url')),
+         source_url TEXT,
+         status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','extracted','reviewed','exported')),
+         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+       )`,
+      `CREATE TABLE IF NOT EXISTS scenarios (
+         id SERIAL PRIMARY KEY,
+         story_id INTEGER NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
+         project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+         category TEXT NOT NULL CHECK (category IN (
+           'happy_path','negative','edge','validation',
+           'role_permission','state_transition','api_impact','non_functional'
+         )),
+         title TEXT NOT NULL,
+         summary TEXT,
+         preconditions JSONB DEFAULT '[]'::jsonb,
+         test_intent TEXT,
+         inputs JSONB DEFAULT '{}'::jsonb,
+         expected_outcome TEXT,
+         priority TEXT NOT NULL DEFAULT 'P1' CHECK (priority IN ('P0','P1','P2','P3')),
+         status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')),
+         review_note TEXT,
+         jira_issue_key VARCHAR(50),
+         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+       )`,
+      `CREATE INDEX IF NOT EXISTS idx_stories_project_user ON stories(project_id, user_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_stories_project ON stories(project_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_scenarios_story ON scenarios(story_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_scenarios_story_status ON scenarios(story_id, status)`,
+      `CREATE INDEX IF NOT EXISTS idx_scenarios_project ON scenarios(project_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_scenarios_jira_key ON scenarios(jira_issue_key)`,
+      // test_cases.story_id was supposed to land via migration 010 but
+      // would have failed if stories didn't exist yet. Replay safely now.
+      `ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS story_id INTEGER REFERENCES stories(id) ON DELETE SET NULL`,
+      `CREATE INDEX IF NOT EXISTS idx_test_cases_story_id ON test_cases(story_id)`,
     ];
     for (const sql of statements) {
       try {

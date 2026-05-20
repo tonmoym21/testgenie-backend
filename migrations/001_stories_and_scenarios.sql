@@ -1,10 +1,17 @@
 -- Migration: Story-to-CSV foundation tables
 -- Run: psql $DATABASE_URL -f migrations/001_stories_and_scenarios.sql
+--
+-- NOTE: Original version of this file declared project_id and user_id as
+-- UUID, which failed in production because projects.id and users.id are
+-- SERIAL (integer). The startup migration runner in src/index.js
+-- ("Migration 018") repairs production databases on the next deploy.
+-- This file is kept aligned with the corrected schema for any fresh
+-- bootstrap.
 
 CREATE TABLE IF NOT EXISTS stories (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  id SERIAL PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   title TEXT NOT NULL,
   description TEXT NOT NULL,
   source_type TEXT NOT NULL DEFAULT 'text' CHECK (source_type IN ('text', 'url')),
@@ -15,10 +22,10 @@ CREATE TABLE IF NOT EXISTS stories (
 );
 
 CREATE TABLE IF NOT EXISTS scenarios (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  story_id UUID NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
-  project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  id SERIAL PRIMARY KEY,
+  story_id INTEGER NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   category TEXT NOT NULL CHECK (category IN (
     'happy_path', 'negative', 'edge', 'validation',
     'role_permission', 'state_transition', 'api_impact', 'non_functional'
