@@ -38,30 +38,50 @@ const commitSchema = z.object({
 
 // ── Routes ──────────────────────────────────────────────────────────────
 
+// Surfaces the actual failure reason to the UI. preview / ingest are
+// user-input-driven (paste a URL, paste a spec) — masking errors as
+// "Internal server error" makes the feature unusable when something goes
+// wrong with the user's input. We still log full stack server-side via
+// req.log so Render logs retain the detail.
+function handleImportError(err, req, res) {
+  // Detector errors (already typed).
+  if (err.code === 'UNRECOGNISED_FORMAT' || err.code === 'UNKNOWN_JSON_FORMAT' || err.code === 'NO_ADAPTER') {
+    return res.status(400).json({ error: { code: err.code, message: err.message } });
+  }
+  // Caller-provided statusCode (apiSourceService throws with statusCode on user errors).
+  if (err.statusCode && err.statusCode >= 400 && err.statusCode < 500) {
+    return res.status(err.statusCode).json({ error: { code: 'IMPORT_ERROR', message: err.message } });
+  }
+  // Fetcher / parser / network failures — fall here. The message is
+  // user-meaningful ("Blocked private/reserved address: …", "Spec exceeds
+  // 5 MB limit", "Could not parse YAML at …"), so we expose it directly.
+  const log = req.log || require('../utils/logger');
+  log.error({ err: err.message, stack: err.stack }, 'apiSource import failed');
+  return res.status(502).json({
+    error: {
+      code: 'IMPORT_FAILED',
+      message: err.message || 'Import failed',
+    },
+  });
+}
+
 // POST /api/sources/preview — paste-box live preview, no persistence
-router.post('/preview', validate(previewSchema), async (req, res, next) => {
+router.post('/preview', validate(previewSchema), async (req, res) => {
   try {
     const result = await svc.previewImport(req.body);
     res.json(result);
   } catch (err) {
-    // Format-detection failures are expected user input errors; surface as 400.
-    if (err.code === 'UNRECOGNISED_FORMAT' || err.code === 'UNKNOWN_JSON_FORMAT' || err.code === 'NO_ADAPTER') {
-      return res.status(400).json({ error: { code: err.code, message: err.message } });
-    }
-    next(err);
+    handleImportError(err, req, res);
   }
 });
 
 // POST /api/sources — full ingest. Persists source, version, endpoints.
-router.post('/', validate(ingestSchema), async (req, res, next) => {
+router.post('/', validate(ingestSchema), async (req, res) => {
   try {
     const source = await svc.ingestSource(req.user, req.body);
     res.status(201).json(source);
   } catch (err) {
-    if (err.code === 'UNRECOGNISED_FORMAT' || err.code === 'UNKNOWN_JSON_FORMAT') {
-      return res.status(400).json({ error: { code: err.code, message: err.message } });
-    }
-    next(err);
+    handleImportError(err, req, res);
   }
 });
 

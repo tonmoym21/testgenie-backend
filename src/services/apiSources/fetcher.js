@@ -97,10 +97,14 @@ async function resolveSafely(hostname) {
   if (isBlockedHost(hostname)) throw new Error(`Blocked hostname: ${hostname}`);
 
   const addresses = await dns.lookup(hostname, { all: true, verbatim: true });
-  for (const { address, family } of addresses) {
-    const blocked = family === 4 ? isPrivateIPv4(address) : isPrivateIPv6(address);
-    if (!blocked) return { ip: address, family };
-  }
+  // Prefer IPv4 over IPv6. Many container platforms (Render, Heroku, some
+  // Railway routes) advertise dual-stack but only have working outbound
+  // IPv4. Falling back to IPv6 only when there's no public v4 keeps the
+  // happy path on whichever stack actually works.
+  const v4 = addresses.find((a) => a.family === 4 && !isPrivateIPv4(a.address));
+  if (v4) return { ip: v4.address, family: 4 };
+  const v6 = addresses.find((a) => a.family === 6 && !isPrivateIPv6(a.address));
+  if (v6) return { ip: v6.address, family: 6 };
   throw new Error(`No public address resolves for ${hostname}`);
 }
 
