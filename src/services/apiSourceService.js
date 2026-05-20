@@ -35,7 +35,15 @@ async function detectAndParse({ raw, urlHint }) {
     throw err;
   }
   if (detected.format === 'json_unknown') {
-    const err = new Error('JSON parsed but is not a known API spec format');
+    // Include the top-level keys + first 200 chars of the body so we (and
+    // the user) can see what was actually parsed. Without this, every
+    // "wrong response from upstream" case looks identical.
+    const keys = detected.doc && typeof detected.doc === 'object' ? Object.keys(detected.doc).slice(0, 10).join(', ') : '(no keys)';
+    const sample = typeof raw === 'string' ? raw.slice(0, 200) : '';
+    const err = new Error(
+      `JSON parsed but no API spec markers found. Top-level keys: [${keys}]. ` +
+      `First 200 chars: ${JSON.stringify(sample)}`
+    );
     err.code = 'UNKNOWN_JSON_FORMAT';
     throw err;
   }
