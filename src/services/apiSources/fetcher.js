@@ -53,11 +53,23 @@ function isPrivateIPv4(ip) {
 function isPrivateIPv6(ip) {
   const lower = ip.toLowerCase();
   if (lower === '::1' || lower === '::') return true;
-  // ULA fc00::/7, link-local fe80::/10, IPv4-mapped ::ffff:a.b.c.d (re-check the v4)
+  // ULA fc00::/7, link-local fe80::/10.
   if (/^f[cd][0-9a-f]{2}:/.test(lower)) return true;
   if (/^fe[89ab][0-9a-f]:/.test(lower)) return true;
-  const v4Mapped = lower.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
-  if (v4Mapped) return isPrivateIPv4(v4Mapped[1]);
+
+  // IPv4-mapped addresses can be written two ways:
+  //   ::ffff:127.0.0.1   (dotted)   ← old check only caught this
+  //   ::ffff:7f00:0001   (hex form) ← previously bypassed → SSRF
+  // Both shapes must be detected and the embedded v4 re-checked.
+  const dotted = lower.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+  if (dotted) return isPrivateIPv4(dotted[1]);
+  const hex = lower.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (hex) {
+    const high = parseInt(hex[1], 16);
+    const low  = parseInt(hex[2], 16);
+    const v4 = `${(high >> 8) & 0xff}.${high & 0xff}.${(low >> 8) & 0xff}.${low & 0xff}`;
+    return isPrivateIPv4(v4);
+  }
   return false;
 }
 

@@ -107,11 +107,35 @@ function parse(input) {
       case '--compressed':
         // No-op for our purposes.
         break;
+      // Known single-value flags that take an argument we don't care about
+      // semantically. Listing them keeps the URL scan from accidentally
+      // eating the URL when an unknown flag's value happens to look like one.
+      case '-A':
+      case '--user-agent':
+      case '-e':
+      case '--referer':
+      case '--connect-timeout':
+      case '--max-time':
+      case '-o':
+      case '--output':
+      case '-w':
+      case '--write-out':
+      case '-x':
+      case '--proxy':
+      case '--resolve':
+      case '--cookie':
+      case '-b':
+      case '--cookie-jar':
+      case '-c':
+        i++; // consume the flag's value
+        break;
       default:
         // First non-flag token that looks like a URL → that's our target.
         if (!url && /^https?:\/\//.test(t)) url = t;
-        // Skip values of unknown flags rather than treating them as URLs.
-        else if (t.startsWith('-')) i++;
+        // Unknown flag — DON'T skip the next token, otherwise something like
+        // `--unknown-flag https://api.example.com` would lose the URL. If a
+        // future curl flag does take an argument and we miss it, we'll over-
+        // parse rather than under-parse, which is the safer failure mode.
     }
   }
 

@@ -7,7 +7,7 @@ const { scanAndRedact } = require('../src/services/apiSources/secretScanner');
 const openapi = require('../src/services/apiSources/adapters/openapi');
 const postman = require('../src/services/apiSources/adapters/postman');
 const curl = require('../src/services/apiSources/adapters/curl');
-const { isPrivateIPv4 } = require('../src/services/apiSources/fetcher');
+const { isPrivateIPv4, isPrivateIPv6 } = require('../src/services/apiSources/fetcher');
 
 // ──────────────────────────── detector ────────────────────────────
 
@@ -215,6 +215,15 @@ describe('curl adapter', () => {
     const ir = await curl.parse({ raw: 'curl -u admin:hunter2 https://api.example.com/secure' });
     expect(ir.endpoints[0].sampleRequest.headers.Authorization).toMatch(/^Basic /);
   });
+
+  it('does not swallow the URL when -A / --user-agent precedes it', async () => {
+    // Previously a default-branch "skip next token after unknown flag"
+    // would eat the URL. Regression test for that bug.
+    const ir = await curl.parse({
+      raw: 'curl -A "Mozilla/5.0" https://api.example.com/v1/widgets',
+    });
+    expect(ir.endpoints[0].path).toBe('/v1/widgets');
+  });
 });
 
 // ──────────────────────────── fetcher SSRF guards ────────────────────────────
@@ -230,5 +239,27 @@ describe('fetcher private-IP detection', () => {
   it('allows public IPs', () => {
     expect(isPrivateIPv4('8.8.8.8')).toBe(false);
     expect(isPrivateIPv4('1.1.1.1')).toBe(false);
+  });
+
+  it('blocks IPv6 loopback, ULA, link-local', () => {
+    expect(isPrivateIPv6('::1')).toBe(true);
+    expect(isPrivateIPv6('fc00::1')).toBe(true);
+    expect(isPrivateIPv6('fd12:3456::1')).toBe(true);
+    expect(isPrivateIPv6('fe80::1')).toBe(true);
+  });
+
+  it('blocks IPv4-mapped IPv6 addresses in BOTH dotted and hex form', () => {
+    // Dotted form (e.g. ::ffff:127.0.0.1)
+    expect(isPrivateIPv6('::ffff:127.0.0.1')).toBe(true);
+    expect(isPrivateIPv6('::ffff:169.254.169.254')).toBe(true);
+    // Hex form (e.g. ::ffff:7f00:0001) — previously bypassed → SSRF
+    expect(isPrivateIPv6('::ffff:7f00:0001')).toBe(true);  // 127.0.0.1
+    expect(isPrivateIPv6('::ffff:a9fe:a9fe')).toBe(true);  // 169.254.169.254 — AWS IMDS
+    expect(isPrivateIPv6('::ffff:c0a8:0001')).toBe(true);  // 192.168.0.1
+  });
+
+  it('allows IPv4-mapped public addresses', () => {
+    expect(isPrivateIPv6('::ffff:8.8.8.8')).toBe(false);
+    expect(isPrivateIPv6('::ffff:0808:0808')).toBe(false);
   });
 });

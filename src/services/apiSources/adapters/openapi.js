@@ -23,10 +23,19 @@ async function parseRaw(raw) {
   // Accept either JSON or YAML. swagger-parser handles both but we pre-parse
   // so we control the YAML safety options (FAILSAFE_SCHEMA avoids `!!js/function`
   // and other code-exec gadgets).
+  // 5 MB hard cap on raw input. swagger-parser will subsequently dereference
+  // and we don't want a multi-hundred-MB spec consuming the event loop.
+  if (typeof raw === 'string' && raw.length > 5 * 1024 * 1024) {
+    throw new Error('Spec exceeds 5 MB limit');
+  }
   let doc;
   try { doc = JSON.parse(raw); }
   catch {
-    doc = yaml.load(raw, { schema: yaml.JSON_SCHEMA });
+    // JSON_SCHEMA restricts YAML to JSON-compatible scalars only — no
+    // !!js/function, !!js/regexp, !!timestamp, !!set. Strictly safer than
+    // js-yaml's default DEFAULT_SCHEMA, and unlike FAILSAFE_SCHEMA it still
+    // preserves numbers and booleans (which OpenAPI specs need).
+    doc = yaml.load(raw, { schema: yaml.JSON_SCHEMA, json: false });
   }
 
   // Validate + dereference, but keep external refs OFF. swagger-parser's
