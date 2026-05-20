@@ -97,13 +97,17 @@ async function resolveSafely(hostname) {
   if (isBlockedHost(hostname)) throw new Error(`Blocked hostname: ${hostname}`);
 
   const addresses = await dns.lookup(hostname, { all: true, verbatim: true });
+  // dns.lookup occasionally returns records with a missing address field
+  // depending on the resolver state. Filter those out before predicates
+  // run, otherwise downstream code receives ip: undefined.
+  const valid = (addresses || []).filter((a) => a && typeof a.address === 'string' && a.address.length > 0);
   // Prefer IPv4 over IPv6. Many container platforms (Render, Heroku, some
   // Railway routes) advertise dual-stack but only have working outbound
   // IPv4. Falling back to IPv6 only when there's no public v4 keeps the
   // happy path on whichever stack actually works.
-  const v4 = addresses.find((a) => a.family === 4 && !isPrivateIPv4(a.address));
+  const v4 = valid.find((a) => a.family === 4 && !isPrivateIPv4(a.address));
   if (v4) return { ip: v4.address, family: 4 };
-  const v6 = addresses.find((a) => a.family === 6 && !isPrivateIPv6(a.address));
+  const v6 = valid.find((a) => a.family === 6 && !isPrivateIPv6(a.address));
   if (v6) return { ip: v6.address, family: 6 };
   throw new Error(`No public address resolves for ${hostname}`);
 }
@@ -123,23 +127,39 @@ function fetchOne(targetUrl, allowHttp) {
     let resolved;
     try { resolved = await resolveSafely(parsed.hostname); }
     catch (err) { return reject(err); }
+    if (!resolved || !resolved.ip) {
+      return reject(new Error(`Could not resolve ${parsed.hostname}`));
+    }
 
-    // Pin the resolved IP for the connection but keep the original Host header
-    // so TLS SNI / virtual hosts still work. The custom `lookup` is what
-    // closes the DNS-rebinding hole — the agent can't re-resolve mid-flight.
+    // Pin the resolved IP for the connection. We previously used a custom
+    // `lookup` callback for this — but in some Node 20 builds, the
+    // https.Agent calls lookup in a way that produced "Invalid IP address:
+    // undefined" before our callback could even run. Setting `hostname` to
+    // the IP directly and passing `servername` (for TLS SNI) + a `Host`
+    // header (for vhost routing) is the cleaner pattern: the agent never
+    // re-resolves mid-flight, which is exactly the DNS-rebinding defence
+    // we want, without any of the callback edge cases.
     const lib = parsed.protocol === 'https:' ? https : http;
-    const req = lib.request({
+    const isHttps = parsed.protocol === 'https:';
+    const port = parsed.port || (isHttps ? 443 : 80);
+    const hostHeader = parsed.port ? `${parsed.hostname}:${parsed.port}` : parsed.hostname;
+    const reqOpts = {
       method: 'GET',
-      hostname: parsed.hostname,
-      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+      host: resolved.ip,                       // dial the pinned IP directly
+      port,
       path: parsed.pathname + parsed.search,
+      family: resolved.family,                  // 4 or 6
       headers: {
+        Host: hostHeader,                       // virtual hosting / Host-based routing
         'User-Agent': 'TestForge-ApiImport/1.0',
         'Accept': 'application/json, application/yaml, text/yaml, text/plain, */*',
       },
-      lookup: (_host, _opts, cb) => cb(null, resolved.ip, resolved.family),
       timeout: REQUEST_TIMEOUT_MS,
-    });
+    };
+    if (isHttps) {
+      reqOpts.servername = parsed.hostname;     // SNI — TLS cert must match hostname, not IP
+    }
+    const req = lib.request(reqOpts);
 
     req.on('timeout', () => req.destroy(new Error('Request timed out')));
     req.on('error', reject);
