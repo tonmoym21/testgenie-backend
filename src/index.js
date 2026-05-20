@@ -190,6 +190,77 @@ logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backen
       `CREATE INDEX IF NOT EXISTS idx_team_audit_logs_actor ON team_audit_logs(actor_id)`,
       `CREATE INDEX IF NOT EXISTS idx_team_audit_logs_action ON team_audit_logs(action)`,
       `CREATE INDEX IF NOT EXISTS idx_team_audit_logs_created ON team_audit_logs(created_at DESC)`,
+
+      // ── Migration 017: API source import (catalog, versions, endpoints) ──
+      `CREATE TABLE IF NOT EXISTS api_sources (
+         id SERIAL PRIMARY KEY,
+         user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+         organization_id INTEGER REFERENCES organizations(id) ON DELETE SET NULL,
+         name VARCHAR(300) NOT NULL,
+         protocol VARCHAR(40) NOT NULL DEFAULT 'rest',
+         format VARCHAR(40) NOT NULL,
+         spec_version VARCHAR(40),
+         source_url TEXT,
+         servers JSONB NOT NULL DEFAULT '[]'::jsonb,
+         auth_schemes JSONB NOT NULL DEFAULT '[]'::jsonb,
+         refresh_policy JSONB NOT NULL DEFAULT '{"mode":"manual"}'::jsonb,
+         lifecycle_state VARCHAR(20) NOT NULL DEFAULT 'active',
+         provenance JSONB NOT NULL DEFAULT '{}'::jsonb,
+         endpoint_count INTEGER NOT NULL DEFAULT 0,
+         last_fetched_at TIMESTAMPTZ,
+         parsed_at TIMESTAMPTZ,
+         current_version_id INTEGER,
+         parent_source_id INTEGER REFERENCES api_sources(id) ON DELETE SET NULL,
+         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         deleted_at TIMESTAMPTZ
+       )`,
+      `CREATE INDEX IF NOT EXISTS idx_api_sources_user ON api_sources(user_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_api_sources_org  ON api_sources(organization_id)`,
+      `CREATE TABLE IF NOT EXISTS api_source_versions (
+         id SERIAL PRIMARY KEY,
+         source_id INTEGER NOT NULL REFERENCES api_sources(id) ON DELETE CASCADE,
+         content_address VARCHAR(80) NOT NULL,
+         raw_size_bytes INTEGER,
+         parser_version VARCHAR(40),
+         endpoint_count INTEGER NOT NULL DEFAULT 0,
+         change_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+         fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         parsed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+       )`,
+      `CREATE INDEX IF NOT EXISTS idx_api_source_versions_source ON api_source_versions(source_id, fetched_at DESC)`,
+      `CREATE INDEX IF NOT EXISTS idx_api_source_versions_address ON api_source_versions(content_address)`,
+      `CREATE TABLE IF NOT EXISTS api_endpoints (
+         id SERIAL PRIMARY KEY,
+         source_id INTEGER NOT NULL REFERENCES api_sources(id) ON DELETE CASCADE,
+         organization_id INTEGER REFERENCES organizations(id) ON DELETE SET NULL,
+         protocol VARCHAR(40) NOT NULL DEFAULT 'rest',
+         operation_id VARCHAR(300),
+         fingerprint VARCHAR(80) NOT NULL,
+         method VARCHAR(10) NOT NULL,
+         path TEXT NOT NULL,
+         summary TEXT,
+         description TEXT,
+         tags JSONB NOT NULL DEFAULT '[]'::jsonb,
+         auth_requirement JSONB NOT NULL DEFAULT '[]'::jsonb,
+         request_schema JSONB NOT NULL DEFAULT '{}'::jsonb,
+         response_schema JSONB NOT NULL DEFAULT '{}'::jsonb,
+         sample_request JSONB NOT NULL DEFAULT '{}'::jsonb,
+         bindings JSONB NOT NULL DEFAULT '{}'::jsonb,
+         examples JSONB NOT NULL DEFAULT '[]'::jsonb,
+         vendor_extensions JSONB NOT NULL DEFAULT '{}'::jsonb,
+         stability VARCHAR(20) NOT NULL DEFAULT 'stable',
+         first_seen_version_id INTEGER REFERENCES api_source_versions(id) ON DELETE SET NULL,
+         last_seen_version_id INTEGER REFERENCES api_source_versions(id) ON DELETE SET NULL,
+         deprecated_at TIMESTAMPTZ,
+         removed_at TIMESTAMPTZ,
+         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+       )`,
+      `CREATE INDEX IF NOT EXISTS idx_api_endpoints_source ON api_endpoints(source_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_api_endpoints_org    ON api_endpoints(organization_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_api_endpoints_fp     ON api_endpoints(fingerprint)`,
+      `CREATE INDEX IF NOT EXISTS idx_api_endpoints_method ON api_endpoints(method)`,
     ];
     for (const sql of statements) {
       try {
@@ -267,6 +338,7 @@ const folderRoutes = safeRequire('./routes/folders', 'folders');
 const testRunRoutes = safeRequire('./routes/testRuns', 'testRuns');
 const projectInsightsRoutes = safeRequire('./routes/projectInsights', 'projectInsights');
 const webhookRoutes = safeRequire('./routes/webhooks', 'webhooks');
+const apiSourceRoutes = safeRequire('./routes/apiSources', 'apiSources');
 
 // ============================================================================
 // CORS — credentials: true so the HttpOnly refresh cookie flows on /auth/refresh
@@ -406,6 +478,7 @@ app.use('/api/automation-assets', automationAssetRoutes);
 app.use('/api/team', teamRoutes);
 app.use('/api/environments', environmentRoutes);
 app.use('/api/collections', collectionRoutes);
+app.use('/api/sources', apiSourceRoutes);
 app.use('/api/schedules', scheduleRoutes);
 app.use('/api/reports', reportRoutes);
 
