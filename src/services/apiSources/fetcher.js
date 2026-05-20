@@ -169,6 +169,14 @@ function fetchOne(targetUrl, allowHttp) {
         res.resume();
         return resolve({ redirect: new URL(res.headers.location, targetUrl).toString(), status });
       }
+      // Non-2xx is a fetch failure. Previously we returned an empty body
+      // and let the detector fail downstream with a confusing message
+      // ("need either raw text or url"). Reject with a clear reason that
+      // bubbles to the paste-box pill.
+      if (status < 200 || status >= 300) {
+        res.resume();
+        return reject(new Error(`Fetch failed: ${targetUrl} returned HTTP ${status}`));
+      }
 
       const chunks = [];
       let size = 0;
@@ -181,6 +189,9 @@ function fetchOne(targetUrl, allowHttp) {
         chunks.push(chunk);
       });
       res.on('end', () => {
+        if (size === 0) {
+          return reject(new Error(`Fetch failed: ${targetUrl} returned an empty body (HTTP ${status})`));
+        }
         resolve({
           body: Buffer.concat(chunks),
           contentType: res.headers['content-type'] || '',
