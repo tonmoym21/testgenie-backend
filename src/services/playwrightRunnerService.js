@@ -5,13 +5,20 @@
 const { spawn, execSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
-const os = require('os');
 const db = require('../db');
 const logger = require('../utils/logger');
 const automationAssetService = require('./automationAssetService');
 const targetAppConfigService = require('./targetAppConfigService');
+const { maskSecretsInText, getSecretValues } = require('./environmentService');
+const lineageService = require('./lineageService');
 
-const RUNS_BASE_DIR = path.join(os.tmpdir(), 'testforge-pw-runs');
+// Persisted runs (was os.tmpdir() — artifacts were lost on cleanup, killing the
+// trace/video/screenshot pipeline downstream features depend on).
+const RUNS_BASE_DIR = process.env.ARTIFACT_DIR
+  ? path.resolve(process.env.ARTIFACT_DIR)
+  : path.join(process.cwd(), 'var', 'artifacts');
+
+try { fs.mkdirSync(RUNS_BASE_DIR, { recursive: true }); } catch { /* surface on first write */ }
 
 // ---------------------------------------------------------------------------
 // Runtime selector sanitizer — replaces TODO placeholders with real locators
@@ -225,107 +232,171 @@ async function runAsset(assetId, userId, { baseUrl, browser = 'chromium', catego
 }
 
 /**
- * Actually run Playwright in a temp dir.
+ * Run Playwright in a persisted run dir under RUNS_BASE_DIR.
+ *
+ * Phase 0 invariants:
+ *   - The run dir is NOT cleaned up. trace.zip, videos, and failure screenshots
+ *     stay on disk so the trace viewer (Phase 2) and the auto-fix-PR agent
+ *     (Phase 4) have something to read.
+ *   - output_logs is scrubbed of known secret values before insert.
+ *   - artifact_dir, trace_url, screenshot_urls, video_urls, html_report_url
+ *     columns on playwright_runs are populated from the on-disk results.
  */
 async function executePlaywright(run, asset, targetConfig) {
   const runDir = path.join(RUNS_BASE_DIR, `run-${run.id}`);
   const testsDir = path.join(runDir, 'tests');
   const resultsDir = path.join(runDir, 'results');
 
-  try {
-    fs.mkdirSync(testsDir, { recursive: true });
-    fs.mkdirSync(resultsDir, { recursive: true });
+  fs.mkdirSync(testsDir, { recursive: true });
+  fs.mkdirSync(resultsDir, { recursive: true });
 
-    const configCode = asset.config_code || generateDefaultConfig(run.base_url || (targetConfig && targetConfig.base_url), run.browser);
-    fs.writeFileSync(path.join(runDir, 'playwright.config.ts'), configCode);
+  const configCode = asset.config_code || generateDefaultConfig(run.base_url || (targetConfig && targetConfig.base_url), run.browser);
+  fs.writeFileSync(path.join(runDir, 'playwright.config.ts'), configCode);
 
-    const sourceIds = typeof asset.source_test_ids === 'string'
-      ? JSON.parse(asset.source_test_ids) : asset.source_test_ids || [];
+  const sourceIds = typeof asset.source_test_ids === 'string'
+    ? JSON.parse(asset.source_test_ids) : asset.source_test_ids || [];
 
-    if (sourceIds.length > 0) {
-      const testRows = await db.query('SELECT file_name, code FROM playwright_tests WHERE id = ANY($1::int[])', [sourceIds]);
-      for (const row of testRows.rows) {
-        // SANITIZE: replace TODO selectors with real locators from target config
-        const cleanCode = sanitize(row.code, targetConfig);
-        fs.writeFileSync(path.join(testsDir, row.file_name), cleanCode);
-      }
-    } else if (asset.story_id) {
-      const testRows = await db.query('SELECT file_name, code FROM playwright_tests WHERE story_id = $1 AND project_id = $2', [asset.story_id, asset.project_id]);
-      for (const row of testRows.rows) {
-        // SANITIZE: replace TODO selectors with real locators from target config
-        const cleanCode = sanitize(row.code, targetConfig);
-        fs.writeFileSync(path.join(testsDir, row.file_name), cleanCode);
-      }
+  if (sourceIds.length > 0) {
+    const testRows = await db.query('SELECT file_name, code FROM playwright_tests WHERE id = ANY($1::int[])', [sourceIds]);
+    for (const row of testRows.rows) {
+      // SANITIZE: replace TODO selectors with real locators from target config
+      const cleanCode = sanitize(row.code, targetConfig);
+      fs.writeFileSync(path.join(testsDir, row.file_name), cleanCode);
     }
-
-    const writtenFiles = fs.readdirSync(testsDir).filter((f) => f.endsWith('.spec.ts'));
-    if (writtenFiles.length === 0) throw new Error('No test files found for this asset');
-
-    await bootstrapRunDir(runDir, run.id);
-
-    logger.info({ runId: run.id, fileCount: writtenFiles.length, dir: runDir, hasSanitization: !!targetConfig }, 'Running Playwright');
-
-    const startMs = Date.now();
-
-    // Build env with credential env vars if configured
-    const extraEnv = {};
-    if (targetConfig) {
-      if (run.base_url || targetConfig.base_url) {
-        extraEnv.BASE_URL = run.base_url || targetConfig.base_url;
-      }
+  } else if (asset.story_id) {
+    const testRows = await db.query('SELECT file_name, code FROM playwright_tests WHERE story_id = $1 AND project_id = $2', [asset.story_id, asset.project_id]);
+    for (const row of testRows.rows) {
+      // SANITIZE: replace TODO selectors with real locators from target config
+      const cleanCode = sanitize(row.code, targetConfig);
+      fs.writeFileSync(path.join(testsDir, row.file_name), cleanCode);
     }
-
-    const { stdout, stderr, exitCode } = await spawnPlaywright(runDir, run.browser, run.base_url, extraEnv);
-    const durationMs = Date.now() - startMs;
-
-    let parsed = { total: writtenFiles.length, passed: 0, failed: 0, skipped: 0 };
-    const jsonReportPath = path.join(resultsDir, 'report.json');
-    if (fs.existsSync(jsonReportPath)) {
-      try {
-        const report = JSON.parse(fs.readFileSync(jsonReportPath, 'utf8'));
-        if (report.stats) {
-          parsed.total = report.stats.expected + (report.stats.unexpected || 0) + (report.stats.skipped || 0);
-          parsed.passed = report.stats.expected || 0;
-          parsed.failed = report.stats.unexpected || 0;
-          parsed.skipped = report.stats.skipped || 0;
-        }
-      } catch { /* use defaults */ }
-    } else {
-      const passMatch = stdout.match(/(\d+) passed/);
-      const failMatch = stdout.match(/(\d+) failed/);
-      const skipMatch = stdout.match(/(\d+) skipped/);
-      if (passMatch) parsed.passed = parseInt(passMatch[1], 10);
-      if (failMatch) parsed.failed = parseInt(failMatch[1], 10);
-      if (skipMatch) parsed.skipped = parseInt(skipMatch[1], 10);
-      parsed.total = parsed.passed + parsed.failed + parsed.skipped;
-    }
-
-    const finalStatus = exitCode === 0 ? 'passed' : 'failed';
-    const combinedOutput = (stdout + '\n' + stderr).slice(0, 50000);
-
-    await db.query(
-      `UPDATE playwright_runs SET
-         status = $2, finished_at = NOW(), duration_ms = $3,
-         total_tests = $4, passed_tests = $5, failed_tests = $6, skipped_tests = $7,
-         output_logs = $8, error_summary = $9, raw_result_json = $10
-       WHERE id = $1`,
-      [run.id, finalStatus, durationMs, parsed.total, parsed.passed, parsed.failed, parsed.skipped,
-       combinedOutput, parsed.failed > 0 ? `${parsed.failed} test(s) failed` : null, JSON.stringify(parsed)]
-    );
-
-    await automationAssetService.updateLastRun(run.automation_asset_id, finalStatus, new Date().toISOString());
-
-    await db.query(
-      `UPDATE execution_run_items SET
-         item_status = $2, duration_ms = $3, output_log = $4, finished_at = NOW()
-       WHERE execution_run_id = $1 AND automation_asset_id = $5`,
-      [run.id, finalStatus, durationMs, combinedOutput.slice(0, 10000), run.automation_asset_id]
-    );
-
-    logger.info({ runId: run.id, status: finalStatus, duration: durationMs, ...parsed }, 'Playwright run complete');
-  } finally {
-    try { fs.rmSync(runDir, { recursive: true, force: true }); } catch { /* ignore */ }
   }
+
+  const writtenFiles = fs.readdirSync(testsDir).filter((f) => f.endsWith('.spec.ts'));
+  if (writtenFiles.length === 0) throw new Error('No test files found for this asset');
+
+  await bootstrapRunDir(runDir, run.id);
+
+  logger.info({ runId: run.id, fileCount: writtenFiles.length, dir: runDir, hasSanitization: !!targetConfig }, 'Running Playwright');
+
+  // Pull secret values up front so we can scrub them out of stdout/stderr.
+  // Failures here are non-fatal — better to log unscrubbed than fail the run.
+  let secretValues = [];
+  try {
+    secretValues = await getSecretValues(run.triggered_by);
+  } catch (err) {
+    logger.warn({ runId: run.id, err: err.message }, 'Could not load secret values for log scrubbing');
+  }
+
+  const startMs = Date.now();
+
+  const extraEnv = {};
+  if (targetConfig) {
+    if (run.base_url || targetConfig.base_url) {
+      extraEnv.BASE_URL = run.base_url || targetConfig.base_url;
+    }
+  }
+
+  const { stdout, stderr, exitCode } = await spawnPlaywright(runDir, run.browser, run.base_url, extraEnv);
+  const durationMs = Date.now() - startMs;
+
+  let parsed = { total: writtenFiles.length, passed: 0, failed: 0, skipped: 0 };
+  let report = null;
+  const jsonReportPath = path.join(resultsDir, 'report.json');
+  if (fs.existsSync(jsonReportPath)) {
+    try {
+      report = JSON.parse(fs.readFileSync(jsonReportPath, 'utf8'));
+      if (report.stats) {
+        parsed.total = report.stats.expected + (report.stats.unexpected || 0) + (report.stats.skipped || 0);
+        parsed.passed = report.stats.expected || 0;
+        parsed.failed = report.stats.unexpected || 0;
+        parsed.skipped = report.stats.skipped || 0;
+      }
+    } catch { /* use defaults */ }
+  } else {
+    const passMatch = stdout.match(/(\d+) passed/);
+    const failMatch = stdout.match(/(\d+) failed/);
+    const skipMatch = stdout.match(/(\d+) skipped/);
+    if (passMatch) parsed.passed = parseInt(passMatch[1], 10);
+    if (failMatch) parsed.failed = parseInt(failMatch[1], 10);
+    if (skipMatch) parsed.skipped = parseInt(skipMatch[1], 10);
+    parsed.total = parsed.passed + parsed.failed + parsed.skipped;
+  }
+
+  const finalStatus = exitCode === 0 ? 'passed' : 'failed';
+  const rawCombined = (stdout + '\n' + stderr).slice(0, 50000);
+  const combinedOutput = maskSecretsInText(rawCombined, secretValues);
+
+  // Walk the persisted run dir for artifacts. Paths are stored relative to
+  // RUNS_BASE_DIR so they survive an ARTIFACT_DIR remount; an HTTP layer in
+  // Phase 2 will turn them into signed URLs.
+  const artifacts = collectArtifacts(runDir);
+
+  await db.query(
+    `UPDATE playwright_runs SET
+       status = $2, finished_at = NOW(), duration_ms = $3,
+       total_tests = $4, passed_tests = $5, failed_tests = $6, skipped_tests = $7,
+       output_logs = $8, error_summary = $9, raw_result_json = $10,
+       artifact_dir = $11, trace_url = $12, screenshot_urls = $13, video_urls = $14, html_report_url = $15
+     WHERE id = $1`,
+    [
+      run.id, finalStatus, durationMs, parsed.total, parsed.passed, parsed.failed, parsed.skipped,
+      combinedOutput, parsed.failed > 0 ? `${parsed.failed} test(s) failed` : null, JSON.stringify(parsed),
+      runDir, artifacts.trace, JSON.stringify(artifacts.screenshots), JSON.stringify(artifacts.videos), artifacts.htmlReport,
+    ]
+  );
+
+  await automationAssetService.updateLastRun(run.automation_asset_id, finalStatus, new Date().toISOString());
+
+  await db.query(
+    `UPDATE execution_run_items SET
+       item_status = $2, duration_ms = $3, output_log = $4, finished_at = NOW()
+     WHERE execution_run_id = $1 AND automation_asset_id = $5`,
+    [run.id, finalStatus, durationMs, combinedOutput.slice(0, 10000), run.automation_asset_id]
+  );
+
+  // Closed-loop lineage: per-spec results + deduplicated failure signatures.
+  // Non-fatal — the run row is already final; lineage is best-effort.
+  try {
+    const counts = await lineageService.writeRunLineage(run, report);
+    logger.info({ runId: run.id, ...counts }, 'Lineage written');
+  } catch (err) {
+    logger.warn({ runId: run.id, err: err.message }, 'Lineage write failed');
+  }
+
+  logger.info({ runId: run.id, status: finalStatus, duration: durationMs, dir: runDir, ...parsed }, 'Playwright run complete');
+}
+
+/**
+ * Walk a finished run dir and pluck out the artifacts Playwright dropped.
+ * Returns paths relative to RUNS_BASE_DIR so callers can mount or sign them later.
+ */
+function collectArtifacts(runDir) {
+  const out = { trace: null, screenshots: [], videos: [], htmlReport: null };
+  const rel = (p) => path.relative(RUNS_BASE_DIR, p).split(path.sep).join('/');
+
+  // Default Playwright output dir is `test-results/` under cwd
+  const testResultsDir = path.join(runDir, 'test-results');
+  if (fs.existsSync(testResultsDir)) {
+    const walk = (dir) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) { walk(full); continue; }
+        if (entry.name === 'trace.zip' && !out.trace) out.trace = rel(full);
+        else if (entry.name.endsWith('.zip') && entry.name.includes('trace')) out.screenshots.push(rel(full)); // rare zip variants
+        else if (/\.(png|jpg|jpeg)$/i.test(entry.name)) out.screenshots.push(rel(full));
+        else if (/\.(webm|mp4)$/i.test(entry.name)) out.videos.push(rel(full));
+      }
+    };
+    try { walk(testResultsDir); } catch (err) {
+      logger.warn({ runDir, err: err.message }, 'collectArtifacts: walk failed');
+    }
+  }
+
+  const htmlIndex = path.join(runDir, 'playwright-report', 'index.html');
+  if (fs.existsSync(htmlIndex)) out.htmlReport = rel(htmlIndex);
+
+  return out;
 }
 
 /**
@@ -412,7 +483,7 @@ function spawnPlaywright(cwd, browser = 'chromium', baseUrl, extraEnv = {}) {
     if (baseUrl) env.BASE_URL = baseUrl;
     if (process.env.PLAYWRIGHT_BROWSERS_PATH) env.PLAYWRIGHT_BROWSERS_PATH = process.env.PLAYWRIGHT_BROWSERS_PATH;
 
-    const proc = spawn('npx', args, { cwd, env, shell: true, timeout: 120000 });
+    const proc = spawn('npx', args, { cwd, env, shell: true, timeout: 600000 });
     let stdout = '', stderr = '';
     proc.stdout.on('data', (d) => { stdout += d.toString(); });
     proc.stderr.on('data', (d) => { stderr += d.toString(); });
@@ -429,11 +500,16 @@ export default defineConfig({
   forbidOnly: true,
   retries: 1,
   workers: 1,
-  reporter: [['line'], ['json', { outputFile: 'results/report.json' }]],
+  reporter: [
+    ['line'],
+    ['json', { outputFile: 'results/report.json' }],
+    ['html', { outputFolder: 'playwright-report', open: 'never' }],
+  ],
   use: {
     baseURL: '${baseUrl || 'http://localhost:3000'}',
-    trace: 'on-first-retry',
+    trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
+    video: 'retain-on-failure',
   },
   projects: [
     { name: '${browser || 'chromium'}', use: { ...devices['Desktop Chrome'] } },

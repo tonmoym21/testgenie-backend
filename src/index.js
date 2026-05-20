@@ -130,6 +130,46 @@ logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backen
       `UPDATE run_reports r SET organization_id = u.organization_id FROM users u
          WHERE r.user_id = u.id AND u.organization_id IS NOT NULL AND r.organization_id IS NULL`,
 
+      // ── Reconcile 006 team-mgmt columns/tables ──
+      // Migration 006 used CREATE TABLE IF NOT EXISTS for `organizations`
+      // assuming the table didn't yet exist. On any DB where the table was
+      // already present (1711756800000_initial-schema.sql created it), the
+      // new columns silently never landed. These idempotent ALTERs close
+      // that gap so register/login work on a DB that's been live since
+      // the early schema without needing a manual backfill.
+      `ALTER TABLE organizations ADD COLUMN IF NOT EXISTS logo_url TEXT`,
+      `ALTER TABLE organizations ADD COLUMN IF NOT EXISTS settings JSONB DEFAULT '{}'::jsonb`,
+      `ALTER TABLE organizations ADD COLUMN IF NOT EXISTS domain_restriction_enabled BOOLEAN NOT NULL DEFAULT false`,
+      `ALTER TABLE organizations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS deactivated_at TIMESTAMPTZ`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS deactivated_by INTEGER REFERENCES users(id) ON DELETE SET NULL`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMPTZ`,
+      `CREATE TABLE IF NOT EXISTS organization_members (
+         id SERIAL PRIMARY KEY,
+         organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+         role TEXT NOT NULL DEFAULT 'member',
+         invited_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+         joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         UNIQUE(organization_id, user_id)
+       )`,
+      `CREATE INDEX IF NOT EXISTS idx_organization_members_org ON organization_members(organization_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_organization_members_user ON organization_members(user_id)`,
+      `CREATE TABLE IF NOT EXISTS allowed_email_domains (
+         id SERIAL PRIMARY KEY,
+         organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+         domain TEXT NOT NULL,
+         created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         UNIQUE(organization_id, domain)
+       )`,
+      `CREATE INDEX IF NOT EXISTS idx_allowed_email_domains_org ON allowed_email_domains(organization_id)`,
+
       // ── Migration 012: platform-wide audit log columns ──
       `CREATE TABLE IF NOT EXISTS team_audit_logs (
          id SERIAL PRIMARY KEY,
@@ -184,6 +224,77 @@ logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backen
          PRIMARY KEY (user_id, collection_id)
        )`,
       `CREATE INDEX IF NOT EXISTS idx_chain_sessions_updated ON chain_sessions(updated_at)`,
+
+      // ── Migration 017: API source import (catalog, versions, endpoints) ──
+      `CREATE TABLE IF NOT EXISTS api_sources (
+         id SERIAL PRIMARY KEY,
+         user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+         organization_id INTEGER REFERENCES organizations(id) ON DELETE SET NULL,
+         name VARCHAR(300) NOT NULL,
+         protocol VARCHAR(40) NOT NULL DEFAULT 'rest',
+         format VARCHAR(40) NOT NULL,
+         spec_version VARCHAR(40),
+         source_url TEXT,
+         servers JSONB NOT NULL DEFAULT '[]'::jsonb,
+         auth_schemes JSONB NOT NULL DEFAULT '[]'::jsonb,
+         refresh_policy JSONB NOT NULL DEFAULT '{"mode":"manual"}'::jsonb,
+         lifecycle_state VARCHAR(20) NOT NULL DEFAULT 'active',
+         provenance JSONB NOT NULL DEFAULT '{}'::jsonb,
+         endpoint_count INTEGER NOT NULL DEFAULT 0,
+         last_fetched_at TIMESTAMPTZ,
+         parsed_at TIMESTAMPTZ,
+         current_version_id INTEGER,
+         parent_source_id INTEGER REFERENCES api_sources(id) ON DELETE SET NULL,
+         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         deleted_at TIMESTAMPTZ
+       )`,
+      `CREATE INDEX IF NOT EXISTS idx_api_sources_user ON api_sources(user_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_api_sources_org  ON api_sources(organization_id)`,
+      `CREATE TABLE IF NOT EXISTS api_source_versions (
+         id SERIAL PRIMARY KEY,
+         source_id INTEGER NOT NULL REFERENCES api_sources(id) ON DELETE CASCADE,
+         content_address VARCHAR(80) NOT NULL,
+         raw_size_bytes INTEGER,
+         parser_version VARCHAR(40),
+         endpoint_count INTEGER NOT NULL DEFAULT 0,
+         change_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+         fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         parsed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+       )`,
+      `CREATE INDEX IF NOT EXISTS idx_api_source_versions_source ON api_source_versions(source_id, fetched_at DESC)`,
+      `CREATE INDEX IF NOT EXISTS idx_api_source_versions_address ON api_source_versions(content_address)`,
+      `CREATE TABLE IF NOT EXISTS api_endpoints (
+         id SERIAL PRIMARY KEY,
+         source_id INTEGER NOT NULL REFERENCES api_sources(id) ON DELETE CASCADE,
+         organization_id INTEGER REFERENCES organizations(id) ON DELETE SET NULL,
+         protocol VARCHAR(40) NOT NULL DEFAULT 'rest',
+         operation_id VARCHAR(300),
+         fingerprint VARCHAR(80) NOT NULL,
+         method VARCHAR(10) NOT NULL,
+         path TEXT NOT NULL,
+         summary TEXT,
+         description TEXT,
+         tags JSONB NOT NULL DEFAULT '[]'::jsonb,
+         auth_requirement JSONB NOT NULL DEFAULT '[]'::jsonb,
+         request_schema JSONB NOT NULL DEFAULT '{}'::jsonb,
+         response_schema JSONB NOT NULL DEFAULT '{}'::jsonb,
+         sample_request JSONB NOT NULL DEFAULT '{}'::jsonb,
+         bindings JSONB NOT NULL DEFAULT '{}'::jsonb,
+         examples JSONB NOT NULL DEFAULT '[]'::jsonb,
+         vendor_extensions JSONB NOT NULL DEFAULT '{}'::jsonb,
+         stability VARCHAR(20) NOT NULL DEFAULT 'stable',
+         first_seen_version_id INTEGER REFERENCES api_source_versions(id) ON DELETE SET NULL,
+         last_seen_version_id INTEGER REFERENCES api_source_versions(id) ON DELETE SET NULL,
+         deprecated_at TIMESTAMPTZ,
+         removed_at TIMESTAMPTZ,
+         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+       )`,
+      `CREATE INDEX IF NOT EXISTS idx_api_endpoints_source ON api_endpoints(source_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_api_endpoints_org    ON api_endpoints(organization_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_api_endpoints_fp     ON api_endpoints(fingerprint)`,
+      `CREATE INDEX IF NOT EXISTS idx_api_endpoints_method ON api_endpoints(method)`,
     ];
     for (const sql of statements) {
       try {
@@ -260,6 +371,8 @@ const jiraRoutes = safeRequire('./routes/jira', 'jira');
 const folderRoutes = safeRequire('./routes/folders', 'folders');
 const testRunRoutes = safeRequire('./routes/testRuns', 'testRuns');
 const projectInsightsRoutes = safeRequire('./routes/projectInsights', 'projectInsights');
+const webhookRoutes = safeRequire('./routes/webhooks', 'webhooks');
+const apiSourceRoutes = safeRequire('./routes/apiSources', 'apiSources');
 
 // ============================================================================
 // CORS — credentials: true so the HttpOnly refresh cookie flows on /auth/refresh
@@ -310,7 +423,17 @@ app.use(cors(buildCorsOptions()));
 // ============================================================================
 // BODY PARSING + GLOBAL RATE LIMIT
 // ============================================================================
-app.use(express.json({ limit: '10mb' }));
+// GitHub webhook handlers need the raw request body to recompute the HMAC
+// over the exact bytes GitHub signed. Stashing buf on req for /api/webhooks/*
+// only — keeps memory cost off every other request.
+app.use(express.json({
+  limit: '10mb',
+  verify: (req, _res, buf) => {
+    if (req.url && req.url.startsWith('/api/webhooks/')) {
+      req.rawBody = buf;
+    }
+  },
+}));
 // rateLimiter is the generalLimiter middleware (default export). It skips
 // /health, /healthz, /api/health and /api/version automatically.
 app.use(rateLimiter);
@@ -389,6 +512,7 @@ app.use('/api/automation-assets', automationAssetRoutes);
 app.use('/api/team', teamRoutes);
 app.use('/api/environments', environmentRoutes);
 app.use('/api/collections', collectionRoutes);
+app.use('/api/sources', apiSourceRoutes);
 app.use('/api/schedules', scheduleRoutes);
 app.use('/api/reports', reportRoutes);
 
@@ -401,6 +525,9 @@ app.use('/api/jira', jiraRoutes);
 // Sharing is mounted as a sub-router on collections: /api/collections/:id/share
 // sharing router uses mergeParams to read req.params.id
 app.use('/api/collections/:id/share', sharingRoutes);
+
+// Webhooks — public (HMAC-verified inside the handler), no auth middleware.
+app.use('/api/webhooks', webhookRoutes);
 
 // Execute routes LAST — mounted at /api with `router.use(authenticate)` inside.
 app.use('/api', executeRoutes);

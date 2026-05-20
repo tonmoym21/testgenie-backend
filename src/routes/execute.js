@@ -7,8 +7,10 @@ const executionService = require('../automation/executionService');
 
 const router = Router();
 
-// All execution routes require authentication
-router.use(authenticate);
+// Authentication is attached per-route, not via `router.use`, because this
+// router is mounted at the broad '/api' prefix. A blanket router.use(auth)
+// would catch every unknown /api/* path before Express's 404 handler runs,
+// surfacing 401 for what should be NOT_FOUND.
 
 // POST /api/execute-test
 const executeBodySchema = z.object({
@@ -16,7 +18,7 @@ const executeBodySchema = z.object({
   projectId: z.number().int().positive().optional(),
 });
 
-router.post('/execute-test', validate(executeBodySchema), async (req, res, next) => {
+router.post('/execute-test', authenticate, validate(executeBodySchema), async (req, res, next) => {
   try {
     // Validate test definition with the strict schema
     const parsed = executeTestSchema.parse({ test: req.body.test });
@@ -41,7 +43,7 @@ const listQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(20),
 });
 
-router.get('/executions', validateQuery(listQuerySchema), async (req, res, next) => {
+router.get('/executions', authenticate, validateQuery(listQuerySchema), async (req, res, next) => {
   try {
     const result = await executionService.getExecutions(req.user.id, req.query);
     res.json(result);
@@ -51,7 +53,7 @@ router.get('/executions', validateQuery(listQuerySchema), async (req, res, next)
 });
 
 // GET /api/executions/:id -- single execution with full logs
-router.get('/executions/:id', async (req, res, next) => {
+router.get('/executions/:id', authenticate, async (req, res, next) => {
   try {
     const result = await executionService.getExecution(req.user.id, req.params.id);
     res.json(result);

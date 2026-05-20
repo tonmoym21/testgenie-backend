@@ -3,3 +3,7 @@ node_modules/
 *.log
 dist/
 .DS_Store
+
+# Playwright runner: persisted run dirs (trace.zip, videos, screenshots, HTML report)
+var/artifacts/
+var/
