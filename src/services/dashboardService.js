@@ -82,68 +82,114 @@ async function getCombinedMetrics(userId) {
   };
 
   try {
-    // Check if core table exists
+    // The dashboard aggregates two parallel sources:
+    //   - test_executions     — automated/Playwright runs (have duration_ms)
+    //   - test_run_results    — manual test run results (no duration)
+    // Either may be empty, but we should not early-return just because
+    // test_executions is missing (manual runs still need to show up).
     const hasTestExecutions = await tableExists('test_executions');
-    if (!hasTestExecutions) {
-      logger.warn({ userId }, 'test_executions table does not exist');
+    const hasTestRunResults = await tableExists('test_run_results');
+
+    if (!hasTestExecutions && !hasTestRunResults) {
+      logger.warn({ userId }, 'Neither test_executions nor test_run_results table exists');
       return emptyResponse;
     }
 
-    // Overall execution stats
-    const execStats = await safeQuery(
-      `SELECT 
-         COUNT(*)::int AS total_runs,
-         COUNT(*) FILTER (WHERE status = 'passed')::int AS passed,
-         COUNT(*) FILTER (WHERE status = 'failed')::int AS failed,
-         COUNT(*) FILTER (WHERE status = 'running')::int AS running,
-         COALESCE(AVG(duration_ms), 0)::int AS avg_duration
-       FROM test_executions WHERE ($1::int IS NOT NULL) /* platform-wide */`,
-      [userId],
-      { rows: [{ total_runs: 0, passed: 0, failed: 0, running: 0, avg_duration: 0 }] }
-    );
+    // Overall stats — combine both sources. test_executions contributes
+    // duration_ms (used for avg_duration); test_run_results doesn't.
+    const execStats = hasTestExecutions
+      ? await safeQuery(
+          `SELECT
+             COUNT(*)::int AS total_runs,
+             COUNT(*) FILTER (WHERE status = 'passed')::int AS passed,
+             COUNT(*) FILTER (WHERE status = 'failed')::int AS failed,
+             COUNT(*) FILTER (WHERE status = 'running')::int AS running,
+             COALESCE(AVG(duration_ms), 0)::int AS avg_duration
+           FROM test_executions WHERE ($1::int IS NOT NULL) /* platform-wide */`,
+          [userId],
+          { rows: [{ total_runs: 0, passed: 0, failed: 0, running: 0, avg_duration: 0 }] }
+        )
+      : { rows: [{ total_runs: 0, passed: 0, failed: 0, running: 0, avg_duration: 0 }] };
 
-    // By test type
-    const byType = await safeQuery(
-      `SELECT test_type AS type, COUNT(*)::int AS count,
-              COUNT(*) FILTER (WHERE status = 'passed')::int AS passed,
-              COUNT(*) FILTER (WHERE status = 'failed')::int AS failed
-       FROM test_executions WHERE ($1::int IS NOT NULL) /* platform-wide */
-       GROUP BY test_type`,
-      [userId]
-    );
+    const manualStats = hasTestRunResults
+      ? await safeQuery(
+          `SELECT
+             COUNT(*)::int AS total_runs,
+             COUNT(*) FILTER (WHERE status = 'passed')::int AS passed,
+             COUNT(*) FILTER (WHERE status = 'failed')::int AS failed,
+             COUNT(*) FILTER (WHERE status IN ('blocked', 'retest'))::int AS running
+           FROM test_run_results WHERE ($1::int IS NOT NULL) /* platform-wide */`,
+          [userId],
+          { rows: [{ total_runs: 0, passed: 0, failed: 0, running: 0 }] }
+        )
+      : { rows: [{ total_runs: 0, passed: 0, failed: 0, running: 0 }] };
 
-    // Daily trend (30 days)
+    // By test type — only meaningful for test_executions (which has test_type).
+    // Manual results lump under a single "manual" bucket for visibility.
+    const byType = hasTestExecutions
+      ? await safeQuery(
+          `SELECT test_type AS type, COUNT(*)::int AS count,
+                  COUNT(*) FILTER (WHERE status = 'passed')::int AS passed,
+                  COUNT(*) FILTER (WHERE status = 'failed')::int AS failed
+           FROM test_executions WHERE ($1::int IS NOT NULL) /* platform-wide */
+           GROUP BY test_type`,
+          [userId]
+        )
+      : { rows: [] };
+
+    const manualByType = hasTestRunResults
+      ? await safeQuery(
+          `SELECT 'manual'::text AS type, COUNT(*)::int AS count,
+                  COUNT(*) FILTER (WHERE status = 'passed')::int AS passed,
+                  COUNT(*) FILTER (WHERE status = 'failed')::int AS failed
+           FROM test_run_results WHERE ($1::int IS NOT NULL) /* platform-wide */
+           HAVING COUNT(*) > 0`,
+          [userId]
+        )
+      : { rows: [] };
+
+    // Daily trend (30 days) — UNION both sources by date.
     const dailyTrend = await safeQuery(
-      `SELECT DATE(created_at) AS date,
+      `WITH combined AS (
+         ${hasTestExecutions ? `SELECT DATE(created_at) AS d, status FROM test_executions
+            WHERE created_at > NOW() - INTERVAL '30 days'` : `SELECT NULL::date AS d, NULL::text AS status WHERE false`}
+         UNION ALL
+         ${hasTestRunResults ? `SELECT DATE(created_at) AS d, status FROM test_run_results
+            WHERE created_at > NOW() - INTERVAL '30 days'` : `SELECT NULL::date AS d, NULL::text AS status WHERE false`}
+       )
+       SELECT d AS date,
               COUNT(*)::int AS total,
               COUNT(*) FILTER (WHERE status = 'passed')::int AS passed,
               COUNT(*) FILTER (WHERE status = 'failed')::int AS failed
-       FROM test_executions
-       WHERE ($1::int IS NOT NULL) /* platform-wide */ AND created_at > NOW() - INTERVAL '30 days'
-       GROUP BY DATE(created_at)
-       ORDER BY date`,
+       FROM combined
+       WHERE d IS NOT NULL AND ($1::int IS NOT NULL) /* platform-wide */
+       GROUP BY d
+       ORDER BY d`,
       [userId]
     );
 
-    // Recent executions
-    const recentRuns = await safeQuery(
-      `SELECT id, test_name AS "testName", test_type AS "testType", status,
-              duration_ms AS "durationMs", completed_at AS "completedAt", error
-       FROM test_executions
-       WHERE ($1::int IS NOT NULL) /* platform-wide */
-       ORDER BY created_at DESC LIMIT 10`,
-      [userId]
-    );
+    // Recent activity — automated only (where we have rich rows).
+    const recentRuns = hasTestExecutions
+      ? await safeQuery(
+          `SELECT id, test_name AS "testName", test_type AS "testType", status,
+                  duration_ms AS "durationMs", completed_at AS "completedAt", error
+           FROM test_executions
+           WHERE ($1::int IS NOT NULL) /* platform-wide */
+           ORDER BY created_at DESC LIMIT 10`,
+          [userId]
+        )
+      : { rows: [] };
 
-    // Recent failures
-    const recentFailures = await safeQuery(
-      `SELECT id, test_name AS "testName", test_type AS "testType", error,
-              duration_ms AS "durationMs", completed_at AS "completedAt"
-       FROM test_executions
-       WHERE ($1::int IS NOT NULL) /* platform-wide */ AND status = 'failed'
-       ORDER BY created_at DESC LIMIT 5`,
-      [userId]
-    );
+    const recentFailures = hasTestExecutions
+      ? await safeQuery(
+          `SELECT id, test_name AS "testName", test_type AS "testType", error,
+                  duration_ms AS "durationMs", completed_at AS "completedAt"
+           FROM test_executions
+           WHERE ($1::int IS NOT NULL) /* platform-wide */ AND status = 'failed'
+           ORDER BY created_at DESC LIMIT 5`,
+          [userId]
+        )
+      : { rows: [] };
 
     // Active schedules count
     let schedules = { rows: [{ active: 0, total: 0 }] };
@@ -168,22 +214,26 @@ async function getCombinedMetrics(userId) {
       collectionsCount = getRowValue(collections, 'total', 0);
     }
 
-    // Build response
-    const stats = execStats.rows?.[0] || { total_runs: 0, passed: 0, failed: 0, running: 0, avg_duration: 0 };
-    const passRate = stats.total_runs > 0 
-      ? Math.round((stats.passed / stats.total_runs) * 100) 
-      : 0;
+    // Build response — sum across automated + manual sources.
+    const auto = execStats.rows?.[0] || { total_runs: 0, passed: 0, failed: 0, running: 0, avg_duration: 0 };
+    const manual = manualStats.rows?.[0] || { total_runs: 0, passed: 0, failed: 0, running: 0 };
+    const totalRuns = (auto.total_runs || 0) + (manual.total_runs || 0);
+    const totalPassed = (auto.passed || 0) + (manual.passed || 0);
+    const totalFailed = (auto.failed || 0) + (manual.failed || 0);
+    const passRate = totalRuns > 0 ? Math.round((totalPassed / totalRuns) * 100) : 0;
+
+    const combinedByType = [...(byType.rows || []), ...(manualByType.rows || [])];
 
     return {
       summary: {
-        totalRuns: stats.total_runs || 0,
-        passed: stats.passed || 0,
-        failed: stats.failed || 0,
-        running: stats.running || 0,
+        totalRuns,
+        passed: totalPassed,
+        failed: totalFailed,
+        running: (auto.running || 0) + (manual.running || 0),
         passRate,
-        avgDuration: stats.avg_duration || 0
+        avgDuration: auto.avg_duration || 0,
       },
-      byType: (byType.rows || []).reduce((acc, row) => {
+      byType: combinedByType.reduce((acc, row) => {
         if (row?.type) {
           acc[row.type] = { count: row.count || 0, passed: row.passed || 0, failed: row.failed || 0 };
         }
