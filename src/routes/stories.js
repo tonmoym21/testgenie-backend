@@ -111,18 +111,8 @@ router.get('/', authenticate, async (req, res, next) => {
 
     res.json(result.rows);
   } catch (err) {
-    // Log the actual DB error AND surface its message + code to the client
-    // temporarily so we can diagnose without needing Render log access.
-    // The generic errorHandler would otherwise mask this as "Internal
-    // server error" in production. Remove the inline detail once stable.
     logger.error({ err: err.message, code: err.code, projectId: req.params.projectId }, 'GET /stories failed');
-    return res.status(500).json({
-      error: {
-        code: 'STORIES_QUERY_FAILED',
-        message: err.message || 'Stories query failed',
-        pgCode: err.code,
-      },
-    });
+    next(err);
   }
 });
 
