@@ -386,8 +386,94 @@ async function setCaseAssignee(userId, projectId, runId, caseId, assigneeUserId,
   return { testCaseId: Number(caseId), assigneeUserId: assigneeUserId || null };
 }
 
+// ============================================================================
+// CROSS-PROJECT HELPERS — power the top-level /api/runs surface so the user
+// can list and create runs without first picking a project. A single run is
+// still bound to exactly one project (test_runs.project_id FK is load-
+// bearing for permissions and reports), but the project is derived from
+// the cases the user picks instead of forced upfront.
+// ============================================================================
+
+// Platform-wide listing. Optional `state` filter mirrors the per-project list.
+async function listAcrossProjects(_userId, { state } = {}, _orgId) {
+  const params = [];
+  let where = '';
+  if (state) {
+    params.push(state);
+    where = `WHERE tr.state = $${params.length}`;
+  }
+  const result = await db.query(
+    `SELECT ${COLS}, p.name AS "projectName"
+     FROM test_runs tr
+     LEFT JOIN users u ON u.id = tr.assignee_user_id
+     LEFT JOIN projects p ON p.id = tr.project_id
+     ${where}
+     ORDER BY tr.created_at DESC`,
+    params
+  );
+  return { data: result.rows };
+}
+
+// Cross-project test-case search for the picker. Loads up to `limit` rows
+// across every project the user can see, joined with the project name so
+// the picker can show "ProjectA / Login validates" — visual disambiguation
+// when test-case titles collide across projects.
+async function listTestCasesAcrossProjects(_userId, { q, limit = 200 } = {}, _orgId) {
+  const params = [];
+  let where = '';
+  if (q) {
+    params.push(`%${q.toLowerCase()}%`);
+    where = `WHERE LOWER(tc.title) LIKE $${params.length} OR LOWER(tc.content) LIKE $${params.length}`;
+  }
+  params.push(Math.max(1, Math.min(500, Number(limit) || 200)));
+  const result = await db.query(
+    `SELECT tc.id, tc.title, tc.content, tc.priority,
+            tc.project_id AS "projectId",
+            p.name AS "projectName"
+     FROM test_cases tc
+     LEFT JOIN projects p ON p.id = tc.project_id
+     ${where}
+     ORDER BY tc.updated_at DESC
+     LIMIT $${params.length}`,
+    params
+  );
+  return { data: result.rows };
+}
+
+// Create a run with the project derived from the cases. Rejects mixed-
+// project case lists with a clear 422 so the frontend can surface the
+// constraint instead of producing a silently-broken run.
+async function createFromCases(userId, body, orgId) {
+  const { testCaseIds = [] } = body || {};
+  if (!Array.isArray(testCaseIds) || testCaseIds.length === 0) {
+    const err = new Error('Pick at least one test case to create a run.');
+    err.statusCode = 422;
+    throw err;
+  }
+  const idsResult = await db.query(
+    `SELECT DISTINCT project_id FROM test_cases WHERE id = ANY($1::int[])`,
+    [testCaseIds]
+  );
+  const projects = idsResult.rows.map((r) => r.project_id);
+  if (projects.length === 0) {
+    const err = new Error('No matching test cases were found.');
+    err.statusCode = 404;
+    throw err;
+  }
+  if (projects.length > 1) {
+    const err = new Error('A run can only contain cases from one project. Remove cases from other projects and try again.');
+    err.statusCode = 422;
+    throw err;
+  }
+  // Delegate to the project-scoped create with the derived projectId so
+  // the existing path stays the single source of truth.
+  return create(userId, projects[0], body, orgId);
+}
+
 module.exports = {
   list, getById, create, update, remove,
   addCases, removeCase, getCases, setResult, setStepResult, setStepNote,
   getExecutionLog, getStats, setCaseAssignee,
+  // Cross-project surface
+  listAcrossProjects, listTestCasesAcrossProjects, createFromCases,
 };

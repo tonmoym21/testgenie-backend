@@ -24,8 +24,8 @@ const rateLimiter = require('./middleware/rateLimiter'); // default export = gen
 const app = express();
 
 // Build info for deployment verification
-const BUILD_VERSION = '3.1.9';
-const BUILD_DATE = '2026-05-21T06:30:00Z';
+const BUILD_VERSION = '3.2.0';
+const BUILD_DATE = '2026-05-21T07:00:00Z';
 
 logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backend starting...');
 
@@ -488,6 +488,7 @@ const sharingRoutes = safeRequire('./routes/sharing', 'sharing');
 const jiraRoutes = safeRequire('./routes/jira', 'jira');
 const folderRoutes = safeRequire('./routes/folders', 'folders');
 const testRunRoutes = safeRequire('./routes/testRuns', 'testRuns');
+const runsTopLevelRoutes = safeRequire('./routes/runs', 'runs');
 const projectInsightsRoutes = safeRequire('./routes/projectInsights', 'projectInsights');
 const webhookRoutes = safeRequire('./routes/webhooks', 'webhooks');
 const apiSourceRoutes = safeRequire('./routes/apiSources', 'apiSources');
@@ -615,6 +616,7 @@ app.use('/api/projects', projectRoutes);
 // Folders — scoped under a project
 app.use('/api/projects/:projectId/folders', folderRoutes);
 app.use('/api/projects/:projectId/test-runs', testRunRoutes);
+if (runsTopLevelRoutes) app.use('/api/runs', runsTopLevelRoutes);
 app.use('/api/projects/:projectId/insights', projectInsightsRoutes);
 // Test cases — support both the flat legacy mount and the nested project-scoped mount
 app.use('/api/projects/:projectId/testcases', testcaseRoutes);
