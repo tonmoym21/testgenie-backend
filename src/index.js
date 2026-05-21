@@ -24,8 +24,8 @@ const rateLimiter = require('./middleware/rateLimiter'); // default export = gen
 const app = express();
 
 // Build info for deployment verification
-const BUILD_VERSION = '3.1.4';
-const BUILD_DATE = '2026-05-20T06:52:00Z';
+const BUILD_VERSION = '3.1.5';
+const BUILD_DATE = '2026-05-21T05:40:00Z';
 
 logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backend starting...');
 
@@ -373,6 +373,29 @@ logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backen
       }
     }
     logger.info('Startup migrations complete');
+
+    // Post-migration verification — surface the actual state of the
+    // stories/scenarios tables so we can confirm from Render logs whether
+    // Migration 018 produced the correct schema.
+    try {
+      const probe = await db.query(`
+        SELECT column_name, data_type
+        FROM information_schema.columns
+        WHERE table_name = 'stories' AND column_name IN ('id', 'project_id', 'user_id')
+        ORDER BY column_name
+      `);
+      if (probe.rows.length === 0) {
+        logger.error('Migration 018 verification: stories table is MISSING after migrations ran');
+      } else {
+        logger.info({ columns: probe.rows }, 'Migration 018 verification: stories table schema');
+        const projectIdCol = probe.rows.find((r) => r.column_name === 'project_id');
+        if (projectIdCol && projectIdCol.data_type !== 'integer') {
+          logger.error({ data_type: projectIdCol.data_type }, 'Migration 018 verification: stories.project_id is NOT integer — repair did not succeed');
+        }
+      }
+    } catch (err) {
+      logger.warn({ err: err.message }, 'Migration 018 verification probe failed');
+    }
   } catch (err) {
     logger.error({ err: err.message }, 'Startup migrations failed to run');
   }
