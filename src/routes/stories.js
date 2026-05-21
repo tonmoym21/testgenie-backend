@@ -95,14 +95,18 @@ router.get('/', authenticate, async (req, res, next) => {
       return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Not your project' } });
     }
 
+    // Only $1 is referenced; the legacy s.user_id = $2 filter was dropped
+    // when stories went platform-wide. Passing the extra userId param made
+    // pg throw "bind message supplies 2 parameters, but prepared statement
+    // requires 1".
     const result = await db.query(
       `SELECT s.*,
         (SELECT count(*) FROM scenarios sc WHERE sc.story_id = s.id)::int AS scenario_count,
         (SELECT count(*) FROM scenarios sc WHERE sc.story_id = s.id AND sc.status = 'approved')::int AS approved_count
        FROM stories s
-       WHERE s.project_id = $1 /* s.user_id = $2 ignored: platform-wide */
+       WHERE s.project_id = $1
        ORDER BY s.created_at DESC`,
-      [projectId, userId]
+      [projectId]
     );
 
     res.json(result.rows);
@@ -129,8 +133,8 @@ router.get('/:storyId', authenticate, async (req, res, next) => {
     const userId = req.user.id;
 
     const result = await db.query(
-      'SELECT * FROM stories WHERE id = $1 AND project_id = $2 /* user_id = $3 ignored: platform-wide */',
-      [storyId, projectId, userId]
+      'SELECT * FROM stories WHERE id = $1 AND project_id = $2',
+      [storyId, projectId]
     );
 
     if (result.rows.length === 0) {
@@ -147,11 +151,10 @@ router.get('/:storyId', authenticate, async (req, res, next) => {
 router.delete('/:storyId', authenticate, async (req, res, next) => {
   try {
     const { projectId, storyId } = req.params;
-    const userId = req.user.id;
 
     const result = await db.query(
-      'DELETE FROM stories WHERE id = $1 AND project_id = $2 /* user_id = $3 ignored: platform-wide */ RETURNING id',
-      [storyId, projectId, userId]
+      'DELETE FROM stories WHERE id = $1 AND project_id = $2 RETURNING id',
+      [storyId, projectId]
     );
 
     if (result.rows.length === 0) {
@@ -168,11 +171,10 @@ router.delete('/:storyId', authenticate, async (req, res, next) => {
 router.get('/:storyId/scenarios', authenticate, async (req, res, next) => {
   try {
     const { projectId, storyId } = req.params;
-    const userId = req.user.id;
 
     const storyCheck = await db.query(
-      'SELECT id FROM stories WHERE id = $1 AND project_id = $2 /* user_id = $3 ignored: platform-wide */',
-      [storyId, projectId, userId]
+      'SELECT id FROM stories WHERE id = $1 AND project_id = $2',
+      [storyId, projectId]
     );
     if (storyCheck.rows.length === 0) {
       return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Story not found' } });
@@ -270,8 +272,8 @@ router.patch('/:storyId/scenarios/:scenarioId', authenticate, async (req, res, n
     }
 
     const storyCheck = await db.query(
-      'SELECT id FROM stories WHERE id = $1 AND project_id = $2 /* user_id = $3 ignored: platform-wide */',
-      [storyId, projectId, userId]
+      'SELECT id FROM stories WHERE id = $1 AND project_id = $2',
+      [storyId, projectId]
     );
     if (storyCheck.rows.length === 0) {
       return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Story not found' } });
@@ -316,8 +318,8 @@ router.post('/:storyId/export-csv', authenticate, async (req, res, next) => {
     const userId = req.user.id;
 
     const storyResult = await db.query(
-      'SELECT id, title FROM stories WHERE id = $1 AND project_id = $2 /* user_id = $3 ignored: platform-wide */',
-      [storyId, projectId, userId]
+      'SELECT id, title FROM stories WHERE id = $1 AND project_id = $2',
+      [storyId, projectId]
     );
     if (storyResult.rows.length === 0) {
       return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Story not found' } });
@@ -394,9 +396,9 @@ router.get('/:storyId/manual-test-cases', authenticate, async (req, res, next) =
                       u.email AS "createdByEmail"
                FROM test_cases tc
                JOIN users u ON u.id = tc.user_id
-               WHERE tc.story_id = $1 AND tc.project_id = $2 /* tc.user_id = $3 ignored: platform-wide */
+               WHERE tc.story_id = $1 AND tc.project_id = $2
                ORDER BY tc.created_at DESC`;
-      params = [storyId, projectId, userId];
+      params = [storyId, projectId];
     }
 
     const result = await db.query(query, params);
@@ -453,8 +455,8 @@ router.delete('/:storyId/manual-test-cases/:tcId', authenticate, async (req, res
     const { id: userId } = req.user;
 
     const result = await db.query(
-      'DELETE FROM test_cases WHERE id = $1 AND project_id = $2 AND story_id = $3 /* user_id = $4 ignored: platform-wide */ RETURNING id',
-      [tcId, projectId, storyId, userId]
+      'DELETE FROM test_cases WHERE id = $1 AND project_id = $2 AND story_id = $3 RETURNING id',
+      [tcId, projectId, storyId]
     );
     if (result.rows.length === 0) {
       return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Test case not found' } });
@@ -472,8 +474,8 @@ router.post('/:storyId/scenarios', authenticate, async (req, res, next) => {
     const userId = req.user.id;
 
     const storyCheck = await db.query(
-      'SELECT id FROM stories WHERE id = $1 AND project_id = $2 /* user_id = $3 ignored: platform-wide */',
-      [storyId, projectId, userId]
+      'SELECT id FROM stories WHERE id = $1 AND project_id = $2',
+      [storyId, projectId]
     );
     if (storyCheck.rows.length === 0) {
       return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Story not found' } });
@@ -526,8 +528,8 @@ router.get('/:storyId/coverage', authenticate, async (req, res, next) => {
     const userId = req.user.id;
 
     const storyCheck = await db.query(
-      'SELECT id FROM stories WHERE id = $1 AND project_id = $2 /* user_id = $3 ignored: platform-wide */',
-      [storyId, projectId, userId]
+      'SELECT id FROM stories WHERE id = $1 AND project_id = $2',
+      [storyId, projectId]
     );
     if (storyCheck.rows.length === 0) {
       return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Story not found' } });
