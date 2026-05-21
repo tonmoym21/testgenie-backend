@@ -24,8 +24,8 @@ const rateLimiter = require('./middleware/rateLimiter'); // default export = gen
 const app = express();
 
 // Build info for deployment verification
-const BUILD_VERSION = '3.1.5';
-const BUILD_DATE = '2026-05-21T05:40:00Z';
+const BUILD_VERSION = '3.1.6';
+const BUILD_DATE = '2026-05-21T05:50:00Z';
 
 logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backend starting...');
 
@@ -307,16 +307,27 @@ logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backen
       //   2. Recreates with INTEGER FKs.
       //   3. Replays migration 010's test_cases.story_id ADD COLUMN that
       //      would have failed when stories was missing.
+      // Drop stories/scenarios if they exist with ANY column type that
+      // would prevent the route from running — i.e. project_id is not
+      // INTEGER. Original check only caught the 'uuid' case, but in
+      // practice the column could be 'text', 'character varying', etc.
+      // depending on how the partial migration left the table.
       `DO $mig018$
+       DECLARE
+         pid_type text;
        BEGIN
-         IF EXISTS (
-           SELECT 1 FROM information_schema.columns
-           WHERE table_name = 'stories'
-             AND column_name = 'project_id'
-             AND data_type = 'uuid'
-         ) THEN
+         SELECT data_type INTO pid_type
+         FROM information_schema.columns
+         WHERE table_name = 'stories' AND column_name = 'project_id';
+
+         IF pid_type IS NULL THEN
+           RAISE NOTICE 'Migration 018: stories table does not exist; CREATE TABLE will create it';
+         ELSIF pid_type <> 'integer' THEN
+           RAISE NOTICE 'Migration 018: stories.project_id is %; dropping for recreate', pid_type;
            DROP TABLE IF EXISTS scenarios CASCADE;
            DROP TABLE IF EXISTS stories CASCADE;
+         ELSE
+           RAISE NOTICE 'Migration 018: stories.project_id is already integer; skipping drop';
          END IF;
        END
        $mig018$`,
@@ -375,23 +386,38 @@ logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backen
     logger.info('Startup migrations complete');
 
     // Post-migration verification — surface the actual state of the
-    // stories/scenarios tables so we can confirm from Render logs whether
-    // Migration 018 produced the correct schema.
+    // stories/scenarios tables AND run the exact query the GET /stories
+    // route uses so we can spot the real cause of any 500 without
+    // needing authenticated reproduction.
     try {
-      const probe = await db.query(`
-        SELECT column_name, data_type
+      const schemaProbe = await db.query(`
+        SELECT table_name, column_name, data_type
         FROM information_schema.columns
-        WHERE table_name = 'stories' AND column_name IN ('id', 'project_id', 'user_id')
-        ORDER BY column_name
+        WHERE table_name IN ('stories', 'scenarios')
+        ORDER BY table_name, column_name
       `);
-      if (probe.rows.length === 0) {
-        logger.error('Migration 018 verification: stories table is MISSING after migrations ran');
+      if (schemaProbe.rows.length === 0) {
+        logger.error('Migration 018 verification: stories AND scenarios tables BOTH MISSING after migrations ran');
       } else {
-        logger.info({ columns: probe.rows }, 'Migration 018 verification: stories table schema');
-        const projectIdCol = probe.rows.find((r) => r.column_name === 'project_id');
-        if (projectIdCol && projectIdCol.data_type !== 'integer') {
-          logger.error({ data_type: projectIdCol.data_type }, 'Migration 018 verification: stories.project_id is NOT integer — repair did not succeed');
-        }
+        logger.info({ columns: schemaProbe.rows }, 'Migration 018 verification: schema snapshot');
+      }
+
+      // Reproduce the route's query with a no-op WHERE clause so it
+      // exercises every reference (FROM stories, subquery on scenarios,
+      // ORDER BY created_at) without needing real data.
+      try {
+        await db.query(`
+          SELECT s.*,
+            (SELECT count(*) FROM scenarios sc WHERE sc.story_id = s.id)::int AS scenario_count,
+            (SELECT count(*) FROM scenarios sc WHERE sc.story_id = s.id AND sc.status = 'approved')::int AS approved_count
+          FROM stories s
+          WHERE s.project_id = -1
+          ORDER BY s.created_at DESC
+          LIMIT 0
+        `);
+        logger.info('Migration 018 verification: route query EXECUTES cleanly');
+      } catch (queryErr) {
+        logger.error({ err: queryErr.message, code: queryErr.code }, 'Migration 018 verification: route query FAILED');
       }
     } catch (err) {
       logger.warn({ err: err.message }, 'Migration 018 verification probe failed');
