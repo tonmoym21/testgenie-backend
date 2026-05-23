@@ -9,6 +9,7 @@
     "migrate:up": "node-pg-migrate up --migration-file-language sql --migrations-dir migrations",
     "migrate:down": "node-pg-migrate down --migration-file-language sql --migrations-dir migrations",
     "migrate:create": "node-pg-migrate create --migration-file-language sql --migrations-dir migrations",
+    "db:bootstrap": "node scripts/db-bootstrap.js",
     "test": "NODE_ENV=test jest --runInBand --forceExit",
     "test:watch": "NODE_ENV=test jest --runInBand --watch",
     "test:coverage": "NODE_ENV=test jest --runInBand --forceExit --coverage"
