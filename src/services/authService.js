@@ -308,8 +308,12 @@ async function generateTokens(user) {
     expiresIn: config.JWT_ACCESS_EXPIRY,
   });
 
+  // jti makes each refresh token byte-unique even when issued in the same
+  // wall-clock second. Without it, JWT.iat is seconds-resolution and rotation
+  // can emit a token byte-identical to the one it just deleted — silently
+  // breaking reuse-detection in /refresh.
   const refreshToken = jwt.sign(
-    { sub: user.id, type: 'refresh' },
+    { sub: user.id, type: 'refresh', jti: crypto.randomUUID() },
     config.JWT_SECRET,
     { expiresIn: config.JWT_REFRESH_EXPIRY }
   );
