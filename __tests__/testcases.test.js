@@ -71,7 +71,7 @@ describe('POST /api/projects/:projectId/testcases', () => {
   });
 });
 
-describe('POST /api/projects/:projectId/testcases/batch', () => {
+describe('POST /api/projects/:projectId/testcases/batch/create', () => {
   it('should batch create test cases', async () => {
     const user = await createAuthenticatedUser(app);
     const project = await createTestProject(app, user.accessToken);
@@ -83,7 +83,7 @@ describe('POST /api/projects/:projectId/testcases/batch', () => {
     ];
 
     const res = await request(app)
-      .post(`/api/projects/${project.id}/testcases/batch`)
+      .post(`/api/projects/${project.id}/testcases/batch/create`)
       .set('Authorization', `Bearer ${user.accessToken}`)
       .send({ testCases })
       .expect(201);
@@ -103,7 +103,7 @@ describe('POST /api/projects/:projectId/testcases/batch', () => {
     }));
 
     await request(app)
-      .post(`/api/projects/${project.id}/testcases/batch`)
+      .post(`/api/projects/${project.id}/testcases/batch/create`)
       .set('Authorization', `Bearer ${user.accessToken}`)
       .send({ testCases })
       .expect(400);
@@ -114,7 +114,7 @@ describe('POST /api/projects/:projectId/testcases/batch', () => {
     const project = await createTestProject(app, user.accessToken);
 
     await request(app)
-      .post(`/api/projects/${project.id}/testcases/batch`)
+      .post(`/api/projects/${project.id}/testcases/batch/create`)
       .set('Authorization', `Bearer ${user.accessToken}`)
       .send({ testCases: [] })
       .expect(400);
@@ -217,7 +217,7 @@ describe('DELETE /api/projects/:projectId/testcases/:id', () => {
     await request(app)
       .delete(`/api/projects/${project.id}/testcases/${tc.id}`)
       .set('Authorization', `Bearer ${user.accessToken}`)
-      .expect(200);
+      .expect(204);
 
     // Verify gone
     const res = await request(app)

@@ -194,12 +194,21 @@ describe('POST /api/auth/logout', () => {
     expect(res.body.error.code).toBe('UNAUTHORIZED');
   });
 
-  it('should require authentication', async () => {
-    const res = await request(app)
+  it('is idempotent: succeeds without an access token as long as a valid refresh token is supplied', async () => {
+    // Logout was intentionally made idempotent (src/routes/auth.js: "nothing
+    // to revoke" branch) so a stale tab without an accessToken can still
+    // clear its cookie. This test locks that contract — replacing the older
+    // "requires authentication" assertion that no longer matches the route.
+    await request(app)
       .post('/api/auth/logout')
       .send({ refreshToken: tokens.refreshToken })
-      .expect(401);
+      .expect(200);
 
-    expect(res.body.error.code).toBe('UNAUTHORIZED');
+    // The refresh token must still be revoked even though no Bearer was sent —
+    // otherwise a second refresh would succeed and silently rotate.
+    await request(app)
+      .post('/api/auth/refresh')
+      .send({ refreshToken: tokens.refreshToken })
+      .expect(401);
   });
 });
