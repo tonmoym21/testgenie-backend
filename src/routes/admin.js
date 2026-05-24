@@ -553,9 +553,12 @@ function mintImpersonationToken(targetUser, adminId) {
     payload.role = targetUser.role || 'member';
   }
   if (targetUser.is_platform_admin) payload.isPlatformAdmin = true;
-  // 30-minute window — long enough to debug, short enough to limit blast radius.
-  const token = jwt.sign(payload, config.JWT_SECRET, { expiresIn: '30m' });
-  return { accessToken: token, expiresIn: 1800, user: {
+  // 5-minute window. Impersonation tokens ride the URL hash to the main
+  // app and persist in browser history for the lifetime of that tab —
+  // shorter TTL caps the value of a leaked URL. If the admin needs longer
+  // to debug, they can re-impersonate.
+  const token = jwt.sign(payload, config.JWT_SECRET, { expiresIn: '5m' });
+  return { accessToken: token, expiresIn: 300, user: {
     id: targetUser.id,
     email: targetUser.email,
     organizationId: targetUser.organization_id || null,
@@ -629,7 +632,10 @@ router.post('/organizations/:id/enter', async (req, res, next) => {
       isPlatformAdmin: true,
       impersonatedBy: req.user.id, // self — marks token as a backdoor session
     };
-    const token = jwt.sign(payload, config.JWT_SECRET, { expiresIn: '1h' });
+    // 30-minute window for backdoor sessions. Longer than impersonation
+    // because the admin is doing real investigative work in the org, but
+    // bounded — same blast-radius logic as the impersonation TTL.
+    const token = jwt.sign(payload, config.JWT_SECRET, { expiresIn: '30m' });
     await audit.log({
       actorId: req.user.id, actorEmail: req.user.email,
       action: 'admin.enter_org', targetType: 'organization', targetId: orgId, targetOrgId: orgId,
@@ -637,7 +643,7 @@ router.post('/organizations/:id/enter', async (req, res, next) => {
     });
     res.json({
       accessToken: token,
-      expiresIn: 3600,
+      expiresIn: 1800,
       user: {
         id: req.user.id, email: req.user.email,
         organizationId: orgId, role,
