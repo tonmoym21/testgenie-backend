@@ -11,15 +11,22 @@ const bcrypt = require('bcryptjs');
 const db = require('../db');
 const config = require('../config');
 const { authenticate } = require('../middleware/auth');
-const { requirePlatformAdmin } = require('../middleware/platformAdmin');
+const {
+  requireAdminAccess,
+  assertPlatformScope,
+  assertOrgAccessible,
+} = require('../middleware/platformAdmin');
 const { validate } = require('../middleware/validate');
 const audit = require('../services/platformAuditService');
 const { NotFoundError, ValidationError, ForbiddenError } = require('../utils/apiError');
 
 const router = Router();
 
-// Every route in this file is gated.
-router.use(authenticate, requirePlatformAdmin);
+// Every route is gated. requireAdminAccess admits BOTH platform admins
+// (full cross-org) and org owners (scoped to their own org). Per-handler
+// code calls assertPlatformScope() or assertOrgAccessible(req, orgId) for
+// the cross-org-only actions (delete org, enter other orgs, promote admin).
+router.use(authenticate, requireAdminAccess);
 
 // Validate numeric path params. Without this, parseInt('abc') → NaN, the pg
 // driver then throws `invalid input syntax for type integer` and the global
@@ -47,9 +54,70 @@ const FEATURE_KEYS = [
   'environments',
 ];
 
-// ─── Metrics ──────────────────────────────────────────────────────────────
-router.get('/metrics', async (_req, res, next) => {
+// ─── Identity ─────────────────────────────────────────────────────────────
+// Frontends call this on load to decide which tabs/buttons to render.
+// Returns the caller's adminScope so the UI can hide cross-org actions when
+// the user is just an org owner.
+router.get('/me', async (req, res, next) => {
   try {
+    const r = await db.query(
+      `SELECT u.id, u.email, u.is_platform_admin, u.organization_id,
+              o.name AS org_name, om.role
+         FROM users u
+         LEFT JOIN organizations o ON o.id = u.organization_id
+         LEFT JOIN organization_members om ON om.user_id = u.id AND om.organization_id = u.organization_id
+        WHERE u.id = $1`,
+      [req.user.id]
+    );
+    if (!r.rows.length) throw new NotFoundError('User not found');
+    const u = r.rows[0];
+    res.json({
+      id: u.id,
+      email: u.email,
+      isPlatformAdmin: !!u.is_platform_admin,
+      role: u.role || null,
+      organization: u.organization_id
+        ? { id: u.organization_id, name: u.org_name } : null,
+      scope: req.adminScope, // { type: 'platform' } | { type: 'org', orgId }
+      featureKeys: FEATURE_KEYS,
+    });
+  } catch (err) { next(err); }
+});
+
+// ─── Metrics ──────────────────────────────────────────────────────────────
+router.get('/metrics', async (req, res, next) => {
+  try {
+    const scope = req.adminScope;
+    // Org-scoped: every count is filtered to the caller's org. Skip the
+    // cross-org breakdown entirely so we don't leak global stats.
+    if (scope.type === 'org') {
+      const orgId = scope.orgId;
+      const [users, projects, testCases, runs, runs24h, activeUsers7d, org] = await Promise.all([
+        db.query(`SELECT COUNT(*)::int AS n,
+                         COUNT(*) FILTER (WHERE status='active')::int AS active
+                  FROM users WHERE organization_id = $1`, [orgId]),
+        db.query(`SELECT COUNT(*)::int AS n FROM projects WHERE organization_id = $1`, [orgId]),
+        db.query(`SELECT COUNT(*)::int AS n FROM test_cases WHERE organization_id = $1`, [orgId]),
+        db.query(`SELECT COUNT(*)::int AS n FROM test_runs WHERE organization_id = $1`, [orgId])
+          .catch(() => ({ rows: [{ n: 0 }] })),
+        db.query(`SELECT COUNT(*)::int AS n FROM test_runs WHERE organization_id = $1 AND created_at > NOW() - INTERVAL '24 hours'`, [orgId])
+          .catch(() => ({ rows: [{ n: 0 }] })),
+        db.query(`SELECT COUNT(*)::int AS n FROM users WHERE organization_id = $1 AND last_active_at > NOW() - INTERVAL '7 days'`, [orgId]),
+        db.query(`SELECT id, name, status FROM organizations WHERE id = $1`, [orgId]),
+      ]);
+      return res.json({
+        scope,
+        organization: org.rows[0] || null,
+        users: { ...users.rows[0], admins: 0 },
+        projects: projects.rows[0].n,
+        testCases: testCases.rows[0].n,
+        testRuns: { total: runs.rows[0].n, last24h: runs24h.rows[0].n },
+        activeUsers7d: activeUsers7d.rows[0].n,
+        featureKeys: FEATURE_KEYS,
+      });
+    }
+
+    // Platform-wide
     const [orgs, users, projects, testCases, runs, runs24h, activeUsers7d] = await Promise.all([
       db.query(`SELECT COUNT(*)::int AS n, COUNT(*) FILTER (WHERE status='active')::int AS active,
                        COUNT(*) FILTER (WHERE status='suspended')::int AS suspended,
@@ -67,6 +135,7 @@ router.get('/metrics', async (_req, res, next) => {
       db.query(`SELECT COUNT(*)::int AS n FROM users WHERE last_active_at > NOW() - INTERVAL '7 days'`),
     ]);
     res.json({
+      scope,
       organizations: orgs.rows[0],
       users: users.rows[0],
       projects: projects.rows[0].n,
@@ -85,6 +154,12 @@ router.get('/organizations', async (req, res, next) => {
     const status = (req.query.status || '').toString().trim();
     const where = [];
     const args = [];
+    // Org owners can only see their own org. Search/status filters still
+    // apply within that single row.
+    if (req.adminScope.type === 'org') {
+      args.push(req.adminScope.orgId);
+      where.push(`o.id = $${args.length}`);
+    }
     if (q) { args.push(`%${q.toLowerCase()}%`); where.push(`(LOWER(o.name) LIKE $${args.length} OR LOWER(o.domain) LIKE $${args.length})`); }
     if (status && ['active','suspended','deleted'].includes(status)) {
       args.push(status); where.push(`o.status = $${args.length}`);
@@ -106,6 +181,7 @@ router.get('/organizations', async (req, res, next) => {
 router.get('/organizations/:id', async (req, res, next) => {
   try {
     const id = intParam(req.params.id);
+    assertOrgAccessible(req, id);
     const org = await db.query(`SELECT * FROM organizations WHERE id = $1`, [id]);
     if (!org.rows.length) throw new NotFoundError('Organization not found');
 
@@ -156,6 +232,15 @@ const updateOrgSchema = z.object({
 router.patch('/organizations/:id', validate(updateOrgSchema), async (req, res, next) => {
   try {
     const id = intParam(req.params.id);
+    assertOrgAccessible(req, id);
+    // Org owners can rename but cannot change status (suspend / reactivate)
+    // or feature flags — those are platform-wide policy decisions.
+    if (req.adminScope.type === 'org') {
+      if (req.body.status !== undefined || req.body.features !== undefined
+          || req.body.suspensionReason !== undefined) {
+        throw new ForbiddenError('Only platform admins can change org status or features');
+      }
+    }
     const before = await db.query(`SELECT * FROM organizations WHERE id = $1`, [id]);
     if (!before.rows.length) throw new NotFoundError('Organization not found');
 
@@ -200,6 +285,7 @@ router.patch('/organizations/:id', validate(updateOrgSchema), async (req, res, n
 
 router.delete('/organizations/:id', async (req, res, next) => {
   try {
+    assertPlatformScope(req); // org owners can't delete orgs (even their own)
     const id = intParam(req.params.id);
     const r = await db.query(
       `UPDATE organizations SET status='deleted', suspended_at = NOW(), updated_at = NOW()
@@ -221,7 +307,10 @@ router.get('/users', async (req, res, next) => {
   try {
     const q = (req.query.q || '').toString().trim().toLowerCase();
     const orgIdRaw = req.query.orgId ? Number(req.query.orgId) : null;
-    const orgId = Number.isInteger(orgIdRaw) && orgIdRaw > 0 ? orgIdRaw : null;
+    let orgId = Number.isInteger(orgIdRaw) && orgIdRaw > 0 ? orgIdRaw : null;
+    // Org owners are pinned to their org regardless of the query param.
+    if (req.adminScope.type === 'org') orgId = req.adminScope.orgId;
+
     const where = [];
     const args = [];
     if (q) { args.push(`%${q}%`); where.push(`(LOWER(u.email) LIKE $${args.length} OR LOWER(COALESCE(u.display_name,'')) LIKE $${args.length})`); }
@@ -257,6 +346,16 @@ router.patch('/users/:id', validate(updateUserSchema), async (req, res, next) =>
     }
     const before = await db.query(`SELECT id, email, organization_id, status, is_platform_admin FROM users WHERE id = $1`, [id]);
     if (!before.rows.length) throw new NotFoundError('User not found');
+
+    // Org-scope guards: owners can only touch their own org's users, and
+    // can never promote/demote platform admin (that's a platform-policy
+    // change that crosses the tenancy boundary).
+    if (req.adminScope.type === 'org') {
+      assertOrgAccessible(req, before.rows[0].organization_id);
+      if (req.body.isPlatformAdmin !== undefined) {
+        throw new ForbiddenError('Only platform admins can grant or revoke platform admin');
+      }
+    }
 
     const sets = [];
     const args = [];
@@ -318,8 +417,16 @@ const resetPasswordSchema = z.object({
 router.post('/users/:id/reset-password', validate(resetPasswordSchema), async (req, res, next) => {
   try {
     const id = intParam(req.params.id);
-    const u = await db.query('SELECT id, email, organization_id FROM users WHERE id = $1', [id]);
+    const u = await db.query('SELECT id, email, organization_id, is_platform_admin FROM users WHERE id = $1', [id]);
     if (!u.rows.length) throw new NotFoundError('User not found');
+    if (req.adminScope.type === 'org') {
+      assertOrgAccessible(req, u.rows[0].organization_id);
+      // Don't let an org owner reset a platform admin's password — that'd
+      // be a privilege escalation surface even within the same org.
+      if (u.rows[0].is_platform_admin) {
+        throw new ForbiddenError('Cannot reset password for a platform admin');
+      }
+    }
 
     const provided = req.body.password;
     const generated = provided ? null : (() => {
@@ -362,8 +469,14 @@ router.delete('/users/:id', async (req, res, next) => {
   try {
     const id = intParam(req.params.id);
     if (id === req.user.id) throw new ForbiddenError('Cannot delete yourself');
-    const before = await db.query(`SELECT id, email, organization_id, status FROM users WHERE id = $1`, [id]);
+    const before = await db.query(`SELECT id, email, organization_id, status, is_platform_admin FROM users WHERE id = $1`, [id]);
     if (!before.rows.length) throw new NotFoundError('User not found');
+    if (req.adminScope.type === 'org') {
+      assertOrgAccessible(req, before.rows[0].organization_id);
+      if (before.rows[0].is_platform_admin) {
+        throw new ForbiddenError('Cannot delete a platform admin');
+      }
+    }
 
     await db.query(
       `UPDATE users SET status = 'deleted', deactivated_at = NOW(), deactivated_by = $1, updated_at = NOW()
@@ -389,7 +502,9 @@ router.get('/audit', async (req, res, next) => {
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
     const orgIdRaw = req.query.orgId ? Number(req.query.orgId) : null;
-    const orgId = Number.isInteger(orgIdRaw) && orgIdRaw > 0 ? orgIdRaw : null;
+    let orgId = Number.isInteger(orgIdRaw) && orgIdRaw > 0 ? orgIdRaw : null;
+    // Org owners always filtered to their own org — query param ignored.
+    if (req.adminScope.type === 'org') orgId = req.adminScope.orgId;
     const args = [];
     const where = [];
     if (orgId) { args.push(orgId); where.push(`target_org_id = $${args.length}`); }
@@ -462,6 +577,15 @@ router.post('/impersonate/:userId', async (req, res, next) => {
       [userId]
     );
     if (!r.rows.length) throw new NotFoundError('User not found');
+    if (req.adminScope.type === 'org') {
+      assertOrgAccessible(req, r.rows[0].organization_id);
+      // Blocking impersonation of platform admins prevents the obvious
+      // escalation: owner impersonates an admin → mints a token with
+      // isPlatformAdmin=true → can do anything cross-org.
+      if (r.rows[0].is_platform_admin) {
+        throw new ForbiddenError('Cannot impersonate a platform admin');
+      }
+    }
     const token = mintImpersonationToken(r.rows[0], req.user.id);
     await audit.log({
       actorId: req.user.id, actorEmail: req.user.email,
@@ -479,6 +603,9 @@ router.post('/impersonate/:userId', async (req, res, next) => {
 // admin nav stays visible to exit.
 router.post('/organizations/:id/enter', async (req, res, next) => {
   try {
+    // Backdoor entry is platform-only — org owners are already authenticated
+    // into their org via normal login, no token-mint shortcut needed.
+    assertPlatformScope(req);
     const orgId = intParam(req.params.id);
     const org = await db.query(`SELECT id, name, status FROM organizations WHERE id = $1`, [orgId]);
     if (!org.rows.length) throw new NotFoundError('Organization not found');
