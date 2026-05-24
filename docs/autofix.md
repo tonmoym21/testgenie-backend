@@ -167,7 +167,7 @@ When both an explicit CLI flag (`--repo`) and a config row are present, the CLI 
 |---|---|---|---|
 | `DATABASE_URL` | yes | — | everything |
 | `JWT_SECRET` | yes | — | auth |
-| `OPENAI_API_KEY` | yes (even for ollama, see note) | — | `analyzeService`, `proposeFix` when `AUTOFIX_PROVIDER=openai` |
+| `OPENAI_API_KEY` | conditional — see note | — | `analyzeService`, `playwrightGenerator`, `scenarioGenerator`, `proposeFix` when `AUTOFIX_PROVIDER=openai` |
 | `AUTOFIX_PROVIDER` | no | `openai` | `proposeFix` |
 | `AUTOFIX_MODEL` | no | `gpt-4o` (openai) / `llama3.1` (ollama) | `proposeFix` |
 | `OPENAI_BASE_URL` | no | `api.openai.com` | OpenAI provider — overrides for BYO endpoints |
@@ -176,14 +176,17 @@ When both an explicit CLI flag (`--repo`) and a config row are present, the CLI 
 | `TEST_DB_URL` | for integration tests | `postgresql://postgres:postgres@localhost:5432/testforge_test` | `*.integration.test.js`, `db:bootstrap` |
 | `RUN_PLAYWRIGHT_TESTS` | no | unset | gates `autoFixVerifyService.realPlaywright.integration.test.js` |
 
-Note on `OPENAI_API_KEY` for Ollama-only setups: today you still need to set it to *something* (e.g. `OPENAI_API_KEY=unused`) — `src/config.js` rejects boot without it.
+Note on `OPENAI_API_KEY` for Ollama-only setups:
 
-Making OpenAI fully optional is a bigger lift than the config tweak suggests:
+- `AUTOFIX_PROVIDER=ollama` makes `OPENAI_API_KEY` optional at boot. You can launch the server without it.
+- BUT three other callers still construct an `OpenAI` client at module load: `src/services/analyzeService.js`, `src/services/playwrightGenerator.js`, `src/services/scenarioGenerator.js`. Without a key set, those modules will throw when their routes are hit — so an Ollama-only deployment that calls `POST /api/analyze` or scenario/spec generation will 500 with a key error.
+- The auto-fix path (`proposeFix` + the OpenAI provider in `src/services/llm/openaiProvider.js`) is safe — that one lazy-constructs the client and is never reached when `AUTOFIX_PROVIDER=ollama`.
 
-- `src/config.js` validation is a 3-line change — make the key required only when `AUTOFIX_PROVIDER` is unset or `openai`.
-- BUT four other callers still construct an `OpenAI` client at module load: `src/services/analyzeService.js`, `src/services/playwrightGenerator.js`, `src/services/scenarioGenerator.js`, and `src/services/llm/openaiProvider.js`. With `OPENAI_API_KEY=unused` they boot fine and only fail at call time — so an Ollama-only deployment that hits `POST /api/analyze` or scenario/spec generation will 500 with a key error, not a clean "feature unavailable" message.
+Recipes:
+- **Auto-fix only, no OpenAI features wanted:** set `AUTOFIX_PROVIDER=ollama` and leave `OPENAI_API_KEY` unset. Disable or proxy `/api/analyze`, scenario generation, and spec generation routes at your gateway.
+- **Mixed (Ollama for auto-fix, OpenAI for analyze/generators):** set both `AUTOFIX_PROVIDER=ollama` and `OPENAI_API_KEY=sk-...`. All features work.
 
-So "OpenAI fully optional" means either (a) lazy-construct those four clients with the same per-provider guard, or (b) keep the boot-time requirement and document `OPENAI_API_KEY=unused` as the supported Ollama recipe (current behavior). Don't ship the config tweak alone — it just moves the failure later without removing it.
+Remaining follow-up to make OpenAI **fully** optional: lazy-construct the three eager clients with the same `if (OPENAI_API_KEY) ...` guard the LLM provider already uses, and return a clean "feature unavailable" from the routes when the key is absent.
 
 ---
 
