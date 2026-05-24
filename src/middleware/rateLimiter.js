@@ -104,8 +104,29 @@ const generalLimiter = rateLimit({
  * This makes `const rateLimiter = require('./rateLimiter'); app.use(rateLimiter)` work correctly.
  * Named exports are attached to the function for backward compat.
  */
+/**
+ * Tight per-route limiter for sensitive admin mutations (password resets,
+ * impersonation, enter-org). 10/min/user keeps a compromised admin token
+ * from spamming password resets to lock an org out, or churning out
+ * impersonation URLs faster than they can be used.
+ */
+const adminMutationLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 10,
+  keyGenerator: (req) => req.user?.id || req.ip,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: {
+      code: 'RATE_LIMITED',
+      message: 'Too many admin actions, please slow down',
+    },
+  },
+});
+
 module.exports = generalLimiter;
 module.exports.authLimiter = authLimiter;
 module.exports.refreshLimiter = refreshLimiter;
 module.exports.analyzeLimiter = analyzeLimiter;
 module.exports.generalLimiter = generalLimiter;
+module.exports.adminMutationLimiter = adminMutationLimiter;

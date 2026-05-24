@@ -17,6 +17,7 @@ const {
   assertOrgAccessible,
 } = require('../middleware/platformAdmin');
 const { validate } = require('../middleware/validate');
+const { adminMutationLimiter } = require('../middleware/rateLimiter');
 const audit = require('../services/platformAuditService');
 const { NotFoundError, ValidationError, ForbiddenError } = require('../utils/apiError');
 
@@ -274,10 +275,18 @@ router.patch('/organizations/:id', validate(updateOrgSchema), async (req, res, n
       `UPDATE organizations SET ${sets.join(', ')} WHERE id = $${args.length} RETURNING *`,
       args
     );
+    // Explicit allowlist — never log req.body blanket. Keeps future schema
+    // additions (e.g. if anyone ever adds a sensitive field) out of audit
+    // rows by default. featureKeys is a list of toggled keys, not values.
+    const detailChanges = {};
+    if (req.body.name !== undefined) detailChanges.name = req.body.name;
+    if (req.body.status !== undefined) detailChanges.status = req.body.status;
+    if (req.body.suspensionReason !== undefined) detailChanges.suspensionReason = req.body.suspensionReason;
+    if (req.body.features !== undefined) detailChanges.featureKeys = Object.keys(req.body.features);
     await audit.log({
       actorId: req.user.id, actorEmail: req.user.email,
       action: 'admin.org.update', targetType: 'organization', targetId: id, targetOrgId: id,
-      details: { changes: req.body }, req,
+      details: { changes: detailChanges }, req,
     });
     res.json({ organization: r.rows[0] });
   } catch (err) { next(err); }
@@ -392,11 +401,17 @@ router.patch('/users/:id', validate(updateUserSchema), async (req, res, next) =>
       );
     }
 
+    // Same allowlist pattern as the org PATCH — if a `password` field ever
+    // lands in updateUserSchema, plaintext shouldn't tag along into audit.
+    const detailChanges = {};
+    if (req.body.status !== undefined) detailChanges.status = req.body.status;
+    if (req.body.isPlatformAdmin !== undefined) detailChanges.isPlatformAdmin = req.body.isPlatformAdmin;
+    if (req.body.role !== undefined) detailChanges.role = req.body.role;
     await audit.log({
       actorId: req.user.id, actorEmail: req.user.email,
       action: 'admin.user.update', targetType: 'user', targetId: id,
       targetOrgId: before.rows[0].organization_id,
-      details: { changes: req.body }, req,
+      details: { changes: detailChanges }, req,
     });
     res.json({ user: updatedUser });
   } catch (err) { next(err); }
@@ -414,7 +429,7 @@ const resetPasswordSchema = z.object({
     .regex(/[0-9]/, 'Password must contain at least one number')
     .optional(),
 });
-router.post('/users/:id/reset-password', validate(resetPasswordSchema), async (req, res, next) => {
+router.post('/users/:id/reset-password', adminMutationLimiter, validate(resetPasswordSchema), async (req, res, next) => {
   try {
     const id = intParam(req.params.id);
     const u = await db.query('SELECT id, email, organization_id, is_platform_admin FROM users WHERE id = $1', [id]);
@@ -498,6 +513,9 @@ router.delete('/users/:id', async (req, res, next) => {
 });
 
 // ─── Audit ────────────────────────────────────────────────────────────────
+// Cursor pagination via `?before=<iso-timestamp>`. Pass back the response's
+// nextCursor as `before` on the next call. Single UNION ALL query so we
+// fetch at most `limit` rows total (not `2*limit` like the previous merge).
 router.get('/audit', async (req, res, next) => {
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
@@ -505,34 +523,68 @@ router.get('/audit', async (req, res, next) => {
     let orgId = Number.isInteger(orgIdRaw) && orgIdRaw > 0 ? orgIdRaw : null;
     // Org owners always filtered to their own org — query param ignored.
     if (req.adminScope.type === 'org') orgId = req.adminScope.orgId;
-    const args = [];
-    const where = [];
-    if (orgId) { args.push(orgId); where.push(`target_org_id = $${args.length}`); }
-    const platform = await db.query(
-      `SELECT id, actor_id, actor_email, action, target_type, target_id, target_org_id,
-              details, ip_address, created_at, 'platform' AS source
-         FROM platform_audit_logs
-         ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
-         ORDER BY created_at DESC LIMIT $${args.length + 1}`,
-      [...args, limit]
-    );
-    // Also include team_audit_logs (per-org) for the same org filter if given.
-    const teamArgs = [];
-    const teamWhere = [];
-    if (orgId) { teamArgs.push(orgId); teamWhere.push(`organization_id = $${teamArgs.length}`); }
-    const team = await db.query(
-      `SELECT id, actor_id, NULL::text AS actor_email, action, target_type, target_id,
-              organization_id AS target_org_id, details, ip_address, created_at, 'org' AS source
-         FROM team_audit_logs
-         ${teamWhere.length ? 'WHERE ' + teamWhere.join(' AND ') : ''}
-         ORDER BY created_at DESC LIMIT $${teamArgs.length + 1}`,
-      [...teamArgs, limit]
-    ).catch(() => ({ rows: [] }));
 
-    const merged = [...platform.rows, ...team.rows]
-      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
-      .slice(0, limit);
-    res.json({ events: merged });
+    // Parse cursor — defensive: invalid input falls through to "no cursor"
+    // rather than failing the request.
+    let before = null;
+    if (req.query.before) {
+      const d = new Date(req.query.before);
+      if (!Number.isNaN(d.getTime())) before = d.toISOString();
+    }
+
+    const args = [];
+    const pWhere = [];
+    if (orgId) { args.push(orgId); pWhere.push(`target_org_id = $${args.length}`); }
+    if (before) { args.push(before); pWhere.push(`created_at < $${args.length}`); }
+    const tWhere = [];
+    if (orgId) { args.push(orgId); tWhere.push(`organization_id = $${args.length}`); }
+    if (before) { args.push(before); tWhere.push(`created_at < $${args.length}`); }
+    args.push(limit);
+    const limitPos = args.length;
+
+    // team_audit_logs may not exist on a freshly seeded DB; guard with try.
+    let merged;
+    try {
+      merged = await db.query(
+        `SELECT * FROM (
+           SELECT id, actor_id, actor_email, action, target_type, target_id, target_org_id,
+                  details, ip_address, created_at, 'platform' AS source
+             FROM platform_audit_logs
+             ${pWhere.length ? 'WHERE ' + pWhere.join(' AND ') : ''}
+           UNION ALL
+           SELECT id, actor_id, NULL::text AS actor_email, action, target_type, target_id,
+                  organization_id AS target_org_id, details, ip_address, created_at, 'org' AS source
+             FROM team_audit_logs
+             ${tWhere.length ? 'WHERE ' + tWhere.join(' AND ') : ''}
+         ) AS combined
+         ORDER BY created_at DESC
+         LIMIT $${limitPos}`,
+        args
+      );
+    } catch {
+      // team_audit_logs missing — fall back to platform-only.
+      const fallbackArgs = [];
+      const w = [];
+      if (orgId) { fallbackArgs.push(orgId); w.push(`target_org_id = $${fallbackArgs.length}`); }
+      if (before) { fallbackArgs.push(before); w.push(`created_at < $${fallbackArgs.length}`); }
+      fallbackArgs.push(limit);
+      merged = await db.query(
+        `SELECT id, actor_id, actor_email, action, target_type, target_id, target_org_id,
+                details, ip_address, created_at, 'platform' AS source
+           FROM platform_audit_logs
+           ${w.length ? 'WHERE ' + w.join(' AND ') : ''}
+           ORDER BY created_at DESC
+           LIMIT $${fallbackArgs.length}`,
+        fallbackArgs
+      );
+    }
+
+    // nextCursor is the oldest row's created_at when we filled the page;
+    // null signals "you've reached the end".
+    const nextCursor = merged.rows.length === limit
+      ? merged.rows[merged.rows.length - 1].created_at
+      : null;
+    res.json({ events: merged.rows, nextCursor });
   } catch (err) { next(err); }
 });
 
@@ -552,7 +604,12 @@ function mintImpersonationToken(targetUser, adminId) {
     payload.orgId = targetUser.organization_id;
     payload.role = targetUser.role || 'member';
   }
-  if (targetUser.is_platform_admin) payload.isPlatformAdmin = true;
+  // Intentionally do NOT propagate isPlatformAdmin even if the target user
+  // is a platform admin. The impersonator already has their own admin
+  // powers; bestowing them on the impersonation token would muddy the
+  // audit trail (admin.* actions would attribute to the target's identity)
+  // and create a confusing escalation surface. If admin work is needed,
+  // the impersonator should do it from their own session.
   // 5-minute window. Impersonation tokens ride the URL hash to the main
   // app and persist in browser history for the lifetime of that tab —
   // shorter TTL caps the value of a leaked URL. If the admin needs longer
@@ -563,12 +620,12 @@ function mintImpersonationToken(targetUser, adminId) {
     email: targetUser.email,
     organizationId: targetUser.organization_id || null,
     role: targetUser.role || null,
-    isPlatformAdmin: !!targetUser.is_platform_admin,
+    isPlatformAdmin: false, // never grant admin to the impersonation session
     impersonatedBy: adminId,
   } };
 }
 
-router.post('/impersonate/:userId', async (req, res, next) => {
+router.post('/impersonate/:userId', adminMutationLimiter, async (req, res, next) => {
   try {
     const userId = intParam(req.params.userId, 'userId');
     if (userId === req.user.id) throw new ForbiddenError('Cannot impersonate yourself');
@@ -604,7 +661,7 @@ router.post('/impersonate/:userId', async (req, res, next) => {
 // scoped into a specific org. We mint a token where `sub` is still the admin,
 // but `orgId` points at the target. The user remains is_platform_admin so the
 // admin nav stays visible to exit.
-router.post('/organizations/:id/enter', async (req, res, next) => {
+router.post('/organizations/:id/enter', adminMutationLimiter, async (req, res, next) => {
   try {
     // Backdoor entry is platform-only — org owners are already authenticated
     // into their org via normal login, no token-mint shortcut needed.
