@@ -183,9 +183,11 @@ async function login(email, password) {
   email = email.toLowerCase().trim();
   
   const result = await db.query(
-    `SELECT u.id, u.email, u.password_hash, u.organization_id, u.status, om.role
+    `SELECT u.id, u.email, u.password_hash, u.organization_id, u.status, u.is_platform_admin,
+            om.role, o.status AS org_status
      FROM users u
      LEFT JOIN organization_members om ON u.id = om.user_id AND u.organization_id = om.organization_id
+     LEFT JOIN organizations o ON u.organization_id = o.id
      WHERE u.email = $1`,
     [email]
   );
@@ -196,10 +198,7 @@ async function login(email, password) {
 
   const user = result.rows[0];
 
-  // Check if user is deactivated
-  if (user.status === 'deactivated') {
-    throw new ForbiddenError('Your account has been deactivated. Contact your organization admin.');
-  }
+  enforceAccountAccess(user);
 
   const valid = await bcrypt.compare(password, user.password_hash);
   if (!valid) {
@@ -210,6 +209,34 @@ async function login(email, password) {
   await db.query('UPDATE users SET last_active_at = NOW() WHERE id = $1', [user.id]);
 
   return generateTokens(user);
+}
+
+/**
+ * Reject login/refresh based on user.status and the user's organization.status.
+ * Platform admins are exempt from the org check so they can always recover
+ * a suspended org (they own the Suspend button — locking themselves out
+ * would be a footgun).
+ *
+ * Distinct error messages per failure case so the UI can render the right
+ * recovery copy; password-mismatch is intentionally kept generic upstream.
+ */
+function enforceAccountAccess(user) {
+  if (user.status === 'deactivated') {
+    throw new ForbiddenError('Your account has been deactivated. Contact your organization admin.');
+  }
+  if (user.status === 'deleted') {
+    throw new ForbiddenError('This account no longer exists.');
+  }
+  if (user.status && user.status !== 'active') {
+    throw new ForbiddenError('This account is not in an active state.');
+  }
+  if (user.is_platform_admin) return; // platform admins bypass org-status gate
+  if (user.org_status === 'suspended') {
+    throw new ForbiddenError('Your organization has been suspended. Contact support.');
+  }
+  if (user.org_status === 'deleted') {
+    throw new ForbiddenError('Your organization no longer exists.');
+  }
 }
 
 /**
@@ -242,9 +269,11 @@ async function refresh(refreshToken) {
 
   // Get user with org info
   const userResult = await db.query(
-    `SELECT u.id, u.email, u.organization_id, u.status, om.role
+    `SELECT u.id, u.email, u.organization_id, u.status, u.is_platform_admin,
+            om.role, o.status AS org_status
      FROM users u
      LEFT JOIN organization_members om ON u.id = om.user_id AND u.organization_id = om.organization_id
+     LEFT JOIN organizations o ON u.organization_id = o.id
      WHERE u.id = $1`,
     [result.rows[0].user_id]
   );
@@ -255,10 +284,11 @@ async function refresh(refreshToken) {
 
   const user = userResult.rows[0];
 
-  // Check if user is deactivated
-  if (user.status === 'deactivated') {
-    throw new ForbiddenError('Your account has been deactivated');
-  }
+  // Same gate as login() — handles deactivated/deleted users AND
+  // suspended/deleted orgs. Refresh is the choke point that revalidates
+  // every ~15min, so suspending an org propagates within one refresh
+  // cycle without needing token revocation.
+  enforceAccountAccess(user);
 
   return generateTokens(user);
 }
@@ -310,6 +340,16 @@ async function generateTokens(user) {
     accessPayload.role = user.role || 'member';
   }
 
+  // Cross-org platform admins gate the /admin surface and unlock impersonation.
+  if (user.is_platform_admin) {
+    accessPayload.isPlatformAdmin = true;
+  }
+  // Impersonation/backdoor entry: caller passes user._impersonatedBy = adminId
+  // so the minted token carries that attribution. Not persisted in DB.
+  if (user._impersonatedBy) {
+    accessPayload.impersonatedBy = user._impersonatedBy;
+  }
+
   const accessToken = jwt.sign(accessPayload, config.JWT_SECRET, {
     expiresIn: config.JWT_ACCESS_EXPIRY,
   });
@@ -341,6 +381,7 @@ async function generateTokens(user) {
       email: user.email,
       organizationId: user.organization_id,
       role: user.role,
+      isPlatformAdmin: !!user.is_platform_admin,
     },
   };
 }

@@ -375,6 +375,32 @@ logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backen
       // would have failed if stories didn't exist yet. Replay safely now.
       `ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS story_id INTEGER REFERENCES stories(id) ON DELETE SET NULL`,
       `CREATE INDEX IF NOT EXISTS idx_test_cases_story_id ON test_cases(story_id)`,
+
+      // ── Migration 019: platform admin + org status/features + cross-org audit ──
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS is_platform_admin BOOLEAN NOT NULL DEFAULT false`,
+      `CREATE INDEX IF NOT EXISTS idx_users_platform_admin ON users(is_platform_admin) WHERE is_platform_admin = true`,
+      `ALTER TABLE organizations ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'`,
+      `ALTER TABLE organizations ADD COLUMN IF NOT EXISTS suspended_at TIMESTAMPTZ`,
+      `ALTER TABLE organizations ADD COLUMN IF NOT EXISTS suspension_reason TEXT`,
+      `ALTER TABLE organizations ADD COLUMN IF NOT EXISTS features JSONB NOT NULL DEFAULT '{}'::jsonb`,
+      `CREATE INDEX IF NOT EXISTS idx_organizations_status ON organizations(status)`,
+      `CREATE TABLE IF NOT EXISTS platform_audit_logs (
+         id SERIAL PRIMARY KEY,
+         actor_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+         actor_email TEXT,
+         action TEXT NOT NULL,
+         target_type TEXT,
+         target_id TEXT,
+         target_org_id INTEGER REFERENCES organizations(id) ON DELETE SET NULL,
+         details JSONB DEFAULT '{}'::jsonb,
+         ip_address TEXT,
+         user_agent TEXT,
+         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+       )`,
+      `CREATE INDEX IF NOT EXISTS idx_platform_audit_actor ON platform_audit_logs(actor_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_platform_audit_org ON platform_audit_logs(target_org_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_platform_audit_created ON platform_audit_logs(created_at DESC)`,
+      `CREATE INDEX IF NOT EXISTS idx_platform_audit_action ON platform_audit_logs(action)`,
     ];
     for (const sql of statements) {
       try {
@@ -492,6 +518,7 @@ const runsTopLevelRoutes = safeRequire('./routes/runs', 'runs');
 const projectInsightsRoutes = safeRequire('./routes/projectInsights', 'projectInsights');
 const webhookRoutes = safeRequire('./routes/webhooks', 'webhooks');
 const apiSourceRoutes = safeRequire('./routes/apiSources', 'apiSources');
+const adminRoutes = safeRequire('./routes/admin', 'admin');
 
 // ============================================================================
 // CORS — credentials: true so the HttpOnly refresh cookie flows on /auth/refresh
@@ -610,6 +637,10 @@ app.use('/api/health', healthRoutes);
 
 // Auth routes (no auth middleware — register/login/refresh/logout are public)
 app.use('/api/auth', authRoutes);
+
+// Platform admin (cross-org). Mount early so a 401/403 is returned before
+// org-scoped routes get a chance to redirect on missing orgId.
+app.use('/api/admin', adminRoutes);
 
 // Protected routes — specific paths first
 app.use('/api/projects', projectRoutes);

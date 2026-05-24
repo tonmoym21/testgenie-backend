@@ -40,6 +40,11 @@ function authenticate(req, _res, next) {
       email: decoded.email,
       orgId: decoded.orgId || null,
       role: decoded.role || null,
+      isPlatformAdmin: !!decoded.isPlatformAdmin,
+      // Set on tokens minted by /api/admin/impersonate or /enter-org so the
+      // current request runs as that user/org while audit logs still attribute
+      // the original platform admin via `impersonatedBy`.
+      impersonatedBy: decoded.impersonatedBy || null,
     };
     next();
   } catch (err) {
@@ -75,6 +80,8 @@ function optionalAuth(req, _res, next) {
       email: decoded.email,
       orgId: decoded.orgId || null,
       role: decoded.role || null,
+      isPlatformAdmin: !!decoded.isPlatformAdmin,
+      impersonatedBy: decoded.impersonatedBy || null,
     };
   } catch {
     req.user = null;
