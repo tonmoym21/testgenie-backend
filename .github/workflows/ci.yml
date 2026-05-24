@@ -19,8 +19,10 @@ jobs:
           POSTGRES_DB: testgenie_test
         ports:
           - 5432:5432
-        volumes:
-          - ${{ github.workspace }}/docker/init.sql:/docker-entrypoint-initdb.d/001_init.sql
+        # NB: no docker-entrypoint-initdb.d mount anymore. db:bootstrap
+        # (the next-but-one step) runs every numbered migration against
+        # the empty container. init.sql is retained for docker-compose
+        # use cases but is no longer the source of CI's schema.
         options: >-
           --health-cmd "pg_isready -U postgres"
           --health-interval 10s
@@ -29,6 +31,10 @@ jobs:
 
     env:
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/testgenie_test
+      # Some integration tests resolve TEST_DB_URL before DATABASE_URL.
+      # Keep them in sync so the suite runs against the same DB whichever
+      # variable the file picks up.
+      TEST_DB_URL: postgresql://postgres:postgres@localhost:5432/testgenie_test
       JWT_SECRET: ci-test-secret-that-is-at-least-32-characters-long
       JWT_ACCESS_EXPIRY: 15m
       JWT_REFRESH_EXPIRY: 7d
@@ -49,9 +55,15 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run database migrations
-        run: |
-          PGPASSWORD=postgres psql -h localhost -U postgres -d testgenie_test -f docker/init.sql
+      - name: Bootstrap database (run all numbered migrations)
+        # Replaces the old `psql -f docker/init.sql` step. That only seeded
+        # the initial schema; it did NOT apply migrations 006+, leaving CI's
+        # test DB structurally behind every dev machine that runs
+        # node-pg-migrate. The integration tests passed anyway because
+        # src/index.js's inline runStartupMigrations IIFE self-heals on
+        # boot — accidental green. db:bootstrap makes the schema state
+        # explicit so we'd catch the next migration drift loudly.
+        run: npm run db:bootstrap
 
       - name: Run tests
         run: npm test
