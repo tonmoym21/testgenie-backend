@@ -1,0 +1,9 @@
+{
+  "name": "testforge-verify-fixture",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Minimal Playwright project used by autoFixVerifyService.realPlaywright.integration.test.js. Two specs (passing/failing) are copied into a temp git repo at test time.",
+  "devDependencies": {
+    "@playwright/test": "1.58.2"
+  }
+}
