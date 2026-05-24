@@ -2,12 +2,13 @@
 // Generates Playwright test files from approved CoverageScenarios via OpenAI
 // V2: Grounded in target app config — sends selector strategy + known selectors to LLM
 
-const OpenAI = require('openai');
 const config = require('../config');
 const logger = require('../utils/logger') || console;
 const { classifyAiError } = require('../utils/aiMetrics');
+const { getOpenAIClient } = require('./llm/openaiClient');
 
-const openai = new OpenAI({ apiKey: config.OPENAI_API_KEY });
+// Lazy — see analyzeService.js for the rationale. Boots without
+// OPENAI_API_KEY; 503 FEATURE_UNAVAILABLE only when the route is hit.
 
 // ---------------------------------------------------------------------------
 // Prompt templates — now include target app context
@@ -129,7 +130,7 @@ async function generatePlaywrightFiles(scenarios, categories = [], targetConfig 
 
   let response;
   try {
-    response = await openai.chat.completions.create({
+    response = await getOpenAIClient({}, 'Playwright spec generation').chat.completions.create({
       model,
       temperature: 0.2,
       max_tokens: 4096,

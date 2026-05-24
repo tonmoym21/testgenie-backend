@@ -1,12 +1,14 @@
-const OpenAI = require('openai');
 const db = require('../db');
 const config = require('../config');
 const { retry } = require('../utils/retry');
 const { NotFoundError, AiProviderError } = require('../utils/apiError');
 const logger = require('../utils/logger');
 const { classifyAiError } = require('../utils/aiMetrics');
+const { getOpenAIClient } = require('./llm/openaiClient');
 
-const openai = new OpenAI({ apiKey: config.OPENAI_API_KEY });
+// Lazy: no eager OpenAI construction at module load. Deployments without
+// OPENAI_API_KEY (Ollama-only) boot fine; this route 503s with
+// FEATURE_UNAVAILABLE only when actually called.
 
 const ANALYSIS_PROMPTS = {
   coverage_gaps: `You are a senior QA engineer. Analyze the following test cases and identify missing test scenarios, edge cases, and coverage gaps. Focus on:
@@ -76,7 +78,7 @@ async function analyze(userId, projectId, testCaseIds, analysisType) {
   try {
     completion = await retry(
       () =>
-        openai.chat.completions.create({
+        getOpenAIClient({}, 'Analyze').chat.completions.create({
           model: config.OPENAI_MODEL,
           max_tokens: config.OPENAI_MAX_TOKENS,
           temperature: 0.3,

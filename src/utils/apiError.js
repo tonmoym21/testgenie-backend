@@ -63,6 +63,21 @@ class AiProviderError extends ApiError {
   }
 }
 
+// 503 — the route is wired and the request is valid, but a backing
+// capability the operator hasn't enabled (e.g. OPENAI_API_KEY unset
+// in an Ollama-only deployment) is needed. Distinct from AiProviderError
+// (the key is present but the upstream LLM failed) and from a 500
+// (genuine server bug).
+class FeatureUnavailableError extends ApiError {
+  constructor(feature, hint = null) {
+    const msg = hint
+      ? `${feature} is not available in this deployment: ${hint}`
+      : `${feature} is not available in this deployment`;
+    super(503, 'FEATURE_UNAVAILABLE', msg);
+    this.feature = feature;
+  }
+}
+
 module.exports = {
   ApiError,
   ValidationError,
@@ -72,4 +87,5 @@ module.exports = {
   ConflictError,
   RateLimitError,
   AiProviderError,
+  FeatureUnavailableError,
 };

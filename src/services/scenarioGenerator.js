@@ -2,12 +2,12 @@
 // AI-powered scenario generation using OpenAI GPT-4o
 // Generates 12-16 specific, actionable scenarios from story title + description
 
-const OpenAI = require('openai');
 const config = require('../config');
 const logger = require('../utils/logger');
 const { classifyAiError } = require('../utils/aiMetrics');
+const { getOpenAIClient } = require('./llm/openaiClient');
 
-const openai = new OpenAI({ apiKey: config.OPENAI_API_KEY });
+// Lazy — see analyzeService.js for the rationale.
 
 const SYSTEM_PROMPT = `You are a senior QA test architect writing test cases for a manual test case repository. The cases must read like a professional QA spreadsheet (Test Case ID / Title / Steps / Expected Result) — concrete, terse, and tied to the specific feature in the story. Avoid abstract or generic language.
 
@@ -176,7 +176,7 @@ async function generateScenarios(story) {
 
   let response;
   try {
-    response = await openai.chat.completions.create({
+    response = await getOpenAIClient({}, 'Scenario generation').chat.completions.create({
       model: config.OPENAI_MODEL || 'gpt-4o',
       temperature: 0.4,
       max_tokens: config.OPENAI_MAX_TOKENS || 12000,

@@ -178,15 +178,14 @@ When both an explicit CLI flag (`--repo`) and a config row are present, the CLI 
 
 Note on `OPENAI_API_KEY` for Ollama-only setups:
 
-- `AUTOFIX_PROVIDER=ollama` makes `OPENAI_API_KEY` optional at boot. You can launch the server without it.
-- BUT three other callers still construct an `OpenAI` client at module load: `src/services/analyzeService.js`, `src/services/playwrightGenerator.js`, `src/services/scenarioGenerator.js`. Without a key set, those modules will throw when their routes are hit — so an Ollama-only deployment that calls `POST /api/analyze` or scenario/spec generation will 500 with a key error.
-- The auto-fix path (`proposeFix` + the OpenAI provider in `src/services/llm/openaiProvider.js`) is safe — that one lazy-constructs the client and is never reached when `AUTOFIX_PROVIDER=ollama`.
+- `AUTOFIX_PROVIDER=ollama` makes `OPENAI_API_KEY` optional at boot.
+- All four OpenAI call sites (analyzeService, playwrightGenerator, scenarioGenerator, the OpenAI LLM provider) now lazy-construct via `src/services/llm/openaiClient.js`. With no key set, the affected routes return **HTTP 503 `FEATURE_UNAVAILABLE`** with a message naming the feature and pointing at this knob — no 500s, no boot failures.
+- The auto-fix path (`proposeFix` + the OpenAI provider) is doubly safe: lazy-constructed AND never reached when `AUTOFIX_PROVIDER=ollama`.
 
 Recipes:
-- **Auto-fix only, no OpenAI features wanted:** set `AUTOFIX_PROVIDER=ollama` and leave `OPENAI_API_KEY` unset. Disable or proxy `/api/analyze`, scenario generation, and spec generation routes at your gateway.
+- **Auto-fix only, no OpenAI features wanted:** set `AUTOFIX_PROVIDER=ollama` and leave `OPENAI_API_KEY` unset. `/api/analyze`, scenario generation, and spec generation will respond 503 `FEATURE_UNAVAILABLE`. The auto-fix loop runs entirely against Ollama.
 - **Mixed (Ollama for auto-fix, OpenAI for analyze/generators):** set both `AUTOFIX_PROVIDER=ollama` and `OPENAI_API_KEY=sk-...`. All features work.
-
-Remaining follow-up to make OpenAI **fully** optional: lazy-construct the three eager clients with the same `if (OPENAI_API_KEY) ...` guard the LLM provider already uses, and return a clean "feature unavailable" from the routes when the key is absent.
+- **Default:** `AUTOFIX_PROVIDER` unset (= 'openai'), `OPENAI_API_KEY=sk-...`. Unchanged from before this branch.
 
 ---
 

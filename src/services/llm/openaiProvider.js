@@ -9,19 +9,15 @@
 // AUTOFIX_PROVIDER=ollama, b) tests that don't touch this provider
 // don't need the OpenAI mock loaded.
 
-let _client;
+const { getOpenAIClient } = require('./openaiClient');
 
 function getClient(deps = {}) {
-  if (_client) return _client;
-  const OpenAI = deps.OpenAI || require('openai');
-  const config = deps.config || require('../../config');
-  _client = new OpenAI({
-    apiKey: config.OPENAI_API_KEY,
-    // baseURL is optional in the SDK — passing undefined uses the default
-    // (api.openai.com). Set OPENAI_BASE_URL to redirect to a compatible API.
-    baseURL: process.env.OPENAI_BASE_URL || undefined,
-  });
-  return _client;
+  // The shared helper handles caching, baseURL, and the
+  // FeatureUnavailableError-on-missing-key path. The 'Auto-fix' feature
+  // name is used only if AUTOFIX_PROVIDER='openai' but OPENAI_API_KEY is
+  // missing — a misconfiguration the boot gate now catches (see config.js
+  // superRefine), but kept as defense in depth.
+  return getOpenAIClient(deps, 'Auto-fix');
 }
 
 /**
@@ -52,8 +48,7 @@ async function chatJson(req, deps = {}) {
   return { content };
 }
 
-// Reset for tests — drops the cached client so a re-require with new mocks
-// rebuilds. Not exported on the public surface used by callers.
-function _resetForTests() { _client = null; }
+// Reset for tests — delegates to the shared helper's cache reset.
+function _resetForTests() { require('./openaiClient')._resetForTests(); }
 
 module.exports = { name: 'openai', chatJson, _resetForTests };
