@@ -6,6 +6,7 @@ const { authenticate } = require('../middleware/auth');
 const authService = require('../services/authService');
 const auditService = require('../services/auditService');
 const logger = require('../utils/logger');
+const { ApiError } = require('../utils/apiError');
 
 const router = Router();
 
@@ -180,10 +181,11 @@ router.post('/refresh', refreshLimiter, validate(refreshSchema), async (req, res
   try {
     const token = (req.body && req.body.refreshToken) || readRefreshCookie(req);
     if (!token) {
-      const err = new Error('Refresh token required');
-      err.status = 400;
-      err.code = 'VALIDATION_ERROR';
-      throw err;
+      // Use ApiError so the global errorHandler maps it to a clean 400.
+      // The previous plain-Error path fell to the "unexpected errors"
+      // branch and surfaced as 500 — the failure that surfaced in the
+      // "rejects when neither cookie nor body" cookie-pipe test.
+      throw new ApiError(400, 'VALIDATION_ERROR', 'Refresh token required');
     }
     const tokens = await authService.refresh(token);
     if (tokens && tokens.refreshToken) setRefreshCookie(res, tokens.refreshToken);

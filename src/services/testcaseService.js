@@ -5,8 +5,18 @@ const { NotFoundError } = require('../utils/apiError');
  * Platform-wide visibility: any authenticated user can access any project.
  * We still verify the project exists so callers get a clean 404.
  */
-async function verifyProjectAccess(_userId, projectId, _orgId) {
-  const result = await db.query('SELECT id FROM projects WHERE id = $1', [projectId]);
+async function verifyProjectAccess(userId, projectId, orgId) {
+  // Previously: only checked the project row EXISTED, ignoring userId and
+  // orgId entirely. That let any authenticated user write test cases into
+  // any project in the system — a cross-tenant data write vulnerability.
+  // The same bug class as the orgScopedWhere always-true clause in
+  // projectService.js. Fix mirrors the projects fix: visible to the
+  // owner or to anyone in the project's organization.
+  const result = await db.query(
+    `SELECT id FROM projects
+      WHERE id = $1 AND (user_id = $2 OR (organization_id IS NOT NULL AND organization_id = $3))`,
+    [projectId, userId, orgId || null],
+  );
   if (result.rows.length === 0) throw new NotFoundError('Project');
 }
 
