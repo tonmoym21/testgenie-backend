@@ -9,6 +9,45 @@ const db = require('../db');
 const logger = require('../utils/logger');
 
 // ============================================================================
+// SCOPE CLAUSES — per-table SQL fragments that replace the audit-flagged
+// `WHERE ($1::int IS NOT NULL) /* platform-wide */` always-true stub. Every
+// query in this file convention-binds $1 = userId, $2 = orgId, with any
+// query-specific params starting at $3.
+//
+// Visibility model (per migration 011's "org-wide visibility" intent):
+//   - test_executions  : user owns the row, OR the row's project belongs to
+//                        the user OR the user's org
+//   - test_run_results : user executed it, OR the row's test_run belongs to
+//                        the user OR the user's org
+//   - scheduled_tests  : direct user_id + organization_id columns
+//   - collections      : direct user_id + organization_id columns
+//
+// `organization_id IS NOT NULL` guard avoids leaking pre-migration rows
+// where the org column was nullable and an attacker with orgId=null could
+// otherwise match every legacy row.
+// ============================================================================
+const SCOPE = {
+  test_executions:
+    `(user_id = $1 OR project_id IN (
+       SELECT id FROM projects
+        WHERE user_id = $1
+           OR (organization_id IS NOT NULL AND organization_id = $2)
+     ))`,
+  test_run_results:
+    `(executed_by = $1 OR test_run_id IN (
+       SELECT id FROM test_runs
+        WHERE user_id = $1
+           OR (organization_id IS NOT NULL AND organization_id = $2)
+     ))`,
+  scheduled_tests:
+    `(user_id = $1 OR (organization_id IS NOT NULL AND organization_id = $2))`,
+  collections:
+    `(user_id = $1 OR (organization_id IS NOT NULL AND organization_id = $2))`,
+  projects:
+    `(user_id = $1 OR (organization_id IS NOT NULL AND organization_id = $2))`,
+};
+
+// ============================================================================
 // SAFE QUERY UTILITIES
 // ============================================================================
 
@@ -60,8 +99,9 @@ function getRowValue(result, key, defaultValue = 0) {
 // COMBINED DASHBOARD METRICS
 // ============================================================================
 
-async function getCombinedMetrics(userId) {
-  logger.info({ userId }, 'Dashboard: getCombinedMetrics called');
+async function getCombinedMetrics(userId, orgId = null) {
+  logger.info({ userId, orgId }, 'Dashboard: getCombinedMetrics called');
+  const scopeParams = [userId, orgId || null];
   
   // Default empty response structure
   const emptyResponse = {
@@ -105,8 +145,8 @@ async function getCombinedMetrics(userId) {
              COUNT(*) FILTER (WHERE status = 'failed')::int AS failed,
              COUNT(*) FILTER (WHERE status = 'running')::int AS running,
              COALESCE(AVG(duration_ms), 0)::int AS avg_duration
-           FROM test_executions WHERE ($1::int IS NOT NULL) /* platform-wide */`,
-          [userId],
+           FROM test_executions WHERE ${SCOPE.test_executions}`,
+          scopeParams,
           { rows: [{ total_runs: 0, passed: 0, failed: 0, running: 0, avg_duration: 0 }] }
         )
       : { rows: [{ total_runs: 0, passed: 0, failed: 0, running: 0, avg_duration: 0 }] };
@@ -118,8 +158,8 @@ async function getCombinedMetrics(userId) {
              COUNT(*) FILTER (WHERE status = 'passed')::int AS passed,
              COUNT(*) FILTER (WHERE status = 'failed')::int AS failed,
              COUNT(*) FILTER (WHERE status IN ('blocked', 'retest'))::int AS running
-           FROM test_run_results WHERE ($1::int IS NOT NULL) /* platform-wide */`,
-          [userId],
+           FROM test_run_results WHERE ${SCOPE.test_run_results}`,
+          scopeParams,
           { rows: [{ total_runs: 0, passed: 0, failed: 0, running: 0 }] }
         )
       : { rows: [{ total_runs: 0, passed: 0, failed: 0, running: 0 }] };
@@ -131,9 +171,9 @@ async function getCombinedMetrics(userId) {
           `SELECT test_type AS type, COUNT(*)::int AS count,
                   COUNT(*) FILTER (WHERE status = 'passed')::int AS passed,
                   COUNT(*) FILTER (WHERE status = 'failed')::int AS failed
-           FROM test_executions WHERE ($1::int IS NOT NULL) /* platform-wide */
+           FROM test_executions WHERE ${SCOPE.test_executions}
            GROUP BY test_type`,
-          [userId]
+          scopeParams
         )
       : { rows: [] };
 
@@ -142,30 +182,34 @@ async function getCombinedMetrics(userId) {
           `SELECT 'manual'::text AS type, COUNT(*)::int AS count,
                   COUNT(*) FILTER (WHERE status = 'passed')::int AS passed,
                   COUNT(*) FILTER (WHERE status = 'failed')::int AS failed
-           FROM test_run_results WHERE ($1::int IS NOT NULL) /* platform-wide */
+           FROM test_run_results WHERE ${SCOPE.test_run_results}
            HAVING COUNT(*) > 0`,
-          [userId]
+          scopeParams
         )
       : { rows: [] };
 
-    // Daily trend (30 days) — UNION both sources by date.
+    // Daily trend (30 days) — UNION both sources, each scoped to the caller's
+    // visibility. Old shape pushed the scope clause to the outer SELECT against
+    // a `combined` CTE that had no scope columns left — which is why the bug's
+    // outer WHERE was forced to be the always-true marker. We push the scope
+    // INTO each branch where the real columns still exist.
     const dailyTrend = await safeQuery(
       `WITH combined AS (
          ${hasTestExecutions ? `SELECT DATE(created_at) AS d, status FROM test_executions
-            WHERE created_at > NOW() - INTERVAL '30 days'` : `SELECT NULL::date AS d, NULL::text AS status WHERE false`}
+            WHERE created_at > NOW() - INTERVAL '30 days' AND ${SCOPE.test_executions}` : `SELECT NULL::date AS d, NULL::text AS status WHERE false`}
          UNION ALL
          ${hasTestRunResults ? `SELECT DATE(created_at) AS d, status FROM test_run_results
-            WHERE created_at > NOW() - INTERVAL '30 days'` : `SELECT NULL::date AS d, NULL::text AS status WHERE false`}
+            WHERE created_at > NOW() - INTERVAL '30 days' AND ${SCOPE.test_run_results}` : `SELECT NULL::date AS d, NULL::text AS status WHERE false`}
        )
        SELECT d AS date,
               COUNT(*)::int AS total,
               COUNT(*) FILTER (WHERE status = 'passed')::int AS passed,
               COUNT(*) FILTER (WHERE status = 'failed')::int AS failed
        FROM combined
-       WHERE d IS NOT NULL AND ($1::int IS NOT NULL) /* platform-wide */
+       WHERE d IS NOT NULL
        GROUP BY d
        ORDER BY d`,
-      [userId]
+      scopeParams
     );
 
     // Recent activity — automated only (where we have rich rows).
@@ -174,9 +218,9 @@ async function getCombinedMetrics(userId) {
           `SELECT id, test_name AS "testName", test_type AS "testType", status,
                   duration_ms AS "durationMs", completed_at AS "completedAt", error
            FROM test_executions
-           WHERE ($1::int IS NOT NULL) /* platform-wide */
+           WHERE ${SCOPE.test_executions}
            ORDER BY created_at DESC LIMIT 10`,
-          [userId]
+          scopeParams
         )
       : { rows: [] };
 
@@ -185,9 +229,9 @@ async function getCombinedMetrics(userId) {
           `SELECT id, test_name AS "testName", test_type AS "testType", error,
                   duration_ms AS "durationMs", completed_at AS "completedAt"
            FROM test_executions
-           WHERE ($1::int IS NOT NULL) /* platform-wide */ AND status = 'failed'
+           WHERE ${SCOPE.test_executions} AND status = 'failed'
            ORDER BY created_at DESC LIMIT 5`,
-          [userId]
+          scopeParams
         )
       : { rows: [] };
 
@@ -197,8 +241,8 @@ async function getCombinedMetrics(userId) {
       schedules = await safeQuery(
         `SELECT COUNT(*) FILTER (WHERE is_active = true)::int AS active,
                 COUNT(*)::int AS total
-         FROM scheduled_tests WHERE ($1::int IS NOT NULL) /* platform-wide */`,
-        [userId],
+         FROM scheduled_tests WHERE ${SCOPE.scheduled_tests}`,
+        scopeParams,
         { rows: [{ active: 0, total: 0 }] }
       );
     }
@@ -207,8 +251,8 @@ async function getCombinedMetrics(userId) {
     let collectionsCount = 0;
     if (await tableExists('collections')) {
       const collections = await safeQuery(
-        `SELECT COUNT(*)::int AS total FROM collections WHERE ($1::int IS NOT NULL) /* platform-wide */`,
-        [userId],
+        `SELECT COUNT(*)::int AS total FROM collections WHERE ${SCOPE.collections}`,
+        scopeParams,
         { rows: [{ total: 0 }] }
       );
       collectionsCount = getRowValue(collections, 'total', 0);
@@ -261,8 +305,9 @@ async function getCombinedMetrics(userId) {
 // API DASHBOARD METRICS
 // ============================================================================
 
-async function getApiDashboardMetrics(userId) {
-  logger.info({ userId }, 'Dashboard: getApiDashboardMetrics called');
+async function getApiDashboardMetrics(userId, orgId = null) {
+  logger.info({ userId, orgId }, 'Dashboard: getApiDashboardMetrics called');
+  const scopeParams = [userId, orgId || null];
 
   const emptyResponse = {
     summary: {
@@ -293,8 +338,8 @@ async function getApiDashboardMetrics(userId) {
          COALESCE(AVG(duration_ms), 0)::int AS avg_duration,
          COALESCE(MIN(duration_ms), 0)::int AS min_duration,
          COALESCE(MAX(duration_ms), 0)::int AS max_duration
-       FROM test_executions WHERE ($1::int IS NOT NULL) /* platform-wide */ AND test_type = 'api'`,
-      [userId],
+       FROM test_executions WHERE ${SCOPE.test_executions} AND test_type = 'api'`,
+      scopeParams,
       { rows: [emptyResponse.summary] }
     );
 
@@ -306,10 +351,10 @@ async function getApiDashboardMetrics(userId) {
               COUNT(*) FILTER (WHERE status = 'failed')::int AS failed,
               COALESCE(AVG(duration_ms), 0)::int AS avg_duration
        FROM test_executions
-       WHERE ($1::int IS NOT NULL) /* platform-wide */ AND test_type = 'api' AND created_at > NOW() - INTERVAL '30 days'
+       WHERE ${SCOPE.test_executions} AND test_type = 'api' AND created_at > NOW() - INTERVAL '30 days'
        GROUP BY DATE(created_at)
        ORDER BY date`,
-      [userId]
+      scopeParams
     );
 
     // Hourly distribution
@@ -317,10 +362,10 @@ async function getApiDashboardMetrics(userId) {
       `SELECT EXTRACT(HOUR FROM created_at)::int AS hour,
               COUNT(*)::int AS count
        FROM test_executions
-       WHERE ($1::int IS NOT NULL) /* platform-wide */ AND test_type = 'api' AND created_at > NOW() - INTERVAL '7 days'
+       WHERE ${SCOPE.test_executions} AND test_type = 'api' AND created_at > NOW() - INTERVAL '7 days'
        GROUP BY EXTRACT(HOUR FROM created_at)
        ORDER BY hour`,
-      [userId]
+      scopeParams
     );
 
     // Recent API runs
@@ -328,20 +373,20 @@ async function getApiDashboardMetrics(userId) {
       `SELECT id, test_name AS "testName", status, error,
               duration_ms AS "durationMs", completed_at AS "completedAt"
        FROM test_executions
-       WHERE ($1::int IS NOT NULL) /* platform-wide */ AND test_type = 'api'
+       WHERE ${SCOPE.test_executions} AND test_type = 'api'
        ORDER BY created_at DESC LIMIT 15`,
-      [userId]
+      scopeParams
     );
 
     // Top failing endpoints
     const topFailures = await safeQuery(
       `SELECT test_name AS "testName", COUNT(*)::int AS failures
        FROM test_executions
-       WHERE ($1::int IS NOT NULL) /* platform-wide */ AND test_type = 'api' AND status = 'failed'
+       WHERE ${SCOPE.test_executions} AND test_type = 'api' AND status = 'failed'
          AND created_at > NOW() - INTERVAL '7 days'
        GROUP BY test_name
        ORDER BY failures DESC LIMIT 5`,
-      [userId]
+      scopeParams
     );
 
     const summary = stats.rows?.[0] || emptyResponse.summary;
@@ -369,8 +414,9 @@ async function getApiDashboardMetrics(userId) {
 // AUTOMATION DASHBOARD METRICS
 // ============================================================================
 
-async function getAutomationDashboardMetrics(userId) {
-  logger.info({ userId }, 'Dashboard: getAutomationDashboardMetrics called');
+async function getAutomationDashboardMetrics(userId, orgId = null) {
+  logger.info({ userId, orgId }, 'Dashboard: getAutomationDashboardMetrics called');
+  const scopeParams = [userId, orgId || null];
 
   const emptyResponse = {
     summary: {
@@ -397,8 +443,8 @@ async function getAutomationDashboardMetrics(userId) {
          COUNT(*) FILTER (WHERE status = 'failed')::int AS failed,
          COUNT(*) FILTER (WHERE status = 'running')::int AS running,
          COALESCE(AVG(duration_ms), 0)::int AS avg_duration
-       FROM test_executions WHERE ($1::int IS NOT NULL) /* platform-wide */ AND test_type = 'ui'`,
-      [userId],
+       FROM test_executions WHERE ${SCOPE.test_executions} AND test_type = 'ui'`,
+      scopeParams,
       { rows: [{ total_runs: 0, passed: 0, failed: 0, running: 0, avg_duration: 0 }] }
     );
 
@@ -409,10 +455,10 @@ async function getAutomationDashboardMetrics(userId) {
               COUNT(*) FILTER (WHERE status = 'passed')::int AS passed,
               COUNT(*) FILTER (WHERE status = 'failed')::int AS failed
        FROM test_executions
-       WHERE ($1::int IS NOT NULL) /* platform-wide */ AND test_type = 'ui' AND created_at > NOW() - INTERVAL '30 days'
+       WHERE ${SCOPE.test_executions} AND test_type = 'ui' AND created_at > NOW() - INTERVAL '30 days'
        GROUP BY DATE(created_at)
        ORDER BY date`,
-      [userId]
+      scopeParams
     );
 
     // Recent runs
@@ -420,9 +466,9 @@ async function getAutomationDashboardMetrics(userId) {
       `SELECT id, test_name AS "testName", status, error,
               duration_ms AS "durationMs", completed_at AS "completedAt"
        FROM test_executions
-       WHERE ($1::int IS NOT NULL) /* platform-wide */ AND test_type = 'ui'
+       WHERE ${SCOPE.test_executions} AND test_type = 'ui'
        ORDER BY created_at DESC LIMIT 15`,
-      [userId]
+      scopeParams
     );
 
     // Flaky tests
@@ -432,12 +478,12 @@ async function getAutomationDashboardMetrics(userId) {
               COUNT(*) FILTER (WHERE status = 'passed')::int AS passed,
               COUNT(*) FILTER (WHERE status = 'failed')::int AS failed
        FROM test_executions
-       WHERE ($1::int IS NOT NULL) /* platform-wide */ AND test_type = 'ui' AND created_at > NOW() - INTERVAL '7 days'
+       WHERE ${SCOPE.test_executions} AND test_type = 'ui' AND created_at > NOW() - INTERVAL '7 days'
        GROUP BY test_name
-       HAVING COUNT(*) FILTER (WHERE status = 'passed') > 0 
+       HAVING COUNT(*) FILTER (WHERE status = 'passed') > 0
           AND COUNT(*) FILTER (WHERE status = 'failed') > 0
        ORDER BY failed DESC LIMIT 5`,
-      [userId]
+      scopeParams
     );
 
     // Asset stats
@@ -446,9 +492,9 @@ async function getAutomationDashboardMetrics(userId) {
       const assetStats = await safeQuery(
         `SELECT COALESCE(execution_readiness, 'unknown') AS status, COUNT(*)::int AS count
          FROM automation_assets
-         WHERE project_id IN (SELECT id FROM projects WHERE ($1::int IS NOT NULL) /* platform-wide */)
+         WHERE project_id IN (SELECT id FROM projects WHERE ${SCOPE.projects})
          GROUP BY execution_readiness`,
-        [userId]
+        scopeParams
       );
       assetsByReadiness = (assetStats.rows || []).reduce((acc, row) => {
         acc[row.status || 'unknown'] = row.count;
@@ -533,8 +579,9 @@ async function getTeamActivity(userId, limit = 10) {
 // ALERTS
 // ============================================================================
 
-async function getAlerts(userId) {
-  logger.info({ userId }, 'Dashboard: getAlerts called');
+async function getAlerts(userId, orgId = null) {
+  logger.info({ userId, orgId }, 'Dashboard: getAlerts called');
+  const scopeParams = [userId, orgId || null];
   
   const alerts = [];
 
@@ -550,12 +597,12 @@ async function getAlerts(userId) {
        FROM (
          SELECT test_name, status,
                 ROW_NUMBER() OVER (PARTITION BY test_name ORDER BY created_at DESC) AS rn
-         FROM test_executions WHERE ($1::int IS NOT NULL) /* platform-wide */
+         FROM test_executions WHERE ${SCOPE.test_executions}
        ) sub
        WHERE rn <= 3 AND status = 'failed'
        GROUP BY test_name
        HAVING COUNT(*) >= 3`,
-      [userId]
+      scopeParams
     );
 
     for (const f of (failures.rows || [])) {
@@ -573,11 +620,11 @@ async function getAlerts(userId) {
     const slowTests = await safeQuery(
       `SELECT test_name, AVG(duration_ms)::int AS avg_duration
        FROM test_executions
-       WHERE ($1::int IS NOT NULL) /* platform-wide */ AND created_at > NOW() - INTERVAL '7 days'
+       WHERE ${SCOPE.test_executions} AND created_at > NOW() - INTERVAL '7 days'
        GROUP BY test_name
        HAVING AVG(duration_ms) > 5000
        LIMIT 3`,
-      [userId]
+      scopeParams
     );
 
     for (const s of (slowTests.rows || [])) {
