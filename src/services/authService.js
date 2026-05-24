@@ -296,6 +296,12 @@ async function generateTokens(user) {
     sub: user.id,
     email: user.email,
     type: 'access',
+    // Same jti rationale as the refresh token below: JWT.iat resolves to
+    // seconds. Without a nonce, a login+immediate-refresh in the same
+    // wall-clock second produces a byte-identical access token, which made
+    // "new token should differ from old" tests flake. jti also doubles as
+    // a per-issuance correlation id in logs.
+    jti: crypto.randomUUID(),
   };
 
   // Include org info if user belongs to an organization

@@ -6,9 +6,21 @@ const { NotFoundError } = require('../utils/apiError');
  * any project. The clause is a tautology that still references both
  * params so node-pg parameter alignment stays stable.
  */
-function orgScopedWhere(userId, orgId, _alias = 'p') {
+function orgScopedWhere(userId, orgId, alias = 'p') {
+  // Visibility = "own projects + same-org projects" per the design that
+  // migration 011 introduced. The previous clause —
+  //   ($1::int IS NOT NULL OR $2::int IS NULL)
+  // — always evaluated to true when userId was supplied (which is every
+  // authenticated request), so list() and getById() returned EVERY row
+  // in the projects table to any authenticated caller. That's a cross-
+  // tenant data leak surfaced by three integration tests that expected
+  // 404 for another user's project and instead got 200.
+  //
+  // When orgId is null (user with no organization, edge case during
+  // migration), the IS NOT NULL guard collapses the OR to just the
+  // owner check — visibility is then strict per-user.
   return {
-    clause: `($1::int IS NOT NULL OR $2::int IS NULL)`,
+    clause: `(${alias}.user_id = $1 OR (${alias}.organization_id IS NOT NULL AND ${alias}.organization_id = $2))`,
     params: [userId, orgId || null],
   };
 }

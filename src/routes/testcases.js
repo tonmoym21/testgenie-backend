@@ -19,6 +19,21 @@ const createTestCaseSchema = z.object({
   assigneeUserId: z.number().int().positive().optional().nullable(),
 });
 
+// PATCH schema — every field optional, but bounded the same way create() is.
+// status MUST be enum-validated; without this, an invalid value falls through
+// to the DB CHECK constraint and surfaces as a 500 instead of a clean 400.
+const updateTestCaseSchema = z.object({
+  title: z.string().min(1).max(300).optional(),
+  content: z.string().min(1).max(10000).optional(),
+  // Match the DB CHECK constraint exactly (initial-schema.sql):
+  //   CHECK (status IN ('draft', 'active', 'archived', 'failed', 'passed'))
+  status: z.enum(['draft', 'active', 'archived', 'failed', 'passed']).optional(),
+  priority: z.enum(['low', 'medium', 'high', 'critical']).optional(),
+  jiraIssueKey: z.string().max(50).optional().nullable(),
+  folderId: z.number().int().positive().optional().nullable(),
+  assigneeUserId: z.number().int().positive().optional().nullable(),
+});
+
 const batchCreateSchema = z.object({
   testCases: z
     .array(z.object({
@@ -95,7 +110,7 @@ router.post('/batch/create', validate(batchCreateSchema), async (req, res) => {
   }
 });
 
-router.patch('/:testCaseId', async (req, res) => {
+router.patch('/:testCaseId', validate(updateTestCaseSchema), async (req, res) => {
   try {
     const { projectId, testCaseId } = req.params;
     const { id: userId, orgId } = req.user;

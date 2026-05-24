@@ -1,5 +1,5 @@
 const request = require('supertest');
-const { setup, cleanDb, teardown, createAuthenticatedUser, createTestProject } = require('./setup');
+const { setup, cleanDb, teardown, createAuthenticatedUser, createIsolatedAuthenticatedUser, createTestProject } = require('./setup');
 
 let app;
 
@@ -55,8 +55,11 @@ describe('POST /api/projects', () => {
 
 describe('GET /api/projects', () => {
   it('should list only the users projects', async () => {
+    // Cross-org isolation: userB must be in a separate org or the list
+    // legitimately returns both projects (org-wide visibility per
+    // migration 011). See createIsolatedAuthenticatedUser notes in setup.js.
     const userA = await createAuthenticatedUser(app, 'a@test.com', 'Password123');
-    const userB = await createAuthenticatedUser(app, 'b@test.com', 'Password123');
+    const userB = await createIsolatedAuthenticatedUser(app, 'b@elsewhere.example', 'Password123');
 
     await createTestProject(app, userA.accessToken, 'A Project');
     await createTestProject(app, userB.accessToken, 'B Project');
@@ -125,8 +128,13 @@ describe('GET /api/projects/:id', () => {
   });
 
   it('should 404 for another users project', async () => {
+    // userA goes through the normal register path (creates the first org).
+    // userB is seeded directly in a separate org via createIsolatedAuthenticatedUser
+    // because (a) once any org exists, register is invite-only, and (b) we
+    // explicitly want CROSS-org isolation here, not same-org visibility (the
+    // latter is org-wide-visible by design per migration 011).
     const userA = await createAuthenticatedUser(app, 'own@test.com', 'Password123');
-    const userB = await createAuthenticatedUser(app, 'other@test.com', 'Password123');
+    const userB = await createIsolatedAuthenticatedUser(app, 'other@elsewhere.example', 'Password123');
 
     const project = await createTestProject(app, userA.accessToken, 'Private');
 
@@ -182,8 +190,9 @@ describe('DELETE /api/projects/:id', () => {
   });
 
   it('should not allow deleting another users project', async () => {
+    // See createIsolatedAuthenticatedUser comment in the GET cross-tenant test.
     const userA = await createAuthenticatedUser(app, 'del-a@test.com', 'Password123');
-    const userB = await createAuthenticatedUser(app, 'del-b@test.com', 'Password123');
+    const userB = await createIsolatedAuthenticatedUser(app, 'del-b@elsewhere.example', 'Password123');
 
     const project = await createTestProject(app, userA.accessToken, 'Not Yours');
 

@@ -679,33 +679,50 @@ app.use(errorHandler);
 // START SERVER
 // ============================================================================
 const PORT = process.env.PORT || config.PORT || 3000;
-const server = app.listen(PORT, '0.0.0.0', () => {
-  logger.info(
-    {
-      port: PORT,
-      version: BUILD_VERSION,
-      buildDate: BUILD_DATE,
-      env: process.env.NODE_ENV || 'development',
-    },
-    `TestForge server v${BUILD_VERSION} started on port ${PORT}`
-  );
-});
+
+// Only bind a port when this file is the entry point. When `src/index.js` is
+// `require()`d as a module (e.g. supertest in integration tests calling
+// `require('../src/index')`), starting a listener would race with the next
+// test file's require and surface as `EADDRINUSE: 0.0.0.0:3001`. The bound
+// server isn't even used by supertest — supertest spins up its own ephemeral
+// listener from the express app instance.
+let server = null;
+if (require.main === module) {
+  server = app.listen(PORT, '0.0.0.0', () => {
+    logger.info(
+      {
+        port: PORT,
+        version: BUILD_VERSION,
+        buildDate: BUILD_DATE,
+        env: process.env.NODE_ENV || 'development',
+      },
+      `TestForge server v${BUILD_VERSION} started on port ${PORT}`
+    );
+  });
+}
 
 // Graceful shutdown so Railway doesn't SIGKILL mid-request
 function shutdown(signal) {
   logger.info({ signal }, 'Received shutdown signal, closing server...');
-  server.close(() => {
-    logger.info('HTTP server closed');
+  if (server) {
+    server.close(() => {
+      logger.info('HTTP server closed');
+      process.exit(0);
+    });
+  } else {
     process.exit(0);
-  });
+  }
   // Force-exit if graceful close takes too long
   setTimeout(() => {
     logger.warn('Force-exiting after 10s shutdown timeout');
     process.exit(1);
   }, 10000).unref();
 }
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+// Only wire signal handlers when we actually own the server lifecycle.
+if (require.main === module) {
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+}
 
 // Never crash on unhandled rejections — log and keep serving
 process.on('unhandledRejection', (reason) => {

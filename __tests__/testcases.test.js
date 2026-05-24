@@ -4,6 +4,7 @@ const {
   cleanDb,
   teardown,
   createAuthenticatedUser,
+  createIsolatedAuthenticatedUser,
   createTestProject,
   createTestCase,
 } = require('./setup');
@@ -59,8 +60,12 @@ describe('POST /api/projects/:projectId/testcases', () => {
   });
 
   it('should 404 for a project the user does not own', async () => {
+    // Cross-org isolation: userB is seeded in a separate org so they cannot
+    // see/write to userA's project. See createIsolatedAuthenticatedUser
+    // comment in setup.js — the register endpoint is invite-only once any
+    // org exists, so seeding via direct SQL is the only way to land here.
     const userA = await createAuthenticatedUser(app, 'tc-a@test.com', 'Password123');
-    const userB = await createAuthenticatedUser(app, 'tc-b@test.com', 'Password123');
+    const userB = await createIsolatedAuthenticatedUser(app, 'tc-b@elsewhere.example', 'Password123');
     const project = await createTestProject(app, userA.accessToken);
 
     await request(app)
