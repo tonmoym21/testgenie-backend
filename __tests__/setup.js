@@ -27,6 +27,14 @@ async function setup() {
 
 /**
  * Clean all tables between tests. Order matters due to foreign keys.
+ *
+ * organizations + organization_members MUST be wiped too. authService.register
+ * checks `SELECT COUNT(*) FROM organizations` — if any row survives a test,
+ * the next test's register hits "Registration is invite-only" (403) because
+ * test emails like test-N@example.com aren't a corporate-domain auto-join
+ * match. That 403 cascaded into every projects/testcases/auth-cookie test
+ * via the createAuthenticatedUser fixture. Adding the wipes here fixes the
+ * downstream failures in one shot.
  */
 async function cleanDb() {
   await pool.query(`
@@ -34,7 +42,9 @@ async function cleanDb() {
     DELETE FROM test_cases;
     DELETE FROM projects;
     DELETE FROM refresh_tokens;
+    DELETE FROM organization_members;
     DELETE FROM users;
+    DELETE FROM organizations;
   `);
 }
 
