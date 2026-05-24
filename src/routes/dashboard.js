@@ -65,7 +65,7 @@ router.get('/', async (req, res) => {
   }
 
   try {
-    const metrics = await dashboardService.getCombinedMetrics(userId);
+    const metrics = await dashboardService.getCombinedMetrics(userId, req.user?.orgId);
     return res.json(metrics || emptyResponse);
   } catch (err) {
     logger.error({ err: err.message, userId, stack: err.stack }, 'Dashboard route error');
@@ -95,7 +95,7 @@ router.get('/api', async (req, res) => {
   }
 
   try {
-    const metrics = await dashboardService.getApiDashboardMetrics(userId);
+    const metrics = await dashboardService.getApiDashboardMetrics(userId, req.user?.orgId);
     return res.json(metrics || emptyResponse);
   } catch (err) {
     logger.error({ err: err.message, userId }, 'API dashboard route error');
@@ -123,7 +123,7 @@ router.get('/automation', async (req, res) => {
   }
 
   try {
-    const metrics = await dashboardService.getAutomationDashboardMetrics(userId);
+    const metrics = await dashboardService.getAutomationDashboardMetrics(userId, req.user?.orgId);
     return res.json(metrics || emptyResponse);
   } catch (err) {
     logger.error({ err: err.message, userId }, 'Automation dashboard route error');
@@ -164,7 +164,7 @@ router.get('/alerts', async (req, res) => {
   }
 
   try {
-    const alerts = await dashboardService.getAlerts(userId);
+    const alerts = await dashboardService.getAlerts(userId, req.user?.orgId);
     return res.json({ data: alerts || [] });
   } catch (err) {
     logger.error({ err: err.message, userId }, 'Alerts route error');

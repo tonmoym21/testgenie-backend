@@ -31,7 +31,11 @@ describe('authenticate middleware — JWT type-claim enforcement', () => {
     const req = makeReq(token);
     const err = await runMiddleware(authenticate, req);
     expect(err).toBeUndefined();
-    expect(req.user).toEqual({ id: 'u1', email: 'a@b', orgId: null, role: null });
+    // toMatchObject (not toEqual) because authenticate enriches req.user with
+    // platform-admin metadata (impersonatedBy, isPlatformAdmin) that this
+    // test predates. The shape test cares about is sub/email — the rest is
+    // out of scope here.
+    expect(req.user).toMatchObject({ id: 'u1', email: 'a@b', orgId: null, role: null });
   });
 
   it('rejects a refresh token used in the Authorization header', async () => {
