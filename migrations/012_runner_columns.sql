@@ -19,8 +19,30 @@ CREATE INDEX IF NOT EXISTS idx_playwright_runs_retry_of ON playwright_runs(retry
 CREATE INDEX IF NOT EXISTS idx_playwright_runs_queued_at ON playwright_runs(queued_at);
 
 -- 2. execution_run_items.scenario_id -> scenarios(id) with ON DELETE SET NULL.
--- NOT VALID so existing rows (which may contain orphan UUIDs from earlier
--- experiments) don't block the migration; new inserts are still enforced.
+-- Historical drift: 005_execution_module typed scenario_id as UUID, but
+-- scenarios.id is SERIAL/INTEGER. The inline migration runner in
+-- src/index.js coerces production databases; we also need to do it here
+-- so a fresh bootstrap (CI / new dev machine) doesn't fail when the FK
+-- is added below with a type-mismatch error.
+--
+-- Drops any orphan UUID data in the process (the column has never carried
+-- real cross-table links because the FK was never enforceable). Safe.
+DO $$
+DECLARE
+  current_type text;
+BEGIN
+  SELECT data_type INTO current_type
+    FROM information_schema.columns
+    WHERE table_name = 'execution_run_items' AND column_name = 'scenario_id';
+  IF current_type = 'uuid' THEN
+    ALTER TABLE execution_run_items
+      ALTER COLUMN scenario_id DROP DEFAULT,
+      ALTER COLUMN scenario_id TYPE INTEGER USING NULL;
+  END IF;
+END $$;
+
+-- NOT VALID so any pre-existing rows don't block the constraint;
+-- new inserts are still enforced.
 DO $$
 BEGIN
   IF NOT EXISTS (
