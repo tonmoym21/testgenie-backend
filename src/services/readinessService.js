@@ -10,8 +10,11 @@ const targetAppConfigService = require('./targetAppConfigService');
 /**
  * Run and persist a readiness validation for an automation asset.
  */
-async function verifyReadiness(assetId, userId, projectId) {
-  const asset = await automationAssetService.getAsset(assetId, userId);
+async function verifyReadiness(assetId, userId, projectId, orgId = null) {
+  // orgId is a trailing optional positional arg — old callers (cron jobs,
+  // older routes) default to user-only scope. Route handlers updated
+  // alongside this change pass req.user.orgId explicitly.
+  const asset = await automationAssetService.getAsset(assetId, userId, orgId);
   if (!asset) return null;
 
   // Resolve target config

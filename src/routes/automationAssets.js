@@ -34,8 +34,9 @@ router.post('/assets', validate(createSchema), async (req, res, next) => {
   try {
     const { projectId } = req.params;
     const userId = req.user.id;
+    const orgId = req.user.orgId;
     const asset = await automationAssetService.createAsset({
-      projectId: parseInt(projectId, 10), userId,
+      projectId: parseInt(projectId, 10), userId, orgId,
       storyId: req.body.storyId || null, name: req.body.name, description: req.body.description,
       categories: req.body.categories, tags: req.body.tags, generationType: req.body.generationType,
       sourceTestIds: req.body.sourceTestIds, filesManifest: req.body.filesManifest, configCode: req.body.configCode,
@@ -51,7 +52,7 @@ router.get('/assets', async (req, res, next) => {
     const { projectId } = req.params;
     const { status, category, search } = req.query;
     const { page, limit } = parseListPagination(req.query, { defaultLimit: 20 });
-    const result = await automationAssetService.listAssets(parseInt(projectId, 10), req.user.id, {
+    const result = await automationAssetService.listAssets(parseInt(projectId, 10), req.user.id, req.user.orgId, {
       status, category, search, page, limit,
     });
     res.json(result);
@@ -61,7 +62,7 @@ router.get('/assets', async (req, res, next) => {
 // GET /assets/:assetId
 router.get('/assets/:assetId', async (req, res, next) => {
   try {
-    const asset = await automationAssetService.getAsset(parseInt(req.params.assetId, 10), req.user.id);
+    const asset = await automationAssetService.getAsset(parseInt(req.params.assetId, 10), req.user.id, req.user.orgId);
     if (!asset) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Asset not found' } });
     res.json(asset);
   } catch (err) { next(err); }
@@ -79,7 +80,7 @@ const updateSchema = z.object({
 
 router.patch('/assets/:assetId', validate(updateSchema), async (req, res, next) => {
   try {
-    const updated = await automationAssetService.updateAsset(parseInt(req.params.assetId, 10), req.user.id, req.body);
+    const updated = await automationAssetService.updateAsset(parseInt(req.params.assetId, 10), req.user.id, req.user.orgId, req.body);
     if (!updated) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Asset not found' } });
     res.json(updated);
   } catch (err) { next(err); }
@@ -88,7 +89,7 @@ router.patch('/assets/:assetId', validate(updateSchema), async (req, res, next) 
 // DELETE /assets/:assetId
 router.delete('/assets/:assetId', async (req, res, next) => {
   try {
-    const deleted = await automationAssetService.deleteAsset(parseInt(req.params.assetId, 10), req.user.id);
+    const deleted = await automationAssetService.deleteAsset(parseInt(req.params.assetId, 10), req.user.id, req.user.orgId);
     if (!deleted) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Asset not found' } });
     res.json({ message: 'Asset deleted' });
   } catch (err) { next(err); }
@@ -102,7 +103,7 @@ router.post('/assets/:assetId/verify-readiness', async (req, res, next) => {
   try {
     const { projectId } = req.params;
     const assetId = parseInt(req.params.assetId, 10);
-    const result = await readinessService.verifyReadiness(assetId, req.user.id, projectId);
+    const result = await readinessService.verifyReadiness(assetId, req.user.id, projectId, req.user.orgId);
     if (!result) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Asset not found' } });
     res.json(result);
   } catch (err) { next(err); }
@@ -111,7 +112,7 @@ router.post('/assets/:assetId/verify-readiness', async (req, res, next) => {
 router.get('/assets/:assetId/readiness', async (req, res, next) => {
   try {
     const assetId = parseInt(req.params.assetId, 10);
-    const asset = await automationAssetService.getAsset(assetId, req.user.id);
+    const asset = await automationAssetService.getAsset(assetId, req.user.id, req.user.orgId);
     if (!asset) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Asset not found' } });
     const validation = await readinessService.getLatestValidation(assetId);
     res.json({ validation, executionReadiness: asset.execution_readiness });
@@ -154,7 +155,7 @@ router.post('/assets/:assetId/run', validate(runSchema), async (req, res, next) 
     const { projectId } = req.params;
     const userId = req.user.id;
     const assetId = parseInt(req.params.assetId, 10);
-    const asset = await automationAssetService.getAsset(assetId, userId);
+    const asset = await automationAssetService.getAsset(assetId, userId, req.user.orgId);
     if (!asset) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Asset not found' } });
 
     let targetConfig = null;
@@ -164,7 +165,7 @@ router.post('/assets/:assetId/run', validate(runSchema), async (req, res, next) 
 
     let readinessValidationId = null;
     if (!req.body.skipPreflight) {
-      const readinessResult = await readinessService.verifyReadiness(assetId, userId, projectId);
+      const readinessResult = await readinessService.verifyReadiness(assetId, userId, projectId, req.user.orgId);
       if (!readinessResult || !readinessResult.preflight.ready) {
         return res.status(422).json({
           error: { code: 'PREFLIGHT_FAILED', message: 'Readiness verification failed. Fix blockers before running.' },
@@ -176,6 +177,7 @@ router.post('/assets/:assetId/run', validate(runSchema), async (req, res, next) 
 
     const run = await playwrightRunnerService.runAsset(assetId, userId, {
       baseUrl: effectiveBaseUrl, browser: req.body.browser, categoryFilter: req.body.categoryFilter, readinessValidationId,
+      orgId: req.user.orgId,
     });
     res.status(201).json(run);
   } catch (err) {
@@ -213,7 +215,7 @@ router.post('/bulk-run', validate(bulkRunSchema), async (req, res, next) => {
 router.get('/assets/:assetId/runs', async (req, res, next) => {
   try {
     const { page, limit } = parseListPagination(req.query, { defaultLimit: 10 });
-    const result = await playwrightRunnerService.getRunsForAsset(parseInt(req.params.assetId, 10), req.user.id, { page, limit });
+    const result = await playwrightRunnerService.getRunsForAsset(parseInt(req.params.assetId, 10), req.user.id, { page, limit, orgId: req.user.orgId });
     if (!result) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Asset not found' } });
     res.json(result);
   } catch (err) { next(err); }
