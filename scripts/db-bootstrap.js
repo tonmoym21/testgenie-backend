@@ -42,25 +42,66 @@ function parseArgs(argv) {
   return { dbUrl };
 }
 
-function prefixOf(filename) {
-  const m = filename.match(/^(\d+)_/);
-  return m ? Number(m[1]) : null;
-}
+// Explicit dependency-aware order. Neither pure alphabetic nor
+// pure-numeric-prefix sorts work here because the two naming conventions
+// (timestamped vs. numbered) interleave by *dependency*, not by name:
+//   - 007_env_vars_folders_reports_email creates `collections`
+//   - 1712800000000_collections-auto-cookie-jar modifies `collections`
+// so 1712800000000 must run AFTER 007 even though it has a "later" name.
+//
+// Append new migrations to this list as they're added. Any file present
+// on disk but missing from this list is appended at the end with a
+// warning, so a new migration with no dependencies still bootstraps —
+// but you should add it explicitly to lock in the order.
+const ORDER = [
+  // Base schema
+  '1711756800000_initial-schema',
+  '1711843200000_test-executions',
+  '1712700000000_add-raw-response',
+  // Numbered layer (foundational features built on top of the base)
+  '001_stories_and_scenarios',
+  '002_playwright_tests',
+  '003_automation_assets',
+  '004_target_app_configs',
+  '005_execution_module',
+  '006_team_management',
+  '007_env_vars_folders_reports_email', // creates `collections`
+  // Now `collections` exists, so the timestamped tweak can run
+  '1712800000000_collections-auto-cookie-jar',
+  // Rest of the numbered layer
+  '008_dashboard_dependencies',
+  '009_v23_globals_sharing_jira',
+  '010_jira_testcase_story_org',
+  '011_org_visibility',
+  '012_runner_columns',
+  '013_closed_loop_lineage',
+  '014_autofix_apply',
+  '015_autofix_verify',
+  '016_project_repo_configs',
+  '017_api_source_import',
+  // 018 lives only in src/index.js's startup runner; no file
+  '019_platform_admin',
+  '020_public_signup',
+];
 
-// Timestamped vs. numbered: anything with a prefix >= 1e12 is treated as
-// epoch-ms (the legacy "1711756800000_initial-schema.sql" convention).
-// Everything below that is a sequential migration number.
-function compareMigrations(a, b) {
-  const ap = prefixOf(a);
-  const bp = prefixOf(b);
-  if (ap == null && bp == null) return a.localeCompare(b);
-  if (ap == null) return 1;
-  if (bp == null) return -1;
-  const aTs = ap >= 1e12;
-  const bTs = bp >= 1e12;
-  if (aTs && !bTs) return -1;
-  if (!aTs && bTs) return 1;
-  return ap - bp;
+function orderedMigrations(files) {
+  const names = new Set(files.map((f) => f.replace(/\.sql$/, '')));
+  const ordered = [];
+  const seen = new Set();
+  for (const name of ORDER) {
+    if (names.has(name)) {
+      ordered.push(`${name}.sql`);
+      seen.add(name);
+    }
+  }
+  // Anything on disk that isn't in ORDER — append, warn loudly.
+  const leftovers = files.filter((f) => !seen.has(f.replace(/\.sql$/, '')));
+  if (leftovers.length > 0) {
+    console.warn('[db-bootstrap] WARNING — these migrations are not in ORDER (appending at end):');
+    leftovers.forEach((f) => console.warn(`    - ${f}`));
+    console.warn('  Add them to scripts/db-bootstrap.js ORDER to lock dependency-correct positioning.');
+  }
+  return [...ordered, ...leftovers];
 }
 
 async function main() {
@@ -82,7 +123,7 @@ async function main() {
 
   const migrationsDir = path.join(__dirname, '..', 'migrations');
   const allEntries = fs.readdirSync(migrationsDir);
-  const files = allEntries.filter((f) => f.endsWith('.sql')).sort(compareMigrations);
+  const files = orderedMigrations(allEntries.filter((f) => f.endsWith('.sql')));
 
   // .js migrations (node-pg-migrate programmatic API) are not handled here.
   // Flag them so they don't get silently skipped if someone adds more.
