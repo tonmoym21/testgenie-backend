@@ -760,6 +760,14 @@ if (require.main === module) {
       `TestForge server v${BUILD_VERSION} started on port ${PORT}`
     );
   });
+  // Background job: sweep abandoned pending signups (>7d). Daily.
+  // Only when running as a real server — supertest imports of this
+  // module shouldn't spin up the interval.
+  try {
+    require('./services/signupJanitor').start();
+  } catch (err) {
+    logger.warn({ err: err.message }, 'signup janitor failed to start (continuing)');
+  }
 }
 
 // Graceful shutdown so Railway doesn't SIGKILL mid-request
