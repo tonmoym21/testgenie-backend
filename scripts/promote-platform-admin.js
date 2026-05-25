@@ -6,6 +6,8 @@
  *   node scripts/promote-platform-admin.js --list                        List current admins
  *   node scripts/promote-platform-admin.js --reset-password <email> [pw] Reset a user's password
  *                                                                       (auto-generates one if pw is omitted)
+ *   node scripts/promote-platform-admin.js --create-admin <email> [pw]  Create a new org-less platform admin
+ *                                                                       (auto-generates pw if omitted)
  *
  * Idempotent. Exits non-zero if the email isn't found.
  * Reset-password also revokes all active refresh tokens for that user so any
@@ -31,6 +33,7 @@ async function main() {
     console.log('  promote-platform-admin.js --revoke <email>                 Revoke platform admin');
     console.log('  promote-platform-admin.js --list                           List current admins');
     console.log('  promote-platform-admin.js --reset-password <email> [pw]    Reset password (auto-generates if omitted)');
+    console.log('  promote-platform-admin.js --create-admin <email> [pw]      Create new org-less platform admin');
     process.exit(args.length === 0 ? 1 : 0);
   }
 
@@ -59,6 +62,37 @@ async function main() {
     } else {
       console.log('  New password set to the value you provided.');
     }
+    process.exit(0);
+  }
+
+  if (args[0] === '--create-admin') {
+    const email = (args[1] || '').toLowerCase().trim();
+    if (!email) { console.error('Email required: --create-admin <email> [password]'); process.exit(1); }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { console.error('Invalid email format'); process.exit(1); }
+    const existing = await db.query('SELECT id, is_platform_admin FROM users WHERE LOWER(email) = $1', [email]);
+    if (existing.rows.length) {
+      console.error(`User ${email} already exists (#${existing.rows[0].id}). Use the bare command to grant admin instead.`);
+      process.exit(2);
+    }
+    const provided = args[2];
+    const newPw = provided || generatePassword();
+    if (provided && (provided.length < 8 || !/[a-zA-Z]/.test(provided) || !/[0-9]/.test(provided))) {
+      console.error('Password must be at least 8 chars and contain a letter and a number.');
+      process.exit(1);
+    }
+    const hash = await bcrypt.hash(newPw, 12);
+    const inserted = await db.query(
+      `INSERT INTO users (email, password_hash, organization_id, status, is_platform_admin)
+       VALUES ($1, $2, NULL, 'active', true)
+       RETURNING id, email`,
+      [email, hash]
+    );
+    console.log(`Created platform admin ${email} (user #${inserted.rows[0].id})`);
+    console.log('');
+    console.log(`  Password: ${newPw}`);
+    console.log(provided ? '  (using the value you provided)' : '  ↑ auto-generated; not stored anywhere else.');
+    console.log('');
+    console.log('Login at the main app or ops console with this email + password.');
     process.exit(0);
   }
 
