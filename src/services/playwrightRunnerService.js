@@ -193,8 +193,12 @@ function sanitizeSuccessAssertions(code, targetConfig) {
 /**
  * Create a run record and execute Playwright tests for an automation asset.
  */
-async function runAsset(assetId, userId, { baseUrl, browser = 'chromium', categoryFilter, runType = 'single', readinessValidationId = null } = {}) {
-  const asset = await automationAssetService.getAsset(assetId, userId);
+async function runAsset(assetId, userId, { baseUrl, browser = 'chromium', categoryFilter, runType = 'single', readinessValidationId = null, orgId = null } = {}) {
+  // orgId is an opts field (not a positional arg) so pre-org-aware callers
+  // remain backward compatible — they get scope = user-only, which is the
+  // safe default (more restrictive than the platform-wide stub that
+  // preceded this change).
+  const asset = await automationAssetService.getAsset(assetId, userId, orgId);
   if (!asset) throw Object.assign(new Error('Asset not found'), { status: 404 });
 
   // Resolve target config for sanitization
@@ -518,8 +522,8 @@ export default defineConfig({
 `;
 }
 
-async function getRunsForAsset(assetId, userId, { page = 1, limit = 10 } = {}) {
-  const asset = await automationAssetService.getAsset(assetId, userId);
+async function getRunsForAsset(assetId, userId, { page = 1, limit = 10, orgId = null } = {}) {
+  const asset = await automationAssetService.getAsset(assetId, userId, orgId);
   if (!asset) return null;
   const offset = (page - 1) * limit;
   const countRes = await db.query('SELECT COUNT(*) FROM playwright_runs WHERE automation_asset_id = $1', [assetId]);

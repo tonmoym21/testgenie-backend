@@ -117,7 +117,7 @@ router.post('/preflight/:assetId', authenticate, async (req, res, next) => {
     const preflightService = require('../services/preflightService');
     const automationAssetService = require('../services/automationAssetService');
 
-    const asset = await automationAssetService.getAsset(parseInt(assetId, 10), userId);
+    const asset = await automationAssetService.getAsset(parseInt(assetId, 10), userId, req.user.orgId);
     if (!asset) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Asset not found' } });
 
     // Get target config
