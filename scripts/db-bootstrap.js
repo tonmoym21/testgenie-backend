@@ -116,10 +116,16 @@ async function main() {
       skipped++;
       continue;
     }
-    const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
+    const raw = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
+    // Some legacy migrations (the timestamped ones) bundle "-- Up Migration"
+    // and "-- Down Migration" in the same file, separated by that marker.
+    // node-pg-migrate splits on it; we have to do the same or we'll run
+    // the down section right after the up section and undo everything.
+    const downMarker = /^\s*--\s*Down\s+Migration\b/im;
+    const upOnly = raw.split(downMarker)[0];
     try {
       await client.query('BEGIN');
-      await client.query(sql);
+      await client.query(upOnly);
       await client.query('INSERT INTO pgmigrations (name) VALUES ($1)', [name]);
       await client.query('COMMIT');
       console.log(`  [ok]   ${name}`);
