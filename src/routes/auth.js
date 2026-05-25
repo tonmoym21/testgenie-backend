@@ -66,6 +66,19 @@ const registerSchema = z.object({
     .max(128)
     .regex(/[a-zA-Z]/, 'Password must contain at least one letter')
     .regex(/[0-9]/, 'Password must contain at least one number'),
+  // Required when creating a new org (corporate domain not yet claimed).
+  // Optional when auto-joining an existing org or bootstrapping as the
+  // first user. Service-level validation enforces required-ness so the
+  // error message is in one place.
+  companyName: z.string().min(2).max(100).optional(),
+});
+
+const verifyEmailSchema = z.object({
+  token: z.string().min(10).max(200),
+});
+
+const resendVerificationSchema = z.object({
+  email: z.string().email().max(255),
 });
 
 const registerWithInviteSchema = z.object({
@@ -95,13 +108,55 @@ const logoutSchema = z.object({
 });
 
 // POST /api/auth/register
+// Returns one of:
+//   { kind: 'autoJoined', message, user }  — first user OR existing-org join.
+//                                            Caller can immediately call /login.
+//   { kind: 'pending', message, email }    — net-new org. User must click the
+//                                            verification link before login works.
+//                                            We don't return user IDs in this case
+//                                            (no point — they can't log in yet).
 router.post('/register', authLimiter, validate(registerSchema), async (req, res, next) => {
   try {
-    const user = await authService.register(req.body.email, req.body.password);
-    res.status(201).json({
-      message: 'Registration successful',
-      user: { id: user.id, email: user.email, organizationId: user.organization_id },
+    const result = await authService.register(
+      req.body.email, req.body.password, req.body.companyName
+    );
+    if (result.kind === 'autoJoined') {
+      return res.status(201).json({
+        kind: 'autoJoined',
+        message: 'Registration successful',
+        user: { id: result.user.id, email: result.user.email, organizationId: result.user.organization_id },
+      });
+    }
+    // kind === 'pending'
+    return res.status(202).json({
+      kind: 'pending',
+      message: 'Check your inbox to verify your email and finish creating your organization.',
+      email: result.email,
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/auth/verify-email — completes a pending signup.
+// On success, auto-logs the user in (returns access + refresh tokens, sets cookie).
+router.post('/verify-email', authLimiter, validate(verifyEmailSchema), async (req, res, next) => {
+  try {
+    const tokens = await authService.verifyEmail(req.body.token);
+    if (tokens && tokens.refreshToken) setRefreshCookie(res, tokens.refreshToken);
+    res.json(tokens);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/auth/resend-verification — request a fresh verification email.
+// Throttled at the service layer (1/min/user) on top of the IP-level authLimiter.
+// Quietly succeeds for unknown / already-verified emails to avoid account enumeration.
+router.post('/resend-verification', authLimiter, validate(resendVerificationSchema), async (req, res, next) => {
+  try {
+    await authService.resendVerificationEmail(req.body.email);
+    res.json({ ok: true, message: 'If an unverified account exists for that email, a new verification link has been sent.' });
   } catch (err) {
     next(err);
   }

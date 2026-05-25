@@ -3,101 +3,228 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const db = require('../db');
 const config = require('../config');
-const { ConflictError, UnauthorizedError, ForbiddenError, NotFoundError } = require('../utils/apiError');
+const { ConflictError, UnauthorizedError, ForbiddenError, NotFoundError, ValidationError } = require('../utils/apiError');
 const teamService = require('./teamService');
 const { isCorporateDomain, getEmailDomain } = require('../utils/emailDomain');
+const { isConsumerEmail } = require('../utils/consumerEmailDomains');
+const transactionalEmail = require('./transactionalEmail');
+const logger = require('../utils/logger');
 
 const BCRYPT_ROUNDS = 12;
+const VERIFICATION_TOKEN_TTL_MS = 24 * 60 * 60 * 1000; // 24h
+const RESEND_MIN_INTERVAL_MS = 60 * 1000; // throttle resend to 1/min/user
 
 /**
- * Register a new user.
- * 
- * Flow:
- * 1. If NO organization exists → First user creates default org and becomes owner
- * 2. If organization exists → Registration is blocked (must use invite)
+ * Register a new user. Public multi-tenant signup flow:
+ *
+ *   1. No org exists yet  → first-user bootstrap; user becomes owner,
+ *                           email is auto-verified (no email to send yet).
+ *   2. Corporate email + domain matches an existing verified org
+ *                         → auto-join as member, email auto-verified
+ *                           (the existing org's trust covers the new user).
+ *   3. Corporate email + no matching org + companyName provided
+ *                         → create pending user + pending org, send
+ *                           verification email. User must click link
+ *                           before login works. Domain is NOT claimed
+ *                           until verification completes (race-safe).
+ *   4. Consumer email (gmail, outlook, etc.)
+ *                         → reject. Personal accounts can't create orgs.
+ *                           Platform admins can manually create such
+ *                           users via the admin console for exceptions.
+ *
+ * Returns one of:
+ *   { kind: 'autoJoined',  user }             — case 1 & 2: immediate access
+ *   { kind: 'pending',     user, email }      — case 3: must verify
+ *   throws on rejection
  */
-async function register(email, password) {
+async function register(email, password, companyName) {
   email = email.toLowerCase().trim();
-  
-  const existing = await db.query('SELECT id FROM users WHERE email = $1', [email]);
+  companyName = (companyName || '').trim();
+
+  const existing = await db.query(
+    'SELECT id, email_verified_at FROM users WHERE email = $1',
+    [email]
+  );
   if (existing.rows.length > 0) {
+    // Distinct message for the "started signup but never verified" case
+    // so the UI can offer "resend verification" instead of "log in".
+    if (existing.rows[0].email_verified_at == null) {
+      throw new ConflictError('A signup is already in progress for this email. Check your inbox or request a new verification link.');
+    }
     throw new ConflictError('Email already registered');
   }
 
-  // Check if ANY organization exists
-  const orgCheck = await db.query('SELECT COUNT(*) as count FROM organizations');
-  const orgExists = parseInt(orgCheck.rows[0].count, 10) > 0;
+  const orgCheck = await db.query('SELECT COUNT(*)::int AS count FROM organizations');
+  const orgExists = orgCheck.rows[0].count > 0;
 
-  let orgId = null;
-  let isFirstUser = false;
-  let autoJoinedOrg = false;
-
-  if (orgExists) {
-    // Try auto-join by corporate email domain before blocking.
-    if (isCorporateDomain(email)) {
-      const domain = getEmailDomain(email);
-      // Match against organizations.domain OR any existing user whose email shares this domain.
-      const domainOrg = await db.query(
-        `SELECT o.id FROM organizations o WHERE LOWER(o.domain) = $1
-         UNION
-         SELECT DISTINCT u.organization_id AS id FROM users u
-          WHERE u.organization_id IS NOT NULL
-            AND LOWER(SPLIT_PART(u.email, '@', 2)) = $1
-         LIMIT 1`,
-        [domain]
-      );
-      if (domainOrg.rows.length > 0) {
-        orgId = domainOrg.rows[0].id;
-        autoJoinedOrg = true;
-        // Ensure the org has this domain recorded for future lookups.
-        await db.query(
-          `UPDATE organizations SET domain = $1 WHERE id = $2 AND (domain IS NULL OR domain = '')`,
-          [domain, orgId]
-        );
-      }
-    }
-    if (!orgId) {
-      throw new ForbiddenError('Registration is invite-only. Please contact your admin for an invite link.');
-    }
-  } else {
-    // First user ever - create default organization and make them owner
-    isFirstUser = true;
-    const orgName = 'TestForge';
-    const newOrg = await db.query(
-      'INSERT INTO organizations (name, domain, domain_restriction_enabled) VALUES ($1, $2, true) RETURNING id',
-      [orgName, isCorporateDomain(email) ? getEmailDomain(email) : null]
-    );
-    orgId = newOrg.rows[0].id;
+  // Case 1: first user ever — bootstrap path (no email-verify gate since
+  // there's no inbox infrastructure to depend on at this point).
+  if (!orgExists) {
+    return _registerFirstUser({ email, password, companyName });
   }
 
-  // Create user
+  // Corporate vs consumer split governs everything else.
+  if (isConsumerEmail(email) || !isCorporateDomain(email)) {
+    throw new ForbiddenError('Please sign up with your work email. Personal email addresses (gmail.com, outlook.com, etc.) can\'t create new organizations on TestForge. Contact support if you need an exception.');
+  }
+
+  const domain = getEmailDomain(email);
+
+  // Case 2: domain matches an existing VERIFIED org → auto-join.
+  // Pending orgs don't count (their domain isn't claimed yet — see the
+  // unique partial index from migration 020).
+  const verifiedOrg = await db.query(
+    `SELECT o.id FROM organizations o
+      WHERE LOWER(o.domain) = $1
+        AND o.verified_at IS NOT NULL
+        AND o.status = 'active'
+      LIMIT 1`,
+    [domain]
+  );
+  if (verifiedOrg.rows.length > 0) {
+    return _registerAutoJoin({
+      email, password,
+      orgId: verifiedOrg.rows[0].id,
+      domain,
+    });
+  }
+
+  // Case 3: net-new corporate domain → pending org + verification email.
+  if (!companyName) {
+    throw new ValidationError('Company name is required to create a new organization.');
+  }
+  if (companyName.length < 2 || companyName.length > 100) {
+    throw new ValidationError('Company name must be between 2 and 100 characters.');
+  }
+
+  return _registerPending({ email, password, companyName, domain });
+}
+
+// ── Internal register helpers — keep register() readable ──────────────
+
+async function _registerFirstUser({ email, password, companyName }) {
+  const orgName = companyName || 'TestForge';
+  const domain = isCorporateDomain(email) ? getEmailDomain(email) : null;
+  const newOrg = await db.query(
+    `INSERT INTO organizations (name, domain, domain_restriction_enabled, created_via, verified_at)
+     VALUES ($1, $2, true, 'first_user', NOW())
+     RETURNING id`,
+    [orgName, domain]
+  );
+  const orgId = newOrg.rows[0].id;
+
   const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
   const result = await db.query(
-    `INSERT INTO users (email, password_hash, organization_id, status)
-     VALUES ($1, $2, $3, 'active')
+    `INSERT INTO users (email, password_hash, organization_id, status, email_verified_at)
+     VALUES ($1, $2, $3, 'active', NOW())
      RETURNING id, email, organization_id, created_at`,
     [email, passwordHash, orgId]
   );
-  
   const user = result.rows[0];
 
-  const role = isFirstUser ? 'owner' : 'member';
   await db.query(
     `INSERT INTO organization_members (organization_id, user_id, role)
-     VALUES ($1, $2, $3)`,
-    [orgId, user.id, role]
+     VALUES ($1, $2, 'owner')`,
+    [orgId, user.id]
   );
-
   await teamService.logAuditEvent(
-    orgId,
-    user.id,
-    isFirstUser ? 'organization_created' : 'user_auto_joined_by_domain',
-    'user',
-    user.id,
-    { email, role, isFirstUser, autoJoinedOrg }
+    orgId, user.id, 'organization_created', 'user', user.id,
+    { email, role: 'owner', isFirstUser: true }
+  );
+  return { kind: 'autoJoined', user };
+}
+
+async function _registerAutoJoin({ email, password, orgId, domain }) {
+  // Backfill the domain on the org if it wasn't already recorded (legacy
+  // orgs created before the domain field was used).
+  await db.query(
+    `UPDATE organizations SET domain = $1
+       WHERE id = $2 AND (domain IS NULL OR domain = '')`,
+    [domain, orgId]
   );
 
-  return user;
+  const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+  const result = await db.query(
+    `INSERT INTO users (email, password_hash, organization_id, status, email_verified_at)
+     VALUES ($1, $2, $3, 'active', NOW())
+     RETURNING id, email, organization_id, created_at`,
+    [email, passwordHash, orgId]
+  );
+  const user = result.rows[0];
+
+  await db.query(
+    `INSERT INTO organization_members (organization_id, user_id, role)
+     VALUES ($1, $2, 'member')`,
+    [orgId, user.id]
+  );
+  await teamService.logAuditEvent(
+    orgId, user.id, 'user_auto_joined_by_domain', 'user', user.id,
+    { email, role: 'member', autoJoinedOrg: true }
+  );
+  return { kind: 'autoJoined', user };
+}
+
+async function _registerPending({ email, password, companyName, domain }) {
+  // Transactional: org + user + membership + token, all-or-nothing.
+  // The email send happens AFTER commit — if it fails the user can
+  // resend via /resend-verification, no partial DB state to clean up.
+  const client = await db.getClient();
+  let user, token;
+  try {
+    await client.query('BEGIN');
+
+    const newOrg = await client.query(
+      `INSERT INTO organizations (name, domain, domain_restriction_enabled, created_via, status)
+       VALUES ($1, $2, true, 'signup', 'active')
+       RETURNING id`,
+      [companyName, domain]
+    );
+    const orgId = newOrg.rows[0].id;
+
+    const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    const userResult = await client.query(
+      `INSERT INTO users (email, password_hash, organization_id, status, email_verified_at)
+       VALUES ($1, $2, $3, 'active', NULL)
+       RETURNING id, email, organization_id, created_at`,
+      [email, passwordHash, orgId]
+    );
+    user = userResult.rows[0];
+
+    // Pre-create the owner membership so verification = single UPDATE
+    // (verified_at + email_verified_at) rather than a multi-step dance.
+    await client.query(
+      `INSERT INTO organization_members (organization_id, user_id, role)
+       VALUES ($1, $2, 'owner')`,
+      [orgId, user.id]
+    );
+
+    token = crypto.randomBytes(32).toString('base64url');
+    const tokenHash = hashToken(token);
+    const expiresAt = new Date(Date.now() + VERIFICATION_TOKEN_TTL_MS);
+    await client.query(
+      `INSERT INTO email_verification_tokens (user_id, token_hash, purpose, expires_at)
+       VALUES ($1, $2, 'signup', $3)`,
+      [user.id, tokenHash, expiresAt]
+    );
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  // Fire the email. Failure is logged but doesn't block the signup —
+  // user can resend. Don't leak provider errors to the caller.
+  const send = await transactionalEmail.sendVerificationEmail({
+    to: email, companyName, token,
+  });
+  if (!send.ok) {
+    logger.warn({ email, reason: send.reason }, 'verification email send failed; user can resend');
+  }
+
+  return { kind: 'pending', user, email };
 }
 
 /**
@@ -184,7 +311,7 @@ async function login(email, password) {
   
   const result = await db.query(
     `SELECT u.id, u.email, u.password_hash, u.organization_id, u.status, u.is_platform_admin,
-            om.role, o.status AS org_status
+            u.email_verified_at, om.role, o.status AS org_status
      FROM users u
      LEFT JOIN organization_members om ON u.id = om.user_id AND u.organization_id = om.organization_id
      LEFT JOIN organizations o ON u.organization_id = o.id
@@ -230,6 +357,15 @@ function enforceAccountAccess(user) {
   if (user.status && user.status !== 'active') {
     throw new ForbiddenError('This account is not in an active state.');
   }
+  // Block login for users who started signup but never verified their
+  // email. Distinct error code so the UI can offer "resend link".
+  // Platform admins are exempt (they're created via the admin script,
+  // not the signup flow, and never have an unverified email).
+  if (!user.is_platform_admin && user.email_verified_at == null) {
+    const err = new ForbiddenError('Please verify your email before logging in. Check your inbox for the verification link.');
+    err.code = 'EMAIL_NOT_VERIFIED';
+    throw err;
+  }
   if (user.is_platform_admin) return; // platform admins bypass org-status gate
   if (user.org_status === 'suspended') {
     throw new ForbiddenError('Your organization has been suspended. Contact support.');
@@ -270,7 +406,7 @@ async function refresh(refreshToken) {
   // Get user with org info
   const userResult = await db.query(
     `SELECT u.id, u.email, u.organization_id, u.status, u.is_platform_admin,
-            om.role, o.status AS org_status
+            u.email_verified_at, om.role, o.status AS org_status
      FROM users u
      LEFT JOIN organization_members om ON u.id = om.user_id AND u.organization_id = om.organization_id
      LEFT JOIN organizations o ON u.organization_id = o.id
@@ -431,6 +567,160 @@ async function getUserOrgInfo(userId) {
   };
 }
 
+/**
+ * Verify a signup token, mark the user + their org verified, and
+ * issue an access/refresh token pair (auto-login on success).
+ *
+ * Race-safety: wrapped in a transaction with SELECT ... FOR UPDATE on
+ * the org row. If a different signup for the same domain already
+ * verified, the unique partial index on organizations.LOWER(domain)
+ * WHERE verified_at IS NOT NULL will reject this org's verification —
+ * we catch that and return a friendly "domain already claimed".
+ */
+async function verifyEmail(rawToken) {
+  if (!rawToken || typeof rawToken !== 'string') {
+    throw new ValidationError('Verification token is required.');
+  }
+  const tokenHash = hashToken(rawToken);
+  const client = await db.getClient();
+  try {
+    await client.query('BEGIN');
+
+    // Look up token + user, lock the relevant rows.
+    const tokenRow = await client.query(
+      `SELECT t.id, t.user_id, t.expires_at, t.used_at,
+              u.email, u.organization_id
+         FROM email_verification_tokens t
+         JOIN users u ON u.id = t.user_id
+        WHERE t.token_hash = $1 AND t.purpose = 'signup'
+        FOR UPDATE OF t`,
+      [tokenHash]
+    );
+    if (tokenRow.rows.length === 0) {
+      throw new NotFoundError('Verification link is invalid.');
+    }
+    const t = tokenRow.rows[0];
+    if (t.used_at != null) {
+      throw new ForbiddenError('Verification link has already been used. Please log in.');
+    }
+    if (new Date(t.expires_at) < new Date()) {
+      throw new ForbiddenError('Verification link has expired. Request a new one.');
+    }
+
+    // Mark token used (single-use).
+    await client.query(
+      'UPDATE email_verification_tokens SET used_at = NOW() WHERE id = $1',
+      [t.id]
+    );
+
+    // Mark user email verified.
+    await client.query(
+      'UPDATE users SET email_verified_at = NOW() WHERE id = $1',
+      [t.user_id]
+    );
+
+    // Mark the org verified — this is where the unique partial index
+    // on LOWER(domain) WHERE verified_at IS NOT NULL bites if another
+    // signup got there first. Translate the constraint error into a
+    // friendly message.
+    try {
+      await client.query(
+        `UPDATE organizations SET verified_at = NOW()
+           WHERE id = $1 AND verified_at IS NULL`,
+        [t.organization_id]
+      );
+    } catch (err) {
+      if (err.code === '23505') {
+        throw new ConflictError('Your company domain has already been claimed by another account. Please ask them for an invite.');
+      }
+      throw err;
+    }
+
+    await client.query('COMMIT');
+
+    // Issue tokens for auto-login. Re-fetch with the same SELECT shape
+    // login() uses so generateTokens has everything it needs.
+    const userResult = await db.query(
+      `SELECT u.id, u.email, u.organization_id, u.status, u.is_platform_admin,
+              u.email_verified_at, om.role, o.status AS org_status
+         FROM users u
+         LEFT JOIN organization_members om
+           ON u.id = om.user_id AND u.organization_id = om.organization_id
+         LEFT JOIN organizations o ON u.organization_id = o.id
+        WHERE u.id = $1`,
+      [t.user_id]
+    );
+    const user = userResult.rows[0];
+    return generateTokens(user);
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Resend a verification email for an unverified signup. Throttled to
+ * 1/min/user via the latest token's created_at — independent of any
+ * IP-level rate limit on the route.
+ *
+ * Intentionally returns success even when the email doesn't exist or
+ * is already verified — don't leak which addresses have pending
+ * signups (account enumeration mitigation). Real failures (rate
+ * limit hit, send error) do surface.
+ */
+async function resendVerificationEmail(email) {
+  email = (email || '').toLowerCase().trim();
+  if (!email) throw new ValidationError('Email is required.');
+
+  const userRow = await db.query(
+    `SELECT u.id, u.email_verified_at, o.name AS org_name
+       FROM users u
+       LEFT JOIN organizations o ON u.organization_id = o.id
+      WHERE u.email = $1`,
+    [email]
+  );
+  // Quietly succeed for unknown / already-verified accounts.
+  if (userRow.rows.length === 0) return { ok: true, sent: false };
+  const u = userRow.rows[0];
+  if (u.email_verified_at != null) return { ok: true, sent: false };
+
+  // Throttle: refuse if the most recent token was issued within
+  // RESEND_MIN_INTERVAL_MS.
+  const lastToken = await db.query(
+    `SELECT created_at FROM email_verification_tokens
+      WHERE user_id = $1 AND purpose = 'signup'
+      ORDER BY created_at DESC LIMIT 1`,
+    [u.id]
+  );
+  if (lastToken.rows.length > 0) {
+    const age = Date.now() - new Date(lastToken.rows[0].created_at).getTime();
+    if (age < RESEND_MIN_INTERVAL_MS) {
+      const wait = Math.ceil((RESEND_MIN_INTERVAL_MS - age) / 1000);
+      const err = new ForbiddenError(`Please wait ${wait} seconds before requesting another verification email.`);
+      err.code = 'RESEND_THROTTLED';
+      throw err;
+    }
+  }
+
+  const token = crypto.randomBytes(32).toString('base64url');
+  const tokenHash = hashToken(token);
+  const expiresAt = new Date(Date.now() + VERIFICATION_TOKEN_TTL_MS);
+  await db.query(
+    `INSERT INTO email_verification_tokens (user_id, token_hash, purpose, expires_at)
+     VALUES ($1, $2, 'signup', $3)`,
+    [u.id, tokenHash, expiresAt]
+  );
+
+  await transactionalEmail.sendVerificationEmail({
+    to: email,
+    companyName: u.org_name || 'your organization',
+    token,
+  });
+  return { ok: true, sent: true };
+}
+
 module.exports = {
   register,
   registerWithInvite,
@@ -439,4 +729,6 @@ module.exports = {
   logout,
   findActorByRefreshToken,
   getUserOrgInfo,
+  verifyEmail,
+  resendVerificationEmail,
 };
