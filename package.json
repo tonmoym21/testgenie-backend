@@ -22,6 +22,7 @@
     "testTimeout": 15000
   },
   "dependencies": {
+    "@apidevtools/swagger-parser": "^10.1.0",
     "archiver": "^7.0.1",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.5",
@@ -29,15 +30,15 @@
     "express": "^4.21.1",
     "express-rate-limit": "^7.4.1",
     "helmet": "^8.0.0",
+    "js-yaml": "^4.1.0",
     "jsonwebtoken": "^9.0.2",
     "node-cron": "^4.2.1",
     "openai": "^4.73.0",
-    "@apidevtools/swagger-parser": "^10.1.0",
-    "js-yaml": "^4.1.0",
     "pg": "^8.13.1",
     "pino": "^9.5.0",
     "pino-http": "^10.3.0",
     "playwright": "^1.58.2",
+    "resend": "^6.12.3",
     "tough-cookie": "^5.1.2",
     "zod": "^3.23.8"
   },
