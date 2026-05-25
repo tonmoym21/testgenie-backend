@@ -34,10 +34,20 @@ beforeEach(() => _resetForTests());
 
 describe('getOpenAIClient', () => {
   it('throws FeatureUnavailableError when no key is configured', () => {
-    expect(() => getOpenAIClient(
-      { apiKey: undefined, config: { OPENAI_API_KEY: undefined }, OpenAI: FakeOpenAI },
-      'Analyze',
-    )).toThrow(FeatureUnavailableError);
+    // Implementation falls back to process.env.OPENAI_API_KEY when both
+    // deps.apiKey and config.OPENAI_API_KEY are nullish. CI sets the env
+    // var to a placeholder; clear it for the duration of this test so we
+    // genuinely exercise the "no key anywhere" path.
+    const prev = process.env.OPENAI_API_KEY;
+    delete process.env.OPENAI_API_KEY;
+    try {
+      expect(() => getOpenAIClient(
+        { apiKey: undefined, config: { OPENAI_API_KEY: undefined }, OpenAI: FakeOpenAI },
+        'Analyze',
+      )).toThrow(FeatureUnavailableError);
+    } finally {
+      if (prev !== undefined) process.env.OPENAI_API_KEY = prev;
+    }
   });
 
   it('the 503 error includes the feature name and the AUTOFIX_PROVIDER hint', () => {
