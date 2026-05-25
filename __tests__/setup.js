@@ -113,9 +113,13 @@ async function createIsolatedAuthenticatedUser(
   );
   const orgId = orgRes.rows[0].id;
 
+  // email_verified_at must be set — enforceAccountAccess() rejects login
+  // when it's null (gate added by the public-signup flow). Test users
+  // skip the signup-email round trip, so we grandfather them verified
+  // at creation.
   const userRes = await pool.query(
-    `INSERT INTO users (email, password_hash, organization_id, status)
-     VALUES ($1, $2, $3, 'active') RETURNING id`,
+    `INSERT INTO users (email, password_hash, organization_id, status, email_verified_at)
+     VALUES ($1, $2, $3, 'active', NOW()) RETURNING id`,
     [email.toLowerCase().trim(), passwordHash, orgId],
   );
   const userId = userRes.rows[0].id;
