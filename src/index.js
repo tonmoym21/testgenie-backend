@@ -401,6 +401,36 @@ logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backen
       `CREATE INDEX IF NOT EXISTS idx_platform_audit_org ON platform_audit_logs(target_org_id)`,
       `CREATE INDEX IF NOT EXISTS idx_platform_audit_created ON platform_audit_logs(created_at DESC)`,
       `CREATE INDEX IF NOT EXISTS idx_platform_audit_action ON platform_audit_logs(action)`,
+
+      // ── Migration 020: public multi-tenant signup ──
+      // users.email_verified_at — null until verification link clicked.
+      // Existing rows are grandfathered to created_at (trusted pre-flow).
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ`,
+      `UPDATE users SET email_verified_at = created_at WHERE email_verified_at IS NULL`,
+      `CREATE INDEX IF NOT EXISTS idx_users_email_verified ON users(email_verified_at) WHERE email_verified_at IS NULL`,
+      // organizations.created_via for audit; verified_at gates domain claim
+      `ALTER TABLE organizations ADD COLUMN IF NOT EXISTS created_via TEXT NOT NULL DEFAULT 'admin' CHECK (created_via IN ('first_user', 'signup', 'invite', 'admin'))`,
+      `ALTER TABLE organizations ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ`,
+      `UPDATE organizations SET verified_at = created_at WHERE verified_at IS NULL`,
+      `UPDATE organizations SET created_via = 'first_user' WHERE id = 1 AND created_via = 'admin'`,
+      // Single-use verification tokens, hashed at rest
+      `CREATE TABLE IF NOT EXISTS email_verification_tokens (
+         id SERIAL PRIMARY KEY,
+         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+         token_hash TEXT NOT NULL,
+         purpose TEXT NOT NULL DEFAULT 'signup' CHECK (purpose IN ('signup', 'email_change')),
+         expires_at TIMESTAMPTZ NOT NULL,
+         used_at TIMESTAMPTZ,
+         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+       )`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_email_verif_token_hash ON email_verification_tokens(token_hash)`,
+      `CREATE INDEX IF NOT EXISTS idx_email_verif_user ON email_verification_tokens(user_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_email_verif_expires ON email_verification_tokens(expires_at) WHERE used_at IS NULL`,
+      // Race-safe domain claim: pending orgs (verified_at NULL) don't compete.
+      // First org to verify locks the domain; the second one's verify fails.
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_organizations_verified_domain
+         ON organizations(LOWER(domain))
+         WHERE verified_at IS NOT NULL AND domain IS NOT NULL AND domain <> ''`,
     ];
     for (const sql of statements) {
       try {
