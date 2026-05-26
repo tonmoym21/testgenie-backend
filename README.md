@@ -1,6 +1,11 @@
-# TestGenie Backend MVP
+# TestForge Backend
 
-AI-powered QA automation platform -- Phase 0 prototype.
+Node + Express API behind the TestForge multi-tenant SaaS test management
+platform. Postgres on Supabase, deployed to Render at
+`testgenie-backend-g9fu.onrender.com`.
+
+For the bigger picture (three-component architecture, public signup flow,
+domain-claim model, ops scripts), see the [workspace README](../../README.md).
 
 ## Prerequisites
 
@@ -72,10 +77,24 @@ npm run test:coverage
 ### Auth
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| POST | `/api/auth/register` | No | Create account |
-| POST | `/api/auth/login` | No | Get tokens |
-| POST | `/api/auth/refresh` | No | Rotate tokens |
-| POST | `/api/auth/logout` | Yes | Revoke refresh token |
+| POST | `/api/auth/register` | No | Create account. Returns `{kind:'autoJoined', user}` (immediate access) or `{kind:'pending', email}` (must verify). See "Public signup" below. |
+| POST | `/api/auth/verify-email` | No | Redeem a single-use verification token from the email link. Returns tokens + sets cookie on success. |
+| POST | `/api/auth/resend-verification` | No | Mint a fresh verification email for a pending signup. 1/min/user throttle. Quiet-success for unknown/verified emails (no enumeration). |
+| POST | `/api/auth/login` | No | Get tokens. Rejects unverified users with `EMAIL_NOT_VERIFIED`. |
+| POST | `/api/auth/refresh` | No | Rotate tokens. |
+| POST | `/api/auth/logout` | Yes | Revoke refresh token. |
+
+### Admin (cross-org for platform admins, scoped for org owners)
+| Method | Path | Scope | Description |
+|--------|------|-------|-------------|
+| GET | `/api/admin/me` | Either | Returns live admin scope (`{type:'platform'}` or `{type:'org', orgId}`). |
+| GET | `/api/admin/metrics` | Either | Counts. Scope-filtered. |
+| GET, PATCH, DELETE | `/api/admin/organizations[/:id]` | Either (delete = platform only) | Org CRUD. Owners can only rename their own. |
+| GET, PATCH, DELETE | `/api/admin/users[/:id]` | Either | User CRUD. Soft-delete. |
+| POST | `/api/admin/users/:id/reset-password` | Either | Rate-limited via `adminMutationLimiter`. |
+| GET | `/api/admin/audit` | Either | Cursor-paginated via `?before=<iso>`. UNION of platform + team logs. |
+| POST | `/api/admin/impersonate/:userId` | Platform | 5-min TTL token; `isPlatformAdmin` always false in the minted JWT. |
+| POST | `/api/admin/organizations/:id/enter` | Platform | 30-min TTL backdoor entry into any org. |
 
 ### Projects
 | Method | Path | Auth | Description |
@@ -101,6 +120,40 @@ npm run test:coverage
 | POST | `/api/projects/:pid/analyze` | Yes | Run AI analysis |
 
 Analysis types: `coverage_gaps`, `quality_review`, `risk_assessment`, `duplicate_detection`
+
+## Public signup flow
+
+`POST /api/auth/register` is multi-branched by design:
+
+1. **First user ever** (no orgs in DB) → bootstrap a new org with the supplied `companyName` (or `'TestForge'` default), user becomes `owner`, email auto-verified. `kind:'autoJoined'`.
+2. **Corporate email at a domain that matches an existing verified org** → auto-join as `member`, auto-verified, no email sent. `kind:'autoJoined'`.
+3. **Corporate email at a new domain + `companyName` provided** → create a *pending* user + *pending* org (`verified_at = NULL`), mint a 32-byte single-use token, send verification email via Resend, return `kind:'pending'`. User must click the link before `/login` works.
+4. **Consumer email** (gmail / outlook / yahoo / mailinator / …, see `src/utils/consumerEmailDomains.js`) → 403 `Please sign up with your work email`. Platform admins can override via `scripts/promote-platform-admin.js --create-admin`.
+
+Domain claim is race-safe: a unique partial index on `organizations(LOWER(domain)) WHERE verified_at IS NOT NULL` ensures only the first verifier wins the domain. Subsequent same-domain pending signups get `Your company domain has already been claimed`.
+
+Background `signupJanitor` sweeps pending users + orphan pending orgs >7 days old every 24h.
+
+## Admin scripts
+
+```bash
+# Promote / demote / list platform admins
+node scripts/promote-platform-admin.js <email>
+node scripts/promote-platform-admin.js --revoke <email>
+node scripts/promote-platform-admin.js --list
+
+# Create a fresh platform admin (org-less, password auto-generated)
+node scripts/promote-platform-admin.js --create-admin <email> [password]
+
+# Reset a user's password (revokes all their refresh tokens too)
+node scripts/promote-platform-admin.js --reset-password <email> [password]
+
+# Mint a verification link for a pending signup, bypassing the email step
+# Useful when Resend isn't configured or for E2E testing.
+node scripts/promote-platform-admin.js --verify-link <email>
+```
+
+All scripts read `DATABASE_URL` from `.env`.
 
 ## Project Structure
 
@@ -174,9 +227,15 @@ backward compatibility but new clients should rely on the cookie.
 
 | Var | Reason |
 |---|---|
-| `CORS_ORIGIN` | **Must** be a concrete allow-list, never `*`. The cookie requires credentialed CORS, which forbids wildcard origins. Use a comma-separated list, e.g. `https://app.example.com,https://*.vercel.app`. |
-| `NODE_ENV=production` | Required for the `Secure` cookie attribute. Without it, browsers will reject the cookie on HTTPS pages. |
+| `DATABASE_URL` | Postgres connection string (Supabase in prod). |
 | `JWT_SECRET` | 32+ chars; rotating this invalidates every active session. |
+| `CORS_ORIGIN` | **Must** be a concrete allow-list, never `*`. The cookie requires credentialed CORS, which forbids wildcard origins. Use a comma-separated list, e.g. `https://testforge-app.vercel.app,https://testforge-admin.vercel.app`. |
+| `NODE_ENV=production` | Required for the `Secure` cookie attribute. Without it, browsers will reject the cookie on HTTPS pages. |
+| `OPENAI_API_KEY` + `OPENAI_MODEL` | AI features (analyze, autofix). |
+| `EMAIL_PROVIDER` | `resend` in prod, unset (= `noop`) in dev/CI. Determines which adapter handles transactional emails (signup verification). |
+| `RESEND_API_KEY` | Resend send-only API key. **Required for public signup to actually deliver emails.** Without it, pending signups never get a verification link and the janitor sweeps them after 7 days. |
+| `EMAIL_FROM` | Sender address. `onboarding@resend.dev` works as a default; swap to `noreply@<your-domain>` once verified in Resend. |
+| `APP_BASE_URL` | Public URL of the main frontend. Used to build verification links in emails. |
 
 ### Troubleshooting "users can't log in"
 
