@@ -431,6 +431,21 @@ logger.info({ version: BUILD_VERSION, buildDate: BUILD_DATE }, 'TestForge Backen
       `CREATE UNIQUE INDEX IF NOT EXISTS idx_organizations_verified_domain
          ON organizations(LOWER(domain))
          WHERE verified_at IS NOT NULL AND domain IS NOT NULL AND domain <> ''`,
+
+      // ── Migration 021: two-factor auth (TOTP) ──
+      // Login-flow gating ships separately; this only stores the secret + codes.
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret_enc TEXT`,
+      `ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_enabled_at TIMESTAMPTZ`,
+      `CREATE INDEX IF NOT EXISTS idx_users_totp_enabled ON users(totp_enabled_at) WHERE totp_enabled_at IS NOT NULL`,
+      `CREATE TABLE IF NOT EXISTS user_recovery_codes (
+         id SERIAL PRIMARY KEY,
+         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+         code_hash TEXT NOT NULL,
+         used_at TIMESTAMPTZ,
+         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+       )`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_user_recovery_codes_hash ON user_recovery_codes(code_hash)`,
+      `CREATE INDEX IF NOT EXISTS idx_user_recovery_codes_user ON user_recovery_codes(user_id) WHERE used_at IS NULL`,
     ];
     for (const sql of statements) {
       try {
@@ -522,6 +537,7 @@ function safeRequire(modulePath, name) {
 // LOAD ALL ROUTES
 // ============================================================================
 const authRoutes = safeRequire('./routes/auth', 'auth');
+const twoFactorRoutes = safeRequire('./routes/twoFactor', 'twoFactor');
 const projectRoutes = safeRequire('./routes/projects', 'projects');
 const testcaseRoutes = safeRequire('./routes/testcases', 'testcases');
 const analyzeRoutes = safeRequire('./routes/analyze', 'analyze');
@@ -667,6 +683,7 @@ app.use('/api/health', healthRoutes);
 
 // Auth routes (no auth middleware — register/login/refresh/logout are public)
 app.use('/api/auth', authRoutes);
+if (twoFactorRoutes) app.use('/api/auth/2fa', twoFactorRoutes);
 
 // Platform admin (cross-org). Mount early so a 401/403 is returned before
 // org-scoped routes get a chance to redirect on missing orgId.
