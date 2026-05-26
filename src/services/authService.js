@@ -3,7 +3,7 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const db = require('../db');
 const config = require('../config');
-const { ConflictError, UnauthorizedError, ForbiddenError, NotFoundError, ValidationError } = require('../utils/apiError');
+const { ConflictError, UnauthorizedError, ForbiddenError, NotFoundError, ApiError } = require('../utils/apiError');
 const teamService = require('./teamService');
 const { isCorporateDomain, getEmailDomain } = require('../utils/emailDomain');
 const { isConsumerEmail } = require('../utils/consumerEmailDomains');
@@ -91,10 +91,14 @@ async function register(email, password, companyName) {
 
   // Case 3: net-new corporate domain → pending org + verification email.
   if (!companyName) {
-    throw new ValidationError('Company name is required to create a new organization.');
+    // ApiError direct (not ValidationError) because ValidationError's
+    // constructor swallows the first arg into `details` and hardcodes
+    // the user-facing message to "Validation failed" — we want the
+    // specific reason on the wire so the UI can show it as-is.
+    throw new ApiError(400, 'VALIDATION_ERROR', 'Company name is required to create a new organization.');
   }
   if (companyName.length < 2 || companyName.length > 100) {
-    throw new ValidationError('Company name must be between 2 and 100 characters.');
+    throw new ApiError(400, 'VALIDATION_ERROR', 'Company name must be between 2 and 100 characters.');
   }
 
   return _registerPending({ email, password, companyName, domain });
@@ -579,7 +583,7 @@ async function getUserOrgInfo(userId) {
  */
 async function verifyEmail(rawToken) {
   if (!rawToken || typeof rawToken !== 'string') {
-    throw new ValidationError('Verification token is required.');
+    throw new ApiError(400, 'VALIDATION_ERROR', 'Verification token is required.');
   }
   const tokenHash = hashToken(rawToken);
   const client = await db.getClient();
@@ -672,7 +676,7 @@ async function verifyEmail(rawToken) {
  */
 async function resendVerificationEmail(email) {
   email = (email || '').toLowerCase().trim();
-  if (!email) throw new ValidationError('Email is required.');
+  if (!email) throw new ApiError(400, 'VALIDATION_ERROR', 'Email is required.');
 
   const userRow = await db.query(
     `SELECT u.id, u.email_verified_at, o.name AS org_name
