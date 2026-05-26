@@ -8,6 +8,12 @@
  *                                                                       (auto-generates one if pw is omitted)
  *   node scripts/promote-platform-admin.js --create-admin <email> [pw]  Create a new org-less platform admin
  *                                                                       (auto-generates pw if omitted)
+ *   node scripts/promote-platform-admin.js --verify-link <email>        Mint a fresh verification link for a
+ *                                                                       pending signup. Use when the email
+ *                                                                       provider isn't configured or you just
+ *                                                                       want to skip the inbox round-trip
+ *                                                                       (e.g. E2E testing). Refuses for
+ *                                                                       already-verified users.
  *
  * Idempotent. Exits non-zero if the email isn't found.
  * Reset-password also revokes all active refresh tokens for that user so any
@@ -34,7 +40,41 @@ async function main() {
     console.log('  promote-platform-admin.js --list                           List current admins');
     console.log('  promote-platform-admin.js --reset-password <email> [pw]    Reset password (auto-generates if omitted)');
     console.log('  promote-platform-admin.js --create-admin <email> [pw]      Create new org-less platform admin');
+    console.log('  promote-platform-admin.js --verify-link <email>             Mint a fresh verification link for a pending signup');
     process.exit(args.length === 0 ? 1 : 0);
+  }
+
+  if (args[0] === '--verify-link') {
+    const email = (args[1] || '').toLowerCase().trim();
+    if (!email) { console.error('Email required: --verify-link <email>'); process.exit(1); }
+    const user = await db.query(
+      'SELECT id, email_verified_at FROM users WHERE LOWER(email) = $1',
+      [email]
+    );
+    if (!user.rows.length) { console.error(`No user with email ${email}`); process.exit(2); }
+    if (user.rows[0].email_verified_at != null) {
+      console.error(`User ${email} is already verified — no link needed. They can log in directly.`);
+      process.exit(2);
+    }
+    // Mint a NEW token (don't try to reuse the existing one — it's hashed,
+    // we can't recover the plaintext). Same scheme as the register flow:
+    // 32 random bytes, base64url, hashed at rest with sha256, 24h TTL.
+    const token = crypto.randomBytes(32).toString('base64url');
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    await db.query(
+      `INSERT INTO email_verification_tokens (user_id, token_hash, purpose, expires_at)
+       VALUES ($1, $2, 'signup', $3)`,
+      [user.rows[0].id, tokenHash, expiresAt]
+    );
+    const base = (process.env.APP_BASE_URL || 'https://testforge-app.vercel.app').replace(/\/$/, '');
+    const url = `${base}/verify-email?token=${encodeURIComponent(token)}`;
+    console.log(`Verification link for ${email} (user #${user.rows[0].id}):`);
+    console.log('');
+    console.log(`  ${url}`);
+    console.log('');
+    console.log('Click to verify + auto-login. Link is single-use and expires in 24 hours.');
+    process.exit(0);
   }
 
   if (args[0] === '--reset-password') {
