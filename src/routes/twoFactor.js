@@ -1,10 +1,9 @@
-// /api/auth/2fa/* — TOTP setup, confirm, disable, status.
+// /api/auth/2fa/* — TOTP setup, confirm, disable, status, login-verify.
 //
-// Login-flow integration ships in a follow-up. These endpoints only
-// manage the secret + recovery code lifecycle so the frontend can
-// expose an enable/disable UI right away. Until the login change
-// lands, having totp_enabled_at set does NOT yet block login —
-// it's purely informational on this endpoint set.
+// Most endpoints are authenticated (manage your own 2FA after login).
+// /verify is the exception: it accepts the short-lived "pre-2fa" temp
+// token issued by /auth/login when the user has 2FA enabled, and
+// exchanges it (+ a TOTP code or recovery code) for real tokens.
 
 const { Router } = require('express');
 const { z } = require('zod');
@@ -15,17 +14,22 @@ const { authLimiter } = require('../middleware/rateLimiter');
 const { validate } = require('../middleware/validate');
 const { ApiError, NotFoundError, UnauthorizedError, ConflictError } = require('../utils/apiError');
 const totp = require('../services/totpService');
+const authService = require('../services/authService');
 const logger = require('../utils/logger');
 
 const router = Router();
 
 const codeSchema = z.object({
-  code: z.string().min(6).max(10), // 6 digits, or up to 10 with spaces/dashes
+  code: z.string().min(6).max(20), // 6 digits, or up to ~20 with spaces/dashes
 });
 const disableSchema = z.object({
   password: z.string().min(1),
   // Either a current TOTP code OR a recovery code is acceptable proof
   // that the requester really has the second factor in hand.
+  code: z.string().min(6).max(20),
+});
+const verifyLoginSchema = z.object({
+  tempToken: z.string().min(10),
   code: z.string().min(6).max(20),
 });
 
@@ -189,6 +193,37 @@ router.post('/disable', authenticate, authLimiter, validate(disableSchema), asyn
     }
     logger.info({ userId: req.user.id }, '2FA disabled');
     res.json({ enabled: false });
+  } catch (err) { next(err); }
+});
+
+// POST /api/auth/2fa/verify — complete a 2FA-gated login.
+// Body: { tempToken, code } where code is a 6-digit TOTP or a recovery
+// code. On success returns the same shape as /auth/login (access +
+// refresh tokens), and the login route's cookie-set wrapper is mirrored
+// below.
+router.post('/verify', authLimiter, validate(verifyLoginSchema), async (req, res, next) => {
+  try {
+    const tokens = await authService.completeTwoFactorLogin(
+      req.body.tempToken,
+      req.body.code
+    );
+    // Same refresh cookie semantics as /auth/login. Inline rather than
+    // importing the helper from routes/auth.js to keep the dependency
+    // direction one-way (twoFactor → auth, never the reverse).
+    if (tokens && tokens.refreshToken) {
+      const isProd = process.env.NODE_ENV === 'production';
+      const sameSite = isProd ? 'None' : 'Lax';
+      const parts = [
+        `tg_refresh=${encodeURIComponent(tokens.refreshToken)}`,
+        'HttpOnly',
+        'Path=/api/auth',
+        `SameSite=${sameSite}`,
+        'Max-Age=2592000',
+      ];
+      if (isProd) parts.push('Secure');
+      res.setHeader('Set-Cookie', parts.join('; '));
+    }
+    res.json(tokens);
   } catch (err) { next(err); }
 });
 
