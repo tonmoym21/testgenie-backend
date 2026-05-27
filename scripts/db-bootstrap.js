@@ -67,6 +67,7 @@ const ORDER = [
   '019_platform_admin',
   '020_public_signup',
   '021_two_factor_auth',
+  '022_autofix_explanation',
 ];
 
 function parseArgs(argv) {

@@ -203,4 +203,54 @@ describe('autoFixService.proposeFix [real DB]', () => {
     const retry = await autoFixService.proposeFix(failureId);
     expect(retry.status).toBe('proposed');
   });
+
+  it('quota: rejects with 429 AUTOFIX_QUOTA_EXCEEDED when the project hits the daily limit', async () => {
+    // Real-DB version of the quota gate. Inserts (limit-1) historic
+    // fix_attempts so the next proposeFix call would push the project
+    // over. The counter is rolling-24h, joined through test_failures, so
+    // any project_id leak (counting all rows globally) would let this
+    // test pass when it shouldn't.
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    const ORIGINAL_LIMIT = process.env.AUTOFIX_DAILY_LIMIT;
+    process.env.AUTOFIX_DAILY_LIMIT = '3';
+    try {
+      // Seed 3 historic attempts for THIS project — enough to hit the limit.
+      // Use throwaway test_failures rows (status='resolved' so they don't
+      // pollute other tests' eligibility scans).
+      for (let i = 0; i < 3; i++) {
+        const tfRow = await db.query(
+          `INSERT INTO test_failures
+             (project_id, failure_signature, sample_error_message, sample_error_stack,
+              last_test_id, occurrence_count, first_seen_at, last_seen_at, fix_status)
+           VALUES ($1, $2, 'quota-fill', 'stack', $3, 1, NOW(), NOW(), 'resolved')
+           RETURNING id`,
+          [seed.projectId, `quota-fill-${Date.now()}-${i}`, seed.testId]
+        );
+        await db.query(
+          `INSERT INTO fix_attempts
+             (test_failure_id, model_provider, model_name, branch_name, status, started_at)
+           VALUES ($1, 'openai', 'gpt-4o', $2, 'failed', NOW())`,
+          [tfRow.rows[0].id, `quota-fill-branch-${Date.now()}-${i}`]
+        );
+      }
+
+      const failureId = await seedOpenFailure({ signature: 'quotagate12345678' });
+      // No mockPatch() — the LLM must NOT be reached if the gate works.
+      mockLlmCreate.mockReset();
+
+      await expect(autoFixService.proposeFix(failureId)).rejects.toMatchObject({
+        status: 429,
+        code: 'AUTOFIX_QUOTA_EXCEEDED',
+      });
+
+      // The failure remains 'open' — quota denial must not consume the row.
+      const tf = await db.query(`SELECT fix_status FROM test_failures WHERE id = $1`, [failureId]);
+      expect(tf.rows[0].fix_status).toBe('open');
+
+      expect(mockLlmCreate).not.toHaveBeenCalled();
+    } finally {
+      if (ORIGINAL_LIMIT === undefined) delete process.env.AUTOFIX_DAILY_LIMIT;
+      else process.env.AUTOFIX_DAILY_LIMIT = ORIGINAL_LIMIT;
+    }
+  });
 });

@@ -66,7 +66,15 @@ async function chatJson(req, deps = {}) {
   if (!content || typeof content !== 'string') {
     throw new Error('Ollama returned empty/invalid message.content');
   }
-  return { content };
+
+  // Ollama uses prompt_eval_count / eval_count for input / output tokens
+  // (the eval terminology is from the gguf runtime, not OpenAI). Normalize
+  // to the same shape as the OpenAI provider so downstream observability
+  // code is provider-agnostic.
+  const usage = (typeof body.prompt_eval_count === 'number' || typeof body.eval_count === 'number')
+    ? { inputTokens: body.prompt_eval_count ?? null, outputTokens: body.eval_count ?? null }
+    : null;
+  return { content, usage };
 }
 
 async function safeText(res) {

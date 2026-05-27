@@ -53,8 +53,11 @@ const defaultDeps = () => ({
 // ---------------------------------------------------------------------------
 
 async function loadFixAttempt(db, id) {
+  // project_id is pulled through test_failures because fix_attempts itself
+  // has no project_id column. Downstream observability needs project_id on
+  // every autofix.verify* event so per-tenant verify-rate dashboards work.
   const r = await db.query(
-    `SELECT fa.*, tf.id AS failure_id, tf.failure_signature,
+    `SELECT fa.*, tf.id AS failure_id, tf.project_id, tf.failure_signature,
             pt.file_name AS test_file_name
        FROM fix_attempts fa
        JOIN test_failures tf ON tf.id = fa.test_failure_id
@@ -149,6 +152,10 @@ async function verifyFix(opts, deps = {}) {
   // Check out the agent branch, run Playwright against just the patched
   // file, then return to base no matter what.
   runGit(repo, ['checkout', row.branch_name]);
+  // verifyStart is the entry point of the p95 verify-duration metric.
+  // Includes the Playwright subprocess time which dominates the total —
+  // git ops are negligible by comparison.
+  const verifyStart = Date.now();
   let result;
   try {
     result = runPlaywright(repo, [
@@ -168,16 +175,23 @@ async function verifyFix(opts, deps = {}) {
   // exitCode === 0 means every test in the file passed. The runner already
   // handles flakes via retries=1 in the GENERATING run; verify forces
   // retries=0 so a flake-pass doesn't accidentally count as a real fix.
+  const durationMs = Date.now() - verifyStart;
   if (result.exitCode === 0) {
     await recordVerified(db, row.id);
-    logger.info({ event: 'autofix.verified', fixAttemptId: row.id, branch: row.branch_name }, 'Auto-fix verified');
+    // Carries projectId + failureId + durationMs so downstream can compute
+    // per-project verify-success-rate, conversion vs autofix.proposed, and
+    // p95 verify latency. branch_name kept for grep-correlation with git.
+    logger.info({ event: 'autofix.verified', fixAttemptId: row.id, failureId: row.failure_id,
+      projectId: row.project_id, branch: row.branch_name, durationMs },
+      'Auto-fix verified');
     return { fixAttemptId: row.id, status: 'verified', exitCode: 0, stderrTail: '' };
   }
 
   const errorTail = (result.stderr || result.stdout || `Playwright exit ${result.exitCode}`).slice(-4000);
   await recordVerifyFailed(db, row.id, row.failure_id, errorTail);
-  logger.info({ event: 'autofix.verify_failed', fixAttemptId: row.id, branch: row.branch_name,
-    exitCode: result.exitCode }, 'Auto-fix verify failed');
+  logger.info({ event: 'autofix.verify_failed', fixAttemptId: row.id, failureId: row.failure_id,
+    projectId: row.project_id, branch: row.branch_name, exitCode: result.exitCode, durationMs },
+    'Auto-fix verify failed');
   return { fixAttemptId: row.id, status: 'verify_failed', exitCode: result.exitCode, stderrTail: errorTail };
 }
 
@@ -200,8 +214,14 @@ async function verifyFix(opts, deps = {}) {
 async function markMerged(opts, deps = {}) {
   const { db, logger } = { ...defaultDeps(), ...deps };
 
+  // Pull project_id via test_failures so the autofix.merged event can
+  // carry it. Without project_id, end-to-end conversion (proposed →
+  // verified → merged) can only be computed globally, not per-tenant.
   const r = await db.query(
-    `SELECT id, test_failure_id, status FROM fix_attempts WHERE id = $1`,
+    `SELECT fa.id, fa.test_failure_id, fa.status, tf.project_id
+       FROM fix_attempts fa
+       JOIN test_failures tf ON tf.id = fa.test_failure_id
+      WHERE fa.id = $1`,
     [opts.fixAttemptId]
   );
   const row = r.rows[0];
@@ -219,7 +239,10 @@ async function markMerged(opts, deps = {}) {
     [row.test_failure_id]
   );
 
-  logger.info({ event: 'autofix.merged', fixAttemptId: row.id, failureId: row.test_failure_id }, 'Auto-fix merged');
+  // Closes the conversion funnel. projectId enables per-tenant
+  // merged-rate dashboards — the headline metric for "is autofix working?".
+  logger.info({ event: 'autofix.merged', fixAttemptId: row.id, failureId: row.test_failure_id,
+    projectId: row.project_id }, 'Auto-fix merged');
   return { fixAttemptId: row.id, status: 'merged', failureId: row.test_failure_id };
 }
 
