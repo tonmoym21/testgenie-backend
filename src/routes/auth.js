@@ -189,6 +189,12 @@ router.post('/login', authLimiter, validate(loginSchema), async (req, res, next)
   const email = (req.body && req.body.email) || null;
   try {
     const tokens = await authService.login(req.body.email, req.body.password);
+    // 2FA-gated user: forward the temp-token challenge to the client.
+    // No refresh cookie yet, no real login-success audit yet — those
+    // happen at /2fa/verify time once the second factor checks out.
+    if (tokens && tokens.kind === '2fa_required') {
+      return res.json(tokens);
+    }
     if (tokens && tokens.refreshToken) setRefreshCookie(res, tokens.refreshToken);
     if (tokens && tokens.user && tokens.user.organizationId) {
       auditService.logEvent({

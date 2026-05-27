@@ -312,10 +312,10 @@ async function registerWithInvite(email, password, inviteToken) {
  */
 async function login(email, password) {
   email = email.toLowerCase().trim();
-  
+
   const result = await db.query(
     `SELECT u.id, u.email, u.password_hash, u.organization_id, u.status, u.is_platform_admin,
-            u.email_verified_at, om.role, o.status AS org_status
+            u.email_verified_at, u.totp_enabled_at, om.role, o.status AS org_status
      FROM users u
      LEFT JOIN organization_members om ON u.id = om.user_id AND u.organization_id = om.organization_id
      LEFT JOIN organizations o ON u.organization_id = o.id
@@ -336,9 +336,103 @@ async function login(email, password) {
     throw new UnauthorizedError('Invalid email or password');
   }
 
+  // 2FA gate. If enabled, don't return real tokens — issue a short-lived
+  // temp token instead and tell the caller to come back via /auth/2fa/verify
+  // with the temp token + a TOTP code (or recovery code). last_active_at is
+  // updated only on full login completion (verify side), so a half-finished
+  // 2FA challenge doesn't look like a successful login in audit.
+  if (user.totp_enabled_at != null) {
+    return {
+      kind: '2fa_required',
+      tempToken: mintTempToken(user.id),
+    };
+  }
+
   // Update last active
   await db.query('UPDATE users SET last_active_at = NOW() WHERE id = $1', [user.id]);
 
+  return generateTokens(user);
+}
+
+// ── 2FA login-gate helpers ────────────────────────────────────────────
+
+const TEMP_TOKEN_TTL = '5m';
+const TEMP_TOKEN_TYPE = 'pre-2fa';
+
+function mintTempToken(userId) {
+  return jwt.sign(
+    { sub: userId, type: TEMP_TOKEN_TYPE, jti: crypto.randomUUID() },
+    config.JWT_SECRET,
+    { expiresIn: TEMP_TOKEN_TTL }
+  );
+}
+
+/**
+ * Verify a pre-2fa temp token. Returns the user id on success. Throws on
+ * invalid / expired / wrong-type. Caller passes the userId to
+ * completeTwoFactorLogin() below.
+ */
+function verifyTempToken(token) {
+  let payload;
+  try {
+    payload = jwt.verify(token, config.JWT_SECRET);
+  } catch {
+    throw new UnauthorizedError('2FA challenge expired. Please log in again.');
+  }
+  if (payload.type !== TEMP_TOKEN_TYPE || !payload.sub) {
+    throw new UnauthorizedError('Invalid 2FA challenge token');
+  }
+  return payload.sub;
+}
+
+/**
+ * Complete a 2FA-gated login: temp token + (TOTP code OR recovery code) →
+ * real access + refresh tokens. Same lazy `require` for totpService as the
+ * /2fa routes so this file doesn't pull otplib at startup when 2FA isn't
+ * configured.
+ */
+async function completeTwoFactorLogin(tempToken, code) {
+  const userId = verifyTempToken(tempToken);
+  const r = await db.query(
+    `SELECT u.id, u.email, u.organization_id, u.status, u.is_platform_admin,
+            u.email_verified_at, u.totp_secret_enc, u.totp_enabled_at,
+            om.role, o.status AS org_status
+       FROM users u
+       LEFT JOIN organization_members om ON u.id = om.user_id AND u.organization_id = om.organization_id
+       LEFT JOIN organizations o ON u.organization_id = o.id
+      WHERE u.id = $1`,
+    [userId]
+  );
+  if (!r.rows.length) throw new UnauthorizedError('User not found');
+  const user = r.rows[0];
+  enforceAccountAccess(user);
+  if (user.totp_enabled_at == null || !user.totp_secret_enc) {
+    // Edge case: user disabled 2FA between login() and verify(). Let them
+    // straight through — they already cleared password.
+    await db.query('UPDATE users SET last_active_at = NOW() WHERE id = $1', [user.id]);
+    return generateTokens(user);
+  }
+
+  const totp = require('./totpService');
+  const codeRaw = String(code || '');
+  let ok = false;
+  if (/^\d{6}$/.test(codeRaw.replace(/\s/g, ''))) {
+    ok = totp.verifyCode(totp.decryptSecret(user.totp_secret_enc), codeRaw);
+  } else {
+    // Recovery code path. Single-use — mark consumed atomically.
+    const hash = totp.hashRecoveryCode(codeRaw);
+    const consumed = await db.query(
+      `UPDATE user_recovery_codes
+          SET used_at = NOW()
+        WHERE user_id = $1 AND code_hash = $2 AND used_at IS NULL
+        RETURNING id`,
+      [user.id, hash]
+    );
+    ok = consumed.rows.length > 0;
+  }
+  if (!ok) throw new UnauthorizedError('Invalid 2FA code or recovery code');
+
+  await db.query('UPDATE users SET last_active_at = NOW() WHERE id = $1', [user.id]);
   return generateTokens(user);
 }
 
@@ -735,4 +829,5 @@ module.exports = {
   getUserOrgInfo,
   verifyEmail,
   resendVerificationEmail,
+  completeTwoFactorLogin,
 };

@@ -66,6 +66,7 @@ const ORDER = [
   '017_api_source_import',
   '019_platform_admin',
   '020_public_signup',
+  '021_two_factor_auth',
 ];
 
 function parseArgs(argv) {
