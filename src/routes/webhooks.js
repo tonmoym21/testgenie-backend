@@ -77,10 +77,15 @@ function buildHandler(deps = {}) {
       && payload.pull_request.base.repo
       && payload.pull_request.base.repo.full_name;
 
-    // Look up the fix_attempt by branch_name. Auto-fix branches follow the
-    // pattern 'testforge/autofix/failure-<id>-<shortsha>' (set in apply
-    // service) so unrelated PRs simply won't match. We also pull project_id
-    // (via test_failures) so the multi-tenant scope check below can run.
+    // Look up the fix_attempt by branch_name. Auto-fix branches follow
+    // either of two patterns:
+    //   - 'testforge/autofix/attempt-<aid>-failure-<fid>-<shortsha>' (current —
+    //     includes attempt id so retries don't collide on the apply branch)
+    //   - 'testforge/autofix/failure-<fid>-<shortsha>'                  (legacy —
+    //     pre-retry-safe rows from before the schema change).
+    // We match on the exact string so unrelated PRs simply won't match.
+    // We also pull project_id (via test_failures) so the multi-tenant
+    // scope check below can run.
     const lookup = await db.query(
       `SELECT fa.id, fa.status, tf.project_id
          FROM fix_attempts fa
