@@ -23,6 +23,42 @@ const DEFAULT_MODEL_BY_PROVIDER = {
   ollama: 'llama3.1',
 };
 
+// Per-project per-day ceiling on fix_attempts. Each attempt is at least one
+// LLM call (proposeFix → callLlm). Without a ceiling, a runaway test suite
+// that fails N times across N specs racks up N LLM calls against the
+// customer's budget on a single cron interval. Default 20/day/project is
+// generous for a normal QA flake rate; set AUTOFIX_DAILY_LIMIT=0 to disable
+// the gate entirely (CI / e2e demo sessions).
+const DEFAULT_DAILY_LIMIT_PER_PROJECT = 20;
+
+function getDailyLimit() {
+  const raw = process.env.AUTOFIX_DAILY_LIMIT;
+  if (raw === undefined || raw === '') return DEFAULT_DAILY_LIMIT_PER_PROJECT;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_DAILY_LIMIT_PER_PROJECT;
+  return n;
+}
+
+/**
+ * Count fix_attempts created in the last 24h that belong to this project.
+ * Joins through test_failures because fix_attempts has no project_id of
+ * its own. Counted regardless of status — a failed LLM call still cost
+ * money. The window is rolling-24h, not calendar-day, so a customer who
+ * blew through quota at 23:59 doesn't get a fresh 20 at midnight.
+ */
+async function countRecentAttempts(projectId, deps = {}) {
+  const dbRef = deps.db || db;
+  const r = await dbRef.query(
+    `SELECT COUNT(*)::int AS n
+       FROM fix_attempts fa
+       JOIN test_failures tf ON tf.id = fa.test_failure_id
+      WHERE tf.project_id = $1
+        AND fa.started_at > NOW() - INTERVAL '24 hours'`,
+    [projectId]
+  );
+  return r.rows[0].n;
+}
+
 /**
  * Run the agent against a single test_failures row.
  *
@@ -51,6 +87,26 @@ async function proposeFix(failureId, opts = {}) {
   if (!ctx) throw Object.assign(new Error(`Failure ${failureId} not found`), { status: 404 });
   if (!ctx.testId || !ctx.specCode) {
     throw new Error(`Failure ${failureId} has no linked spec code — nothing to patch`);
+  }
+
+  // Per-project daily quota check. Runs BEFORE the claim — a denied request
+  // must not flip fix_status away from 'open', otherwise we leak the row
+  // out of the eligibility pool without doing any work. Skipped when the
+  // limit is 0 (CI / e2e demos that explicitly disable the gate).
+  const dailyLimit = getDailyLimit();
+  if (dailyLimit > 0) {
+    const used = await countRecentAttempts(ctx.projectId);
+    if (used >= dailyLimit) {
+      const err = new Error(
+        `Auto-fix daily limit reached for project ${ctx.projectId}: ${used}/${dailyLimit} attempts in last 24h. ` +
+        `Set AUTOFIX_DAILY_LIMIT higher or wait for the window to slide.`
+      );
+      err.status = 429;
+      err.code = 'AUTOFIX_QUOTA_EXCEEDED';
+      logger.warn({ event: 'autofix.quota_exceeded', projectId: ctx.projectId, used, limit: dailyLimit, failureId },
+        'autofix: daily quota exceeded');
+      throw err;
+    }
   }
 
   // Atomically claim the failure: only one caller can flip 'open' -> 'fix_proposed'.
@@ -95,14 +151,23 @@ async function proposeFix(failureId, opts = {}) {
     [failureId]
   ).catch((relErr) => logger.warn({ failureId, err: relErr.message }, 'autofix: release claim failed'));
 
+  // proposeStart drives autofix.proposed.durationMs so downstream
+  // observability can compute p95 propose-end-to-end (load + LLM + write).
+  const proposeStart = Date.now();
   let patched;
   try {
-    patched = await callLlm({ ctx, model, provider });
+    patched = await callLlm({ ctx, model, provider, failureId, projectId: ctx.projectId, fixAttemptId: attemptId });
     await db.query(`UPDATE fix_attempts SET prompt_excerpt = $2 WHERE id = $1`,
       [attemptId, truncate(patched.promptExcerpt, 4000)]);
   } catch (err) {
     const { reason, status } = classifyAiError(err);
-    logger.error({ event: 'autofix.llm_failure', failureId, reason, status, err: err.message },
+    // llm_failure now carries projectId + fixAttemptId so a metrics
+    // pipeline can compute failure rate per-project AND join to fix_attempts
+    // for retry-cost analysis. Without these, alerts can only fire on
+    // global error rate, which is useless for a multi-tenant deploy.
+    logger.error({ event: 'autofix.llm_failure', failureId, projectId: ctx.projectId,
+      fixAttemptId: attemptId, model, provider: provider.name,
+      reason, status, err: err.message, durationMs: Date.now() - proposeStart },
       'Auto-fix LLM call failed');
     await finalizeAttempt(attemptId, { status: 'failed', errorMessage: `LLM: ${err.message}` });
     await releaseClaim();
@@ -121,11 +186,21 @@ async function proposeFix(failureId, opts = {}) {
     status: 'proposed',
     patchDiff: diff,
     newCode: patched.newCode,
+    explanation: patched.explanation,
   });
   // (test_failures.fix_status was already flipped to 'fix_proposed' by the claim.)
 
-  logger.info({ event: 'autofix.proposed', failureId, fixAttemptId: attemptId, branch: branchName,
-    diffLines: diff.split('\n').length }, 'Auto-fix proposed');
+  // autofix.proposed is the entry point of the conversion funnel
+  // (proposed → verified → merged). Every field needed to compute that
+  // funnel + LLM cost has to be on this single event so downstream
+  // aggregation doesn't need a 3-way join. projectId enables per-tenant
+  // breakdowns; inputTokens/outputTokens × model price = cost-per-fix.
+  logger.info({ event: 'autofix.proposed', failureId, projectId: ctx.projectId,
+    fixAttemptId: attemptId, branch: branchName, model, provider: provider.name,
+    diffLines: diff.split('\n').length, durationMs: Date.now() - proposeStart,
+    inputTokens: patched.usage && patched.usage.inputTokens,
+    outputTokens: patched.usage && patched.usage.outputTokens,
+  }, 'Auto-fix proposed');
 
   return {
     fixAttemptId: attemptId,
@@ -141,7 +216,7 @@ async function proposeFix(failureId, opts = {}) {
 // LLM call
 // ---------------------------------------------------------------------------
 
-async function callLlm({ ctx, model, provider }) {
+async function callLlm({ ctx, model, provider, failureId, projectId, fixAttemptId }) {
   const userPrompt = buildFixPrompt({
     fileName: ctx.fileName,
     specCode: ctx.specCode,
@@ -150,7 +225,7 @@ async function callLlm({ ctx, model, provider }) {
   });
 
   const aiStart = Date.now();
-  const { content: raw } = await provider.chatJson({
+  const { content: raw, usage } = await provider.chatJson({
     system: FIX_SYSTEM_PROMPT,
     user: userPrompt,
     model,
@@ -168,14 +243,22 @@ async function callLlm({ ctx, model, provider }) {
     throw new Error('LLM response missing newCode');
   }
 
+  // llm_ok carries every field needed to compute LLM cost and tail latency
+  // per project per model. inputTokens/outputTokens come from the provider
+  // (null on providers that don't surface them — see openaiProvider.usage).
   logger.info({ event: 'autofix.llm_ok', provider: provider.name, model,
-    durationMs: Date.now() - aiStart, newCodeLen: parsed.newCode.length }, 'Auto-fix LLM ok');
+    failureId, projectId, fixAttemptId,
+    durationMs: Date.now() - aiStart, newCodeLen: parsed.newCode.length,
+    inputTokens: usage && usage.inputTokens,
+    outputTokens: usage && usage.outputTokens,
+  }, 'Auto-fix LLM ok');
 
   return {
     newCode: parsed.newCode,
     explanation: typeof parsed.explanation === 'string' ? parsed.explanation : null,
     confidence: parsed.confidence || null,
     promptExcerpt: userPrompt.slice(0, 4000),
+    usage: usage || null,
   };
 }
 
@@ -227,16 +310,17 @@ async function insertAttempt({ failureId, triggeredBy, providerName, model, bran
   return r.rows[0].id;
 }
 
-async function finalizeAttempt(id, { status, patchDiff, errorMessage, newCode }) {
+async function finalizeAttempt(id, { status, patchDiff, errorMessage, newCode, explanation }) {
   await db.query(
     `UPDATE fix_attempts SET
        status = $2,
        patch_diff = COALESCE($3, patch_diff),
        error_message = COALESCE($4, error_message),
        new_code = COALESCE($5, new_code),
+       explanation = COALESCE($6, explanation),
        finished_at = NOW()
      WHERE id = $1`,
-    [id, status, patchDiff || null, errorMessage || null, newCode || null]
+    [id, status, patchDiff || null, errorMessage || null, newCode || null, explanation || null]
   );
 }
 
@@ -259,4 +343,4 @@ function truncate(s, max) {
   return s.length > max ? s.slice(0, max) : s;
 }
 
-module.exports = { proposeFix };
+module.exports = { proposeFix, countRecentAttempts, getDailyLimit };

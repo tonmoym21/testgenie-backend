@@ -105,6 +105,7 @@ describe('autoFixService.proposeFix', () => {
   it('happy path: claims the failure, writes attempt as proposed, stores diff + new_code', async () => {
     scriptDb([
       { rows: [failureRow()], rowCount: 1 },             // loadFailureContext SELECT
+      { rows: [{ n: 0 }], rowCount: 1 },                 // countRecentAttempts (quota check)
       { rows: [{ id: 42 }], rowCount: 1 },               // atomic claim UPDATE ... RETURNING id
       { rows: [{ id: 99 }], rowCount: 1 },               // insertAttempt RETURNING id
       { rows: [], rowCount: 1 },                         // branch_name UPDATE (attempt-id-suffixed)
@@ -139,6 +140,7 @@ describe('autoFixService.proposeFix', () => {
   it('refuses to run when the claim returns 0 rows (already claimed)', async () => {
     scriptDb([
       { rows: [failureRow()], rowCount: 1 },             // loadFailureContext SELECT
+      { rows: [{ n: 0 }], rowCount: 1 },                 // quota check (under limit)
       { rows: [], rowCount: 0 },                         // atomic claim — LOSES the race
     ]);
 
@@ -156,6 +158,7 @@ describe('autoFixService.proposeFix', () => {
   it('releases the claim when the LLM throws', async () => {
     scriptDb([
       { rows: [failureRow()], rowCount: 1 },
+      { rows: [{ n: 0 }], rowCount: 1 },                 // quota check
       { rows: [{ id: 42 }], rowCount: 1 },               // claim wins
       { rows: [{ id: 99 }], rowCount: 1 },               // insertAttempt
       { rows: [], rowCount: 1 },                         // branch_name UPDATE
@@ -180,6 +183,7 @@ describe('autoFixService.proposeFix', () => {
     const same = "test('login', async () => {});\n";
     scriptDb([
       { rows: [failureRow({ spec_code: same })], rowCount: 1 },
+      { rows: [{ n: 0 }], rowCount: 1 },                 // quota check
       { rows: [{ id: 42 }], rowCount: 1 },               // claim wins
       { rows: [{ id: 99 }], rowCount: 1 },               // insertAttempt
       { rows: [], rowCount: 1 },                         // branch_name UPDATE
@@ -197,6 +201,61 @@ describe('autoFixService.proposeFix', () => {
       (c) => /UPDATE test_failures SET fix_status = 'open'/.test(c[0])
     );
     expect(release).toBeTruthy();
+  });
+
+  it('rejects with 429 AUTOFIX_QUOTA_EXCEEDED when project is over the daily limit', async () => {
+    const ORIGINAL_LIMIT = process.env.AUTOFIX_DAILY_LIMIT;
+    process.env.AUTOFIX_DAILY_LIMIT = '5';
+    try {
+      scriptDb([
+        { rows: [failureRow()], rowCount: 1 },           // loadFailureContext
+        { rows: [{ n: 5 }], rowCount: 1 },               // quota check — exactly at limit
+      ]);
+
+      await expect(autoFixService.proposeFix(42)).rejects.toMatchObject({
+        status: 429,
+        code: 'AUTOFIX_QUOTA_EXCEEDED',
+        message: expect.stringMatching(/daily limit/i),
+      });
+
+      // Critical: no claim, no insert, no LLM call. The 'open' status
+      // stays put so the row remains eligible once the window slides.
+      expect(mockLlmCreate).not.toHaveBeenCalled();
+      const claim = mockDbQuery.mock.calls.find((c) => /UPDATE test_failures SET fix_status = 'fix_proposed'/.test(c[0]));
+      expect(claim).toBeFalsy();
+      const insert = mockDbQuery.mock.calls.find((c) => /INSERT INTO fix_attempts/.test(c[0]));
+      expect(insert).toBeFalsy();
+    } finally {
+      if (ORIGINAL_LIMIT === undefined) delete process.env.AUTOFIX_DAILY_LIMIT;
+      else process.env.AUTOFIX_DAILY_LIMIT = ORIGINAL_LIMIT;
+    }
+  });
+
+  it('bypasses the quota check entirely when AUTOFIX_DAILY_LIMIT=0', async () => {
+    const ORIGINAL_LIMIT = process.env.AUTOFIX_DAILY_LIMIT;
+    process.env.AUTOFIX_DAILY_LIMIT = '0';
+    try {
+      scriptDb([
+        { rows: [failureRow()], rowCount: 1 },           // loadFailureContext
+        // NO quota SELECT — the limit=0 path skips it entirely.
+        { rows: [{ id: 42 }], rowCount: 1 },             // claim wins
+        { rows: [{ id: 99 }], rowCount: 1 },             // insertAttempt
+        { rows: [], rowCount: 1 },                       // branch_name UPDATE
+        { rows: [], rowCount: 1 },                       // prompt_excerpt UPDATE
+        { rows: [], rowCount: 1 },                       // finalizeAttempt
+      ]);
+      llmReply("test('login', async ({page}) => { await page.click('button'); });\n");
+
+      const result = await autoFixService.proposeFix(42, { triggeredBy: null });
+      expect(result.status).toBe('proposed');
+
+      // The COUNT(*) query must NOT have been issued.
+      const countCall = mockDbQuery.mock.calls.find((c) => /COUNT\(\*\)/i.test(c[0]));
+      expect(countCall).toBeFalsy();
+    } finally {
+      if (ORIGINAL_LIMIT === undefined) delete process.env.AUTOFIX_DAILY_LIMIT;
+      else process.env.AUTOFIX_DAILY_LIMIT = ORIGINAL_LIMIT;
+    }
   });
 
   it('errors before any DB write when the failure has no linked spec code', async () => {

@@ -45,7 +45,17 @@ async function chatJson(req, deps = {}) {
 
   const content = response.choices[0]?.message?.content;
   if (!content) throw new Error('Empty LLM response');
-  return { content };
+
+  // Capture token usage when the API surfaces it. Downstream loggers
+  // multiply by per-model pricing to compute cost-per-fix. OpenAI always
+  // returns response.usage on a successful call; compatible gateways may
+  // omit it (e.g. some local proxies), in which case usage is null and
+  // observability falls back to length-based heuristics.
+  const u = response.usage;
+  const usage = u && (typeof u.prompt_tokens === 'number' || typeof u.completion_tokens === 'number')
+    ? { inputTokens: u.prompt_tokens ?? null, outputTokens: u.completion_tokens ?? null }
+    : null;
+  return { content, usage };
 }
 
 // Reset for tests — delegates to the shared helper's cache reset.

@@ -170,8 +170,8 @@ describe('autoFixVerifyService.verifyFix', () => {
 describe('autoFixVerifyService.markMerged', () => {
   it('verified -> merged: flips fix_attempts.status and test_failures.fix_status', async () => {
     const db = makeDb([
-      [/SELECT id, test_failure_id, status FROM fix_attempts/, {
-        rows: [{ id: 99, test_failure_id: 42, status: 'verified' }], rowCount: 1,
+      [/SELECT fa\.id, fa\.test_failure_id, fa\.status, tf\.project_id/, {
+        rows: [{ id: 99, test_failure_id: 42, status: 'verified', project_id: 7 }], rowCount: 1,
       }],
       [/UPDATE fix_attempts SET status = 'merged'/, { rows: [], rowCount: 1 }],
       [/UPDATE test_failures SET fix_status = 'resolved'/, { rows: [], rowCount: 1 }],
@@ -188,8 +188,8 @@ describe('autoFixVerifyService.markMerged', () => {
 
   it('pr_opened -> merged: also legal (skip-verify path)', async () => {
     const db = makeDb([
-      [/SELECT id, test_failure_id, status FROM fix_attempts/, {
-        rows: [{ id: 99, test_failure_id: 42, status: 'pr_opened' }], rowCount: 1,
+      [/SELECT fa\.id, fa\.test_failure_id, fa\.status, tf\.project_id/, {
+        rows: [{ id: 99, test_failure_id: 42, status: 'pr_opened', project_id: 7 }], rowCount: 1,
       }],
       [/UPDATE fix_attempts/, { rows: [], rowCount: 1 }],
       [/UPDATE test_failures/, { rows: [], rowCount: 1 }],
@@ -200,8 +200,8 @@ describe('autoFixVerifyService.markMerged', () => {
 
   it('refuses to merge from a non-mergeable state', async () => {
     const db = makeDb([
-      [/SELECT id, test_failure_id, status FROM fix_attempts/, {
-        rows: [{ id: 99, test_failure_id: 42, status: 'verify_failed' }], rowCount: 1,
+      [/SELECT fa\.id, fa\.test_failure_id, fa\.status, tf\.project_id/, {
+        rows: [{ id: 99, test_failure_id: 42, status: 'verify_failed', project_id: 7 }], rowCount: 1,
       }],
     ]);
     await expect(markMerged({ fixAttemptId: 99 }, { db, logger: silentLogger }))
@@ -213,7 +213,7 @@ describe('autoFixVerifyService.markMerged', () => {
 
   it('throws on missing row', async () => {
     const db = makeDb([
-      [/SELECT id, test_failure_id, status FROM fix_attempts/, { rows: [], rowCount: 0 }],
+      [/SELECT fa\.id, fa\.test_failure_id, fa\.status, tf\.project_id/, { rows: [], rowCount: 0 }],
     ]);
     await expect(markMerged({ fixAttemptId: 999 }, { db, logger: silentLogger }))
       .rejects.toThrow(/not found/);
