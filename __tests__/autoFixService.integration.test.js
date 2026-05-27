@@ -138,7 +138,9 @@ describe('autoFixService.proposeFix [real DB]', () => {
     expect(fa.rows[0].status).toBe('proposed');
     expect(fa.rows[0].new_code).toContain(PATCH_MARKER);
     expect(fa.rows[0].patch_diff).toContain(PATCH_MARKER);
-    expect(fa.rows[0].branch_name).toMatch(/^testforge\/autofix\/failure-\d+-/);
+    // Branch name now includes the attempt id so retries after verify_failed
+    // don't collide on `git checkout -b <branch>`. See autoFixService.buildBranchName.
+    expect(fa.rows[0].branch_name).toMatch(/^testforge\/autofix\/attempt-\d+-failure-\d+-/);
 
     // test_failures.fix_status was flipped by the atomic claim.
     const tf = await db.query(`SELECT fix_status FROM test_failures WHERE id = $1`, [failureId]);
