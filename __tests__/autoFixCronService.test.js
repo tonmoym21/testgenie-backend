@@ -16,7 +16,7 @@ jest.mock('pg', () => {
   return { Pool };
 });
 
-const { tick, findEligibleFailures } = require('../src/services/autoFixCronService');
+const { tick, findEligibleFailures, start, stop } = require('../src/services/autoFixCronService');
 
 const silentLogger = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
 
@@ -152,6 +152,33 @@ describe('autoFixCronService.tick', () => {
 
     expect(out.skipped).toBe(false);
     expect(db.query).toHaveBeenCalled();
+  });
+});
+
+describe('autoFixCronService.start', () => {
+  const ORIGINAL_ENV = process.env.AUTOFIX_CRON_ENABLED;
+  afterEach(() => {
+    // start() registers a real node-cron task on success — stop() unwinds
+    // it so a positive-path test in this describe can't leak a timer into
+    // the next describe.
+    stop();
+    if (ORIGINAL_ENV === undefined) delete process.env.AUTOFIX_CRON_ENABLED;
+    else process.env.AUTOFIX_CRON_ENABLED = ORIGINAL_ENV;
+  });
+
+  it('returns null and does NOT register a cron when AUTOFIX_CRON_ENABLED is unset', () => {
+    delete process.env.AUTOFIX_CRON_ENABLED;
+    const task = start({}, { logger: silentLogger });
+    expect(task).toBeNull();
+  });
+
+  it('registers a task when forced even with the env flag off', () => {
+    delete process.env.AUTOFIX_CRON_ENABLED;
+    const task = start({ force: true }, { logger: silentLogger });
+    expect(task).not.toBeNull();
+    // node-cron tasks expose .stop() — sanity check we got a real one back,
+    // not a stub.
+    expect(typeof task.stop).toBe('function');
   });
 });
 
