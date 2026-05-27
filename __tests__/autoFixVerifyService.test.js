@@ -148,6 +148,54 @@ describe('autoFixVerifyService.verifyFix', () => {
     expect(lastCheckout.args[1]).toBe('main');
   });
 
+  // Regression: on Windows path.join emits `tests\login.spec.ts`, and
+  // runPlaywright spawns with shell:true — the shell eats the backslash
+  // and Playwright sees `testslogin.spec.ts`, which matches nothing, so
+  // verify dies with "No tests found." The fix normalizes to POSIX
+  // separators at the boundary. This test asserts the spawn arg never
+  // contains a backslash, host OS irrespective.
+  it('passes a POSIX-separator spec path to Playwright (no backslashes)', async () => {
+    const runGit = makeRunGit({ 'rev-parse': 'main' });
+    const runPlaywright = makePlaywright({ exitCode: 0, stdout: '1 passed', stderr: '' });
+    const db = makeDb([
+      [/FROM fix_attempts/, { rows: [fixRow()], rowCount: 1 }],
+      [/UPDATE fix_attempts SET status = 'verified'/, { rows: [], rowCount: 1 }],
+    ]);
+
+    await verifyFix(
+      { fixAttemptId: 99, repo: '/tmp/r', base: 'main' },
+      { db, logger: silentLogger, runGit, runPlaywright },
+    );
+
+    expect(runPlaywright.calls).toHaveLength(1);
+    const args = runPlaywright.calls[0].args;
+    // No arg may contain a backslash — that would be the bug returning.
+    for (const a of args) expect(a).not.toMatch(/\\/);
+    // And the spec arg specifically uses forward slashes.
+    expect(args).toContain('tests/login.spec.ts');
+  });
+
+  // Regression companion: caller-supplied opts.specPath that already has
+  // backslashes (e.g. a Windows-side admin pasting a path from File
+  // Explorer) must also get normalized — not just the path.join branch.
+  it('normalizes backslashes in caller-supplied opts.specPath', async () => {
+    const runGit = makeRunGit({ 'rev-parse': 'main' });
+    const runPlaywright = makePlaywright({ exitCode: 0, stdout: '1 passed', stderr: '' });
+    const db = makeDb([
+      [/FROM fix_attempts/, { rows: [fixRow()], rowCount: 1 }],
+      [/UPDATE fix_attempts SET status = 'verified'/, { rows: [], rowCount: 1 }],
+    ]);
+
+    await verifyFix(
+      { fixAttemptId: 99, repo: '/tmp/r', base: 'main', specPath: 'tests\\nested\\login.spec.ts' },
+      { db, logger: silentLogger, runGit, runPlaywright },
+    );
+
+    const args = runPlaywright.calls[0].args;
+    for (const a of args) expect(a).not.toMatch(/\\/);
+    expect(args).toContain('tests/nested/login.spec.ts');
+  });
+
   it('refuses to verify a fix_attempts row not in proposed/pr_opened', async () => {
     const runGit = makeRunGit();
     const runPlaywright = makePlaywright({ exitCode: 0 });
