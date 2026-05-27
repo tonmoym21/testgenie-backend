@@ -107,6 +107,7 @@ describe('autoFixService.proposeFix', () => {
       { rows: [failureRow()], rowCount: 1 },             // loadFailureContext SELECT
       { rows: [{ id: 42 }], rowCount: 1 },               // atomic claim UPDATE ... RETURNING id
       { rows: [{ id: 99 }], rowCount: 1 },               // insertAttempt RETURNING id
+      { rows: [], rowCount: 1 },                         // branch_name UPDATE (attempt-id-suffixed)
       { rows: [], rowCount: 1 },                         // prompt_excerpt UPDATE
       { rows: [], rowCount: 1 },                         // finalizeAttempt status='proposed'
     ]);
@@ -117,7 +118,9 @@ describe('autoFixService.proposeFix', () => {
     expect(result.status).toBe('proposed');
     expect(result.fixAttemptId).toBe(99);
     expect(result.diff).toMatch(/^--- a\/login\.spec\.ts/);
-    expect(result.branchName).toMatch(/^testforge\/autofix\/failure-42-/);
+    // Branch name now includes the attempt id so retries don't collide on
+    // the same `failure-<id>-<sig>` slot (formerly wedged the retry loop).
+    expect(result.branchName).toMatch(/^testforge\/autofix\/attempt-99-failure-42-/);
 
     // Atomic claim was issued
     const claim = findCall(/UPDATE test_failures SET fix_status = 'fix_proposed'\s+WHERE id = \$1 AND fix_status = 'open'/);
@@ -155,6 +158,7 @@ describe('autoFixService.proposeFix', () => {
       { rows: [failureRow()], rowCount: 1 },
       { rows: [{ id: 42 }], rowCount: 1 },               // claim wins
       { rows: [{ id: 99 }], rowCount: 1 },               // insertAttempt
+      { rows: [], rowCount: 1 },                         // branch_name UPDATE
       { rows: [], rowCount: 1 },                         // finalizeAttempt status='failed'
       { rows: [], rowCount: 1 },                         // release claim
     ]);
@@ -178,6 +182,7 @@ describe('autoFixService.proposeFix', () => {
       { rows: [failureRow({ spec_code: same })], rowCount: 1 },
       { rows: [{ id: 42 }], rowCount: 1 },               // claim wins
       { rows: [{ id: 99 }], rowCount: 1 },               // insertAttempt
+      { rows: [], rowCount: 1 },                         // branch_name UPDATE
       { rows: [], rowCount: 1 },                         // prompt_excerpt UPDATE
       { rows: [], rowCount: 1 },                         // finalizeAttempt status='failed'
       { rows: [], rowCount: 1 },                         // release claim

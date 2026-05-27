@@ -69,17 +69,23 @@ async function proposeFix(failureId, opts = {}) {
     throw err;
   }
 
-  const branchName = buildBranchName(ctx);
-
+  // Two-step branch naming: insert the attempt first with branch_name NULL,
+  // then compute the branch using the attempt id so retries after a
+  // verify_failed don't collide on the same `failure-<id>-<sig>` name. The
+  // old form deadlocked the retry loop — second applyFix would hit
+  // "Branch testforge/autofix/failure-X-Y already exists" and never recover.
   const attemptId = await insertAttempt({
     failureId,
     triggeredBy: opts.triggeredBy || null,
     providerName: provider.name,
     model,
-    branchName,
+    branchName: null,
     promptExcerpt: null,
     status: 'patching',
   });
+  const branchName = buildBranchName(ctx, attemptId);
+  await db.query(`UPDATE fix_attempts SET branch_name = $2 WHERE id = $1`,
+    [attemptId, branchName]);
 
   // If anything below fails we must release the claim — otherwise this row
   // stays stuck at 'fix_proposed' with no actual proposal behind it, and a
@@ -238,9 +244,14 @@ async function finalizeAttempt(id, { status, patchDiff, errorMessage, newCode })
 // Helpers
 // ---------------------------------------------------------------------------
 
-function buildBranchName(ctx) {
+function buildBranchName(ctx, attemptId) {
   const sig = (ctx.signature || 'nosig').slice(0, 8);
-  return `testforge/autofix/failure-${ctx.failureId}-${sig}`;
+  // attemptId disambiguates retries of the same failure. Older callers that
+  // don't pass it still get a unique-per-failure name (the legacy shape) —
+  // safe for the single-attempt path that proposeFix used to emit.
+  return attemptId
+    ? `testforge/autofix/attempt-${attemptId}-failure-${ctx.failureId}-${sig}`
+    : `testforge/autofix/failure-${ctx.failureId}-${sig}`;
 }
 
 function truncate(s, max) {

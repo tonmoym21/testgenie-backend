@@ -565,6 +565,7 @@ const projectInsightsRoutes = safeRequire('./routes/projectInsights', 'projectIn
 const webhookRoutes = safeRequire('./routes/webhooks', 'webhooks');
 const apiSourceRoutes = safeRequire('./routes/apiSources', 'apiSources');
 const adminRoutes = safeRequire('./routes/admin', 'admin');
+const autofixRoutes = safeRequire('./routes/autofix', 'autofix');
 
 // ============================================================================
 // CORS — credentials: true so the HttpOnly refresh cookie flows on /auth/refresh
@@ -688,6 +689,7 @@ if (twoFactorRoutes) app.use('/api/auth/2fa', twoFactorRoutes);
 // Platform admin (cross-org). Mount early so a 401/403 is returned before
 // org-scoped routes get a chance to redirect on missing orgId.
 app.use('/api/admin', adminRoutes);
+if (autofixRoutes) app.use('/api/autofix', autofixRoutes);
 
 // Protected routes — specific paths first
 app.use('/api/projects', projectRoutes);
@@ -784,6 +786,15 @@ if (require.main === module) {
     require('./services/signupJanitor').start();
   } catch (err) {
     logger.warn({ err: err.message }, 'signup janitor failed to start (continuing)');
+  }
+  // Auto-fix loop: claim open test_failures rows, run propose -> apply -> verify.
+  // Gated by AUTOFIX_CRON_ENABLED=1 (default off — opt-in so dev boxes don't
+  // burn LLM credits the moment they touch the DB). Schedule overridable via
+  // AUTOFIX_CRON_SCHEDULE (default '*/15 * * * *').
+  try {
+    require('./services/autoFixCronService').start();
+  } catch (err) {
+    logger.warn({ err: err.message }, 'autofix cron failed to start (continuing)');
   }
 }
 

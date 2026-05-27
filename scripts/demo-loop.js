@@ -27,10 +27,20 @@
  *
  * Usage:
  *   node scripts/demo-loop.js
- *     [--db <url>]      defaults to postgresql://postgres:postgres@localhost:5432/testforge_test
- *     [--keep]          leave the temp git repo on disk for inspection
- *     [--open-pr]       run `gh pr create` (requires gh auth + a real remote)
- *     [--push]          push the branch (requires a real remote)
+ *     [--db <url>]         defaults to postgresql://postgres:postgres@localhost:5432/testforge_test
+ *     [--keep]             leave the temp git repo on disk for inspection
+ *     [--open-pr]          run `gh pr create` (requires gh auth + a real remote)
+ *     [--push]             push the branch (requires a real remote)
+ *     [--real-playwright]  bootstrap a Playwright workspace from the verify
+ *                          fixture (npm install + `playwright install
+ *                          chromium`) and run stage 7 against the REAL
+ *                          `npx playwright test` subprocess. Adds 30-60s
+ *                          on first run; idempotent on re-runs. Without
+ *                          this flag stage 7 keeps the deterministic stub.
+ *     [--quiet]            pipe (rather than inherit) the npm install and
+ *                          chromium install streams. Use for unattended /
+ *                          CI runs where the install firehose drowns the
+ *                          banners that are the demo's actual payload.
  *
  * Exits 0 on a complete loop, 1 on any stage failing.
  */
@@ -41,13 +51,15 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 
 function parseArgs(argv) {
-  const out = { dbUrl: null, keep: false, openPr: false, push: false };
+  const out = { dbUrl: null, keep: false, openPr: false, push: false, realPlaywright: false, quiet: false };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--db') out.dbUrl = argv[++i];
     else if (a === '--keep') out.keep = true;
     else if (a === '--open-pr') out.openPr = true;
     else if (a === '--push') out.push = true;
+    else if (a === '--real-playwright') out.realPlaywright = true;
+    else if (a === '--quiet') out.quiet = true;
     else if (a === '-h' || a === '--help') return null;
   }
   out.dbUrl = out.dbUrl || process.env.TEST_DB_URL ||
@@ -56,7 +68,40 @@ function parseArgs(argv) {
 }
 
 function usage() {
-  console.error('Usage: node scripts/demo-loop.js [--db <url>] [--keep] [--push] [--open-pr]');
+  console.error('Usage: node scripts/demo-loop.js [--db <url>] [--keep] [--push] [--open-pr] [--real-playwright] [--quiet]');
+}
+
+// Fixture-based Playwright workspace bootstrap. Same shape as the verify
+// service's real-Playwright integration test — copies the committed fixture
+// (package.json + playwright.config.ts), installs deps + chromium. The
+// fixture's specs are pure-JS arithmetic so this stays fast and doesn't
+// require a running app.
+const PLAYWRIGHT_FIXTURE = path.join(__dirname, '..', '__tests__', 'fixtures', 'playwright-repo');
+
+function bootstrapPlaywrightWorkspace(work, { quiet }) {
+  // Copy package.json + playwright.config.ts only — we want the demo's own
+  // tests/ directory (login.spec.ts) to live alongside, not the fixture's
+  // tests/{passing,failing}.spec.ts.
+  fs.copyFileSync(
+    path.join(PLAYWRIGHT_FIXTURE, 'package.json'),
+    path.join(work, 'package.json'),
+  );
+  fs.copyFileSync(
+    path.join(PLAYWRIGHT_FIXTURE, 'playwright.config.ts'),
+    path.join(work, 'playwright.config.ts'),
+  );
+  // 'inherit' shows live install output (great for watched demos). 'pipe'
+  // suppresses it so unattended / CI runs surface only the banners. Either
+  // way the timeout still applies and a non-zero exit throws.
+  const installStdio = quiet ? 'pipe' : 'inherit';
+  console.log('  installing @playwright/test (one-time, ~30-60s)...');
+  execFileSync('npm', ['install', '--no-audit', '--no-fund'], {
+    cwd: work, stdio: installStdio, shell: process.platform === 'win32', timeout: 5 * 60 * 1000,
+  });
+  console.log('  installing chromium (idempotent)...');
+  execFileSync('npx', ['playwright', 'install', 'chromium'], {
+    cwd: work, stdio: installStdio, shell: process.platform === 'win32', timeout: 5 * 60 * 1000,
+  });
 }
 
 function git(cwd, ...args) {
@@ -104,7 +149,12 @@ async function main() {
   );
   const scenarioId = sc.rows[0].id;
 
-  const ORIGINAL_SPEC = `import { test, expect } from '@playwright/test';
+  // The "narrative" spec used in --stub mode tells a real-app story but
+  // can't actually be run (no app server, no @playwright/test installed in
+  // the temp repo). When --real-playwright is set we swap to a pure-JS
+  // arithmetic spec so `npx playwright test` can really execute it. The
+  // narrative around stages 1-6 is unaffected — only the file BODY changes.
+  const NARRATIVE_ORIGINAL = `import { test, expect } from '@playwright/test';
 
 test('user can log in', async ({ page }) => {
   await page.goto('/login');
@@ -114,6 +164,15 @@ test('user can log in', async ({ page }) => {
   await expect(page).toHaveURL(/\\/dashboard/);
 });
 `;
+  const RUNNABLE_ORIGINAL = `import { test, expect } from '@playwright/test';
+
+// Self-contained spec used by --real-playwright. Fails deterministically
+// to mirror the failure that lineageService just recorded.
+test('user can log in', () => {
+  expect(1 + 1).toBe(3);
+});
+`;
+  const ORIGINAL_SPEC = args.realPlaywright ? RUNNABLE_ORIGINAL : NARRATIVE_ORIGINAL;
   const pt = await db.query(
     `INSERT INTO playwright_tests (project_id, scenario_id, story_id, test_name, file_name, code)
      VALUES ($1, $2, $3, 'login happy', 'login.spec.ts', $4) RETURNING id`,
@@ -182,10 +241,15 @@ test('user can log in', async ({ page }) => {
   // Stage 4: simulate the LLM proposal step
   // -------------------------------------------------------------------------
   banner('4. simulate LLM patch (skipped real OpenAI call)');
-  const PATCHED_SPEC = ORIGINAL_SPEC.replace(
-    "await page.click('#login');",
-    "await page.getByRole('button', { name: /log in/i }).click();"
-  );
+  // Mirror the spec swap from stage 1: narrative mode patches the role
+  // locator, --real-playwright mode flips the failing assertion to a
+  // passing one so the real subprocess in stage 7 exits 0.
+  const PATCHED_SPEC = args.realPlaywright
+    ? ORIGINAL_SPEC.replace('expect(1 + 1).toBe(3);', 'expect(1 + 1).toBe(2);')
+    : ORIGINAL_SPEC.replace(
+        "await page.click('#login');",
+        "await page.getByRole('button', { name: /log in/i }).click();"
+      );
 
   // Atomic claim (same SQL as autoFixService.proposeFix's claim step).
   const claim = await db.query(
@@ -224,11 +288,21 @@ test('user can log in', async ({ page }) => {
     fs.mkdirSync(bare);
     git(bare, 'init', '--bare', '--initial-branch=main');
   }
+  // Real-Playwright mode needs @playwright/test + a chromium binary in the
+  // temp repo BEFORE the first commit — otherwise the install fills the
+  // repo with hundreds of MB of node_modules right after `git add .`. Run
+  // bootstrap first, gitignore node_modules, then add+commit.
+  if (args.realPlaywright) {
+    bootstrapPlaywrightWorkspace(work, { quiet: args.quiet });
+  }
   git(work, 'init', '--initial-branch=main');
   git(work, 'config', 'user.email', 'demo@autofix.local');
   git(work, 'config', 'user.name', 'TestForge demo');
   git(work, 'config', 'commit.gpgsign', 'false');
   git(work, 'config', 'core.autocrlf', 'false');
+  if (args.realPlaywright) {
+    fs.writeFileSync(path.join(work, '.gitignore'), 'node_modules/\n', 'utf8');
+  }
   fs.mkdirSync(path.join(work, 'tests'));
   fs.writeFileSync(path.join(work, 'tests', 'login.spec.ts'), ORIGINAL_SPEC, 'utf8');
   git(work, 'add', '.');
@@ -262,18 +336,28 @@ test('user can log in', async ({ page }) => {
   // -------------------------------------------------------------------------
   // Stage 7: verify (the strategist's "yes I want this" gate)
   // -------------------------------------------------------------------------
-  banner('7. autoFixVerifyService.verifyFix (simulated Playwright pass)');
+  banner(args.realPlaywright
+    ? '7. autoFixVerifyService.verifyFix (REAL `npx playwright test` spawn)'
+    : '7. autoFixVerifyService.verifyFix (simulated Playwright pass)');
   const { verifyFix, markMerged } = require('../src/services/autoFixVerifyService');
-  // The demo can't actually run Playwright (no @playwright/test in the temp
-  // repo, no Chromium install), so we inject a deterministic fake. The
-  // production CLI scripts/autofix-verify.js does the real spawn.
-  const fakePlaywright = (_cwd, _args) => ({ exitCode: 0, stdout: '1 passed (1.2s)', stderr: '' });
+  // Without --real-playwright the temp repo has no @playwright/test and no
+  // chromium, so inject a deterministic fake. With the flag, stage 5
+  // bootstrapped the workspace and we let verifyFix run the real spawn.
+  const verifyDeps = args.realPlaywright
+    ? {}
+    : {
+        runPlaywright: (_cwd, _args) => ({ exitCode: 0, stdout: '1 passed (1.2s)', stderr: '' }),
+      };
   const verifyResult = await verifyFix(
     { fixAttemptId, repo: work, base: 'main' },
-    { runPlaywright: fakePlaywright },
+    verifyDeps,
   );
   console.log(`  status=${verifyResult.status} exit=${verifyResult.exitCode}`);
-  console.log('  (Playwright stubbed — see scripts/autofix-verify.js for the real spawn.)');
+  if (args.realPlaywright) {
+    console.log('  (Real `npx playwright test` ran against the patched spec on the agent branch.)');
+  } else {
+    console.log('  (Playwright stubbed — pass --real-playwright to run the real spawn.)');
+  }
 
   // -------------------------------------------------------------------------
   // Stage 8: PR merged (simulated) -> closes the lifecycle
