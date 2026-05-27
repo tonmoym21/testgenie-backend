@@ -143,8 +143,16 @@ async function verifyFix(opts, deps = {}) {
   }
   const repo = path.resolve(repoArg);
   const specDir = (cfg && cfg.spec_dir) || 'tests';
-  const specRel = opts.specPath || (row.test_file_name ? path.join(specDir, row.test_file_name) : null);
-  if (!specRel) throw new Error('Cannot verify: no specPath and no test_file_name in DB');
+  const specRelRaw = opts.specPath || (row.test_file_name ? path.join(specDir, row.test_file_name) : null);
+  if (!specRelRaw) throw new Error('Cannot verify: no specPath and no test_file_name in DB');
+  // Playwright treats the spec arg as a regex/glob. On Windows, path.join
+  // emits `tests\foo.spec.ts` and runPlaywright spawns with `shell: true`
+  // (see top of file) — the shell then eats the backslash as an escape
+  // char, the argument that reaches Playwright is `testsfoo.spec.ts`, it
+  // matches nothing, and verify dies with "No tests found." Normalizing
+  // to POSIX separators here is the boundary fix; also defends against a
+  // caller passing opts.specPath with backslashes directly.
+  const specRel = specRelRaw.replace(/\\/g, '/');
 
   // Capture the current branch so we can return regardless of outcome.
   const baseBranch = opts.base || runGit(repo, ['rev-parse', '--abbrev-ref', 'HEAD']);
