@@ -348,11 +348,58 @@ async function markWontFix(id, opts = {}, deps = {}) {
   return getFailureDetail(failureId, { db });
 }
 
+/**
+ * Heavy-payload accessor for a single fix_attempts row — returns the
+ * three columns getFailureDetail deliberately excluded: patch_diff,
+ * new_code, prompt_excerpt. Used by the dashboard "view diff" modal.
+ *
+ * Lookup is keyed on BOTH failureId AND attemptId (test_failure_id
+ * matches the URL's :failureId segment). That's defense in depth:
+ * a buggy frontend that links the wrong failureId to an attempt
+ * gets a clean 404 instead of returning data from a different
+ * failure's lineage to the wrong audit context. The platform-admin
+ * gate is the real security control; this just keeps audit logs honest.
+ *
+ * Also returns a few lightweight context fields (status, model_name,
+ * branch_name) so the modal can render a header without needing to
+ * cross-reference against getFailureDetail's response.
+ *
+ * @param {number} failureId   the failure that owns the attempt
+ * @param {number} attemptId   the fix_attempts row to read
+ * @param {object?} deps
+ * @returns {Promise<{id, test_failure_id, status, model_name, branch_name,
+ *                    patch_diff, new_code, prompt_excerpt}>}
+ * @throws {NotFoundError}     when either id is invalid or the attempt
+ *                             doesn't exist under the given failure
+ */
+async function getAttemptDiff(failureId, attemptId, deps = {}) {
+  const db = deps.db || require('../db');
+  const fid = Number(failureId);
+  const aid = Number(attemptId);
+  if (!Number.isFinite(fid) || fid <= 0 || !Number.isFinite(aid) || aid <= 0) {
+    throw new NotFoundError('fix attempt');
+  }
+
+  const r = await db.query(
+    `SELECT id::int AS id, test_failure_id::int AS test_failure_id,
+            status, model_provider, model_name, branch_name,
+            patch_diff, new_code, prompt_excerpt
+       FROM fix_attempts
+      WHERE id = $1 AND test_failure_id = $2`,
+    [aid, fid]
+  );
+  if (r.rows.length === 0) {
+    throw new NotFoundError('fix attempt');
+  }
+  return r.rows[0];
+}
+
 module.exports = {
   listFailures,
   getFailureDetail,
   reopenFailure,
   markWontFix,
+  getAttemptDiff,
   // exported for tests
   FIX_STATUSES,
   DEFAULT_LIMIT,

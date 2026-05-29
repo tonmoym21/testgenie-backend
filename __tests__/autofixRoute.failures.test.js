@@ -21,6 +21,7 @@ jest.mock('../src/services/autoFixFailuresService', () => ({
   getFailureDetail: jest.fn(),
   reopenFailure: jest.fn(),
   markWontFix: jest.fn(),
+  getAttemptDiff: jest.fn(),
 }));
 
 jest.mock('pg', () => {
@@ -255,5 +256,52 @@ describe('POST /api/autofix/failures/:id/wont_fix', () => {
     const res = await request(app).post('/api/autofix/failures/42/wont_fix');
     expect(res.status).toBe(403);
     expect(autoFixFailuresService.markWontFix).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /api/autofix/failures/:failureId/attempts/:attemptId/diff', () => {
+  let app;
+  beforeAll(() => { app = buildApp(); });
+  beforeEach(() => {
+    autoFixFailuresService.getAttemptDiff.mockReset();
+    mockIsAdmin = true;
+  });
+
+  it('200 + payload pass-through; passes both ids to the service in order', async () => {
+    const payload = {
+      id: 99, test_failure_id: 7, status: 'verified',
+      model_name: 'gpt-4o', branch_name: 'b',
+      patch_diff: '--- a\n+++ b', new_code: 'x', prompt_excerpt: 'y',
+    };
+    autoFixFailuresService.getAttemptDiff.mockResolvedValueOnce(payload);
+
+    const res = await request(app).get('/api/autofix/failures/7/attempts/99/diff');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(payload);
+    // Route passes (failureId, attemptId) — same order the URL has them.
+    expect(autoFixFailuresService.getAttemptDiff).toHaveBeenCalledWith('7', '99');
+  });
+
+  it('404 NOT_FOUND when the service throws NotFoundError', async () => {
+    autoFixFailuresService.getAttemptDiff.mockRejectedValueOnce(new NotFoundError('fix attempt'));
+    const res = await request(app).get('/api/autofix/failures/7/attempts/99/diff');
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe('NOT_FOUND');
+    expect(res.body.error.message).toMatch(/fix attempt not found/i);
+  });
+
+  it('401 without auth', async () => {
+    const res = await request(app)
+      .get('/api/autofix/failures/7/attempts/99/diff')
+      .set('x-test-noauth', '1');
+    expect(res.status).toBe(401);
+    expect(autoFixFailuresService.getAttemptDiff).not.toHaveBeenCalled();
+  });
+
+  it('403 for non-admin', async () => {
+    mockIsAdmin = false;
+    const res = await request(app).get('/api/autofix/failures/7/attempts/99/diff');
+    expect(res.status).toBe(403);
+    expect(autoFixFailuresService.getAttemptDiff).not.toHaveBeenCalled();
   });
 });
