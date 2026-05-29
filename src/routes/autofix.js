@@ -38,6 +38,7 @@ const autoFixVerifyService = require('../services/autoFixVerifyService');
 const autoFixCronService = require('../services/autoFixCronService');
 const autoFixMetricsService = require('../services/autoFixMetricsService');
 const autoFixFailuresService = require('../services/autoFixFailuresService');
+const autoFixProjectConfigService = require('../services/autoFixProjectConfigService');
 
 const router = Router();
 
@@ -217,5 +218,52 @@ router.get('/failures/:failureId/attempts/:attemptId/diff', async (req, res, nex
     res.json(result);
   } catch (err) { next(err); }
 });
+
+// Per-project autofix configuration (PR #32). Today: just daily_limit
+// (override of the global AUTOFIX_DAILY_LIMIT env). Schema designed
+// to grow — when we add max_retries_per_failure or enabled toggle,
+// they get extra fields on the same GET/PUT pair.
+//
+//   GET  /api/autofix/projects/:projectId/config
+//        -> { projectId, dailyLimit, effectiveDailyLimit, envDailyLimit, createdAt, updatedAt }
+//
+//   PUT  /api/autofix/projects/:projectId/config
+//        body: { dailyLimit: <int>=0 | null }
+//        -> refreshed read shape
+
+// Upper bound is generous (2e9 ≈ INT max) — the constraint at the DB
+// is daily_limit >= 0; the upper guard here is only to keep pg from
+// throwing a "integer out of range" surfaced as 500. 0 is a legal
+// explicit value meaning "disable autofix for this tenant"
+// (mirrors AUTOFIX_DAILY_LIMIT=0 env semantics).
+const projectConfigBody = z.object({
+  dailyLimit: z.union([
+    z.number().int().min(0).max(2_000_000_000),
+    z.null(),
+  ]),
+});
+
+router.get('/projects/:projectId/config', async (req, res, next) => {
+  try {
+    const result = await autoFixProjectConfigService.getConfig(req.params.projectId);
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
+router.put(
+  '/projects/:projectId/config',
+  adminMutationLimiter,
+  validate(projectConfigBody),
+  async (req, res, next) => {
+    try {
+      const result = await autoFixProjectConfigService.upsertConfig(
+        req.params.projectId,
+        req.body,
+        { triggeredBy: req.user && req.user.id },
+      );
+      res.json(result);
+    } catch (err) { next(err); }
+  }
+);
 
 module.exports = router;
