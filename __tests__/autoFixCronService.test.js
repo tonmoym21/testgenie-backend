@@ -16,7 +16,8 @@ jest.mock('pg', () => {
   return { Pool };
 });
 
-const { tick, findEligibleFailures, start, stop } = require('../src/services/autoFixCronService');
+const { tick, findEligibleFailures, start, stop, defaultTryClusterLock,
+  ADVISORY_LOCK_NS, ADVISORY_LOCK_ID } = require('../src/services/autoFixCronService');
 
 const silentLogger = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
 
@@ -142,6 +143,105 @@ describe('autoFixCronService.tick', () => {
     }
   });
 
+  // ------------------------------------------------------------------
+  // Cluster-lock gate (pg_try_advisory_lock). Same idea as the
+  // in-process mutex above, but cross-instance — needed once the
+  // backend runs on >1 pod. tryClusterLock returns a release fn on
+  // success, null when another instance holds the lock.
+  // ------------------------------------------------------------------
+
+  it('cluster overlap: tryClusterLock returns null -> skip with scope=cluster', async () => {
+    process.env.AUTOFIX_CRON_ENABLED = '1';
+    const db = makeDb([1, 2]);
+    const proposeFix = jest.fn();
+    const applyFix = jest.fn();
+    const verifyFix = jest.fn();
+    // Simulate: another pod holds the advisory lock right now.
+    const tryClusterLock = jest.fn().mockResolvedValue(null);
+
+    const out = await tick({}, { db, logger: silentLogger, proposeFix, applyFix, verifyFix, tryClusterLock });
+
+    expect(out).toEqual({ skipped: true, reason: 'overlap', scope: 'cluster', processed: 0, results: [] });
+    // Critical: no DB read, no LLM call when the lock isn't ours.
+    expect(db.query).not.toHaveBeenCalled();
+    expect(proposeFix).not.toHaveBeenCalled();
+    expect(tryClusterLock).toHaveBeenCalledTimes(1);
+  });
+
+  it('cluster lock acquired: release fn fires after the tick completes', async () => {
+    process.env.AUTOFIX_CRON_ENABLED = '1';
+    const db = makeDb([5]);
+    const proposeFix = jest.fn().mockResolvedValue({ fixAttemptId: 1, status: 'failed' });
+    const release = jest.fn().mockResolvedValue(undefined);
+    const tryClusterLock = jest.fn().mockResolvedValue(release);
+
+    const out = await tick({}, { db, logger: silentLogger, proposeFix,
+      applyFix: jest.fn(), verifyFix: jest.fn(), tryClusterLock });
+
+    expect(out.skipped).toBe(false);
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it('cluster lock acquired: release fn STILL fires when the tick body throws', async () => {
+    // Defense-in-depth: if findEligibleFailures explodes (DB blip mid-tick),
+    // we MUST release the lock or every subsequent tick on every pod
+    // skips with reason:'cluster' until pg auto-reclaims on session end.
+    process.env.AUTOFIX_CRON_ENABLED = '1';
+    const db = { query: jest.fn().mockRejectedValue(new Error('connection lost mid-tick')) };
+    const release = jest.fn().mockResolvedValue(undefined);
+    const tryClusterLock = jest.fn().mockResolvedValue(release);
+
+    await expect(tick({}, { db, logger: silentLogger, proposeFix: jest.fn(),
+      applyFix: jest.fn(), verifyFix: jest.fn(), tryClusterLock })).rejects.toThrow(/connection lost/);
+
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it('cluster lock release failure does NOT mask the tick result', async () => {
+    // A flaky pg_advisory_unlock must not turn a successful tick into
+    // an error from the caller's POV — pg auto-releases session locks
+    // when the client is destroyed, so a leaked unlock is recoverable.
+    process.env.AUTOFIX_CRON_ENABLED = '1';
+    const db = makeDb([8]);
+    const proposeFix = jest.fn().mockResolvedValue({ fixAttemptId: 1, status: 'failed' });
+    const release = jest.fn().mockRejectedValue(new Error('unlock blew up'));
+    const tryClusterLock = jest.fn().mockResolvedValue(release);
+
+    const out = await tick({}, { db, logger: silentLogger, proposeFix,
+      applyFix: jest.fn(), verifyFix: jest.fn(), tryClusterLock });
+
+    // The tick still reports its real outcome — failure was logged + swallowed.
+    expect(out.skipped).toBe(false);
+    expect(out.processed).toBe(1);
+  });
+
+  it('in-process mutex fires BEFORE the cluster lock (fast path — no DB round-trip)', async () => {
+    // Single-instance deploys should never pay the advisory-lock cost
+    // when overlap is already obvious from this process.
+    process.env.AUTOFIX_CRON_ENABLED = '1';
+    const db = makeDb([1]);
+    let releaseFirst;
+    const proposeFix = jest.fn()
+      .mockImplementationOnce(() => new Promise((resolve) => { releaseFirst = () => resolve({ fixAttemptId: 1, status: 'failed' }); }))
+      .mockResolvedValue({ fixAttemptId: 2, status: 'failed' });
+    const tryClusterLock = jest.fn().mockResolvedValue(async () => {});
+    const deps = { db, logger: silentLogger, proposeFix, applyFix: jest.fn(), verifyFix: jest.fn(), tryClusterLock };
+
+    const first = tick({}, deps);
+    await new Promise((r) => setImmediate(r));
+
+    try {
+      const second = await tick({}, deps);
+      expect(second.scope).toBe('process');
+      // tryClusterLock was called ONCE — for the first tick only. The
+      // second hit the in-process gate and never reached the lock query.
+      expect(tryClusterLock).toHaveBeenCalledTimes(1);
+    } finally {
+      releaseFirst();
+      await first;
+    }
+  });
+
   it('respects opts.force when env flag is off', async () => {
     delete process.env.AUTOFIX_CRON_ENABLED;
     const db = makeDb([]);
@@ -179,6 +279,79 @@ describe('autoFixCronService.start', () => {
     // node-cron tasks expose .stop() — sanity check we got a real one back,
     // not a stub.
     expect(typeof task.stop).toBe('function');
+  });
+});
+
+describe('autoFixCronService.defaultTryClusterLock', () => {
+  // Fake client that mirrors the pg pool client's surface we use.
+  function makeClient(lockResult) {
+    const calls = [];
+    let released = false;
+    return {
+      released: () => released,
+      calls,
+      query: jest.fn(async (sql, params) => {
+        calls.push({ sql, params });
+        if (/pg_try_advisory_lock/.test(sql)) {
+          return { rows: [{ locked: lockResult }], rowCount: 1 };
+        }
+        if (/pg_advisory_unlock/.test(sql)) {
+          return { rows: [{ pg_advisory_unlock: true }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+      }),
+      release: jest.fn(() => { released = true; }),
+    };
+  }
+
+  it('returns a no-op release when db.getClient is missing (unit-test stubs)', async () => {
+    const release = await defaultTryClusterLock({ query: () => {} });
+    expect(typeof release).toBe('function');
+    // Calling it must not throw.
+    await release();
+  });
+
+  it('acquires the lock with the documented key, returns a release fn', async () => {
+    const client = makeClient(true);
+    const db = { getClient: jest.fn().mockResolvedValue(client) };
+
+    const release = await defaultTryClusterLock(db);
+    expect(typeof release).toBe('function');
+
+    // pg_try_advisory_lock called with (ns, id).
+    const tryCall = client.calls.find((c) => /pg_try_advisory_lock/.test(c.sql));
+    expect(tryCall.params).toEqual([ADVISORY_LOCK_NS, ADVISORY_LOCK_ID]);
+    // Client NOT released yet — it must be held until the caller releases.
+    expect(client.released()).toBe(false);
+
+    await release();
+
+    // After release: unlock fired with same key, client returned to pool.
+    const unlockCall = client.calls.find((c) => /pg_advisory_unlock/.test(c.sql));
+    expect(unlockCall.params).toEqual([ADVISORY_LOCK_NS, ADVISORY_LOCK_ID]);
+    expect(client.released()).toBe(true);
+  });
+
+  it('returns null AND releases the client when the lock is already held', async () => {
+    const client = makeClient(false);
+    const db = { getClient: jest.fn().mockResolvedValue(client) };
+
+    const result = await defaultTryClusterLock(db);
+    expect(result).toBeNull();
+    // Critical pool-leak guard: client returned to pool even though we
+    // didn't get the lock.
+    expect(client.released()).toBe(true);
+  });
+
+  it('releases the client when the try-lock query itself throws', async () => {
+    const client = {
+      query: jest.fn().mockRejectedValue(new Error('connection reset')),
+      release: jest.fn(),
+    };
+    const db = { getClient: jest.fn().mockResolvedValue(client) };
+
+    await expect(defaultTryClusterLock(db)).rejects.toThrow(/connection reset/);
+    expect(client.release).toHaveBeenCalledTimes(1);
   });
 });
 
