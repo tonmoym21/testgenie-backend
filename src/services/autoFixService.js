@@ -51,27 +51,34 @@ function getEnvDailyLimit() {
 const getDailyLimit = getEnvDailyLimit;
 
 /**
- * Resolve the effective daily limit for ONE project. Reads the
- * per-project override from project_autofix_configs if present,
- * otherwise falls back to the env-level default. The override wins
- * even when 0 (explicit "disabled for this tenant" is meaningful).
+ * Resolve the per-project autofix knobs in ONE query. Returns:
+ *   {
+ *     dailyLimit: number,     effective limit (override or env)
+ *     enabled:    boolean     false = autofix paused for this tenant
+ *                             (PR #33). Defaults to TRUE when no config
+ *                             row exists, preserving pre-#33 behavior.
+ *   }
  *
- * NULL daily_limit in the row means "use env default" — same semantics
- * as having no row at all. Lets ops insert a row with daily_limit=NULL
- * + a future enabled flag without forcing them to also pick a limit
- * value they don't care about.
+ * Single SELECT instead of two so proposeFix's quota check stays at
+ * one round-trip when a config row is absent (the common case).
+ *
+ * daily_limit precedence:
+ *   row exists AND daily_limit IS NOT NULL  →  row value (including 0)
+ *   row exists AND daily_limit IS NULL      →  env default
+ *   no row                                   →  env default
  */
-async function resolveDailyLimit(projectId, deps = {}) {
+async function resolveProjectConfig(projectId, deps = {}) {
   const dbRef = deps.db || db;
   const r = await dbRef.query(
-    `SELECT daily_limit FROM project_autofix_configs WHERE project_id = $1`,
+    `SELECT daily_limit, enabled FROM project_autofix_configs WHERE project_id = $1`,
     [projectId]
   );
-  if (r.rows.length === 0 || r.rows[0].daily_limit == null) {
-    return getEnvDailyLimit();
-  }
-  return r.rows[0].daily_limit;
+  const row = r.rows[0];
+  const dailyLimit = (row && row.daily_limit != null) ? row.daily_limit : getEnvDailyLimit();
+  const enabled = row ? row.enabled : true;
+  return { dailyLimit, enabled };
 }
+
 
 /**
  * Count fix_attempts created in the last 24h that belong to this project.
@@ -123,16 +130,28 @@ async function proposeFix(failureId, opts = {}) {
     throw new Error(`Failure ${failureId} has no linked spec code — nothing to patch`);
   }
 
-  // Per-project daily quota check. Runs BEFORE the claim — a denied request
-  // must not flip fix_status away from 'open', otherwise we leak the row
-  // out of the eligibility pool without doing any work. Skipped when the
-  // limit is 0 (CI / e2e demos that explicitly disable the gate).
-  //
-  // Resolution priority (highest first):
-  //   1. project_autofix_configs.daily_limit (PR #32 — per-tenant override)
-  //   2. AUTOFIX_DAILY_LIMIT env var
-  //   3. DEFAULT_DAILY_LIMIT_PER_PROJECT constant (20)
-  const dailyLimit = await resolveDailyLimit(ctx.projectId);
+  // Per-project autofix config — both the daily quota and the enabled
+  // toggle from PR #33. Single SELECT so the common case (no config
+  // row) stays at one round-trip.
+  const { dailyLimit, enabled } = await resolveProjectConfig(ctx.projectId);
+
+  // Enabled toggle (PR #33). Must come BEFORE the claim — same
+  // reasoning as the quota path: refusing to act on a row must not
+  // flip its fix_status. 409 CONFLICT because the request is
+  // well-formed and authorized, the resource just isn't in a state
+  // where autofix can act on it.
+  if (!enabled) {
+    logger.warn({ event: 'autofix.disabled_skip', projectId: ctx.projectId, failureId },
+      'autofix: project has autofix disabled, refusing');
+    // Typed code (not generic CONFLICT) so the UI can render
+    // "Re-enable autofix" — mirrors AUTOFIX_QUOTA_EXCEEDED in PR #23.
+    throw new ApiError(
+      409,
+      'AUTOFIX_DISABLED',
+      `Auto-fix is disabled for project ${ctx.projectId}. ` +
+      `Re-enable via PUT /api/autofix/projects/${ctx.projectId}/config { enabled: true }.`
+    );
+  }
   if (dailyLimit > 0) {
     const used = await countRecentAttempts(ctx.projectId);
     if (used >= dailyLimit) {
@@ -387,4 +406,4 @@ function truncate(s, max) {
   return s.length > max ? s.slice(0, max) : s;
 }
 
-module.exports = { proposeFix, countRecentAttempts, getDailyLimit, getEnvDailyLimit, resolveDailyLimit };
+module.exports = { proposeFix, countRecentAttempts, getDailyLimit, getEnvDailyLimit, resolveProjectConfig };

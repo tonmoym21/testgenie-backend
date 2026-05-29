@@ -365,4 +365,14 @@ describe('autoFixCronService.findEligibleFailures', () => {
     expect(sql).toMatch(/fix_status\s*=\s*'open'/);
     expect(sql).toMatch(/last_test_id IS NOT NULL/);
   });
+
+  it('LEFT JOINs project_autofix_configs and filters disabled projects out', async () => {
+    // Pins the no-row-means-enabled default — dropping COALESCE would
+    // break every project that doesn't have a config row.
+    const db = makeDb([]);
+    await findEligibleFailures(db, 5);
+    const sql = db.query.mock.calls[0][0];
+    expect(sql).toMatch(/LEFT JOIN project_autofix_configs pac/);
+    expect(sql).toMatch(/COALESCE\(pac\.enabled, TRUE\) = TRUE/);
+  });
 });

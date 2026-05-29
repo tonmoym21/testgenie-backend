@@ -114,12 +114,16 @@ function isEnabled() {
  * ones a human user most likely just hit and is waiting on.
  */
 async function findEligibleFailures(db, limit) {
+  // COALESCE(enabled, TRUE) treats "no config row" as enabled — keeps
+  // projects that predate the configs table eligible by default.
   const r = await db.query(
     `SELECT tf.id
        FROM test_failures tf
        JOIN project_repo_configs prc ON prc.project_id = tf.project_id
+       LEFT JOIN project_autofix_configs pac ON pac.project_id = tf.project_id
       WHERE tf.fix_status = 'open'
         AND tf.last_test_id IS NOT NULL
+        AND COALESCE(pac.enabled, TRUE) = TRUE
       ORDER BY tf.last_seen_at DESC NULLS LAST
       LIMIT $1`,
     [limit]

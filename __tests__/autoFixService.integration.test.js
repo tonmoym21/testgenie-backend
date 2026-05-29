@@ -257,4 +257,40 @@ describe('autoFixService.proposeFix [real DB]', () => {
       else process.env.AUTOFIX_DAILY_LIMIT = ORIGINAL_LIMIT;
     }
   });
+
+  // PR #33 — real-DB version of the enabled-toggle gate. Pins both
+  // the upsert wiring and the resolveProjectConfig read against
+  // actual Postgres (catches BOOLEAN typing / DEFAULT semantics that
+  // the mocked unit test wouldn't).
+  it('enabled toggle: rejects with 409 AUTOFIX_DISABLED when project_autofix_configs.enabled=false', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    // Disable autofix for this project explicitly.
+    await db.query(
+      `INSERT INTO project_autofix_configs (project_id, daily_limit, enabled)
+       VALUES ($1, NULL, false)
+       ON CONFLICT (project_id) DO UPDATE SET enabled = EXCLUDED.enabled`,
+      [seed.projectId]
+    );
+
+    try {
+      const failureId = await seedOpenFailure({ signature: 'disabled-gate-test' });
+      mockLlmCreate.mockReset();
+
+      await expect(autoFixService.proposeFix(failureId)).rejects.toMatchObject({
+        statusCode: 409,
+        code: 'AUTOFIX_DISABLED',
+      });
+
+      // Same safety invariant as the quota path: a refused request
+      // leaves fix_status='open' so the row remains eligible if/when
+      // ops re-enable autofix.
+      const tf = await db.query(`SELECT fix_status FROM test_failures WHERE id = $1`, [failureId]);
+      expect(tf.rows[0].fix_status).toBe('open');
+      expect(mockLlmCreate).not.toHaveBeenCalled();
+    } finally {
+      // Clean up so this test doesn't permanently disable autofix
+      // for the shared project_id (would break subsequent tests).
+      await db.query(`DELETE FROM project_autofix_configs WHERE project_id = $1`, [seed.projectId]);
+    }
+  });
 });

@@ -213,7 +213,7 @@ describe('autoFixService.proposeFix', () => {
     try {
       scriptDb([
         { rows: [failureRow()], rowCount: 1 },           // loadFailureContext
-        { rows: [], rowCount: 0 },                       // resolveDailyLimit — env default (5)
+        { rows: [], rowCount: 0 },                       // resolveProjectConfig — no row → env default + enabled=true
         { rows: [{ n: 5 }], rowCount: 1 },               // quota check — exactly at limit
       ]);
 
@@ -277,6 +277,37 @@ describe('autoFixService.proposeFix', () => {
     // Critical: no claim issued, no fix_attempts row inserted, no LLM call.
     expect(mockLlmCreate).not.toHaveBeenCalled();
     const claim = mockDbQuery.mock.calls.find((c) => /UPDATE test_failures SET fix_status = 'fix_proposed'/.test(c[0]));
+    expect(claim).toBeFalsy();
+  });
+
+  // PR #33 — per-project enabled toggle. When a project has
+  // project_autofix_configs.enabled=false, manual /propose must refuse
+  // cleanly with 409 AUTOFIX_DISABLED rather than running the LLM.
+  // The cron path is covered separately in autoFixCronService tests
+  // (findEligibleFailures filters those projects out at the SQL layer).
+  it('rejects with 409 AUTOFIX_DISABLED when the project has enabled=false', async () => {
+    scriptDb([
+      { rows: [failureRow()], rowCount: 1 },             // loadFailureContext
+      // resolveProjectConfig returns enabled=false → proposeFix throws BEFORE quota.
+      { rows: [{ daily_limit: null, enabled: false }], rowCount: 1 },
+    ]);
+
+    await expect(autoFixService.proposeFix(42)).rejects.toMatchObject({
+      statusCode: 409,
+      code: 'AUTOFIX_DISABLED',
+      message: expect.stringMatching(/disabled for project/i),
+    });
+
+    // No quota check, no claim, no LLM call, no fix_attempts INSERT.
+    // The disabled check runs BEFORE the quota SELECT — if it ran
+    // after, a disabled project would still cost an extra round-trip
+    // per refusal.
+    const countCall = mockDbQuery.mock.calls.find((c) => /COUNT\(\*\)/i.test(c[0]));
+    expect(countCall).toBeFalsy();
+    expect(mockLlmCreate).not.toHaveBeenCalled();
+    const claim = mockDbQuery.mock.calls.find(
+      (c) => /UPDATE test_failures SET fix_status = 'fix_proposed'/.test(c[0])
+    );
     expect(claim).toBeFalsy();
   });
 });
