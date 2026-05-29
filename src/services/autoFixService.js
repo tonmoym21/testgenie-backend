@@ -32,12 +32,45 @@ const DEFAULT_MODEL_BY_PROVIDER = {
 // the gate entirely (CI / e2e demo sessions).
 const DEFAULT_DAILY_LIMIT_PER_PROJECT = 20;
 
-function getDailyLimit() {
+// Env-level default, used when no per-project override exists in
+// project_autofix_configs. Kept as a separate fn so callers (and
+// tests) can resolve "what would the limit be without any override"
+// without going through the DB.
+function getEnvDailyLimit() {
   const raw = process.env.AUTOFIX_DAILY_LIMIT;
   if (raw === undefined || raw === '') return DEFAULT_DAILY_LIMIT_PER_PROJECT;
   const n = Number(raw);
   if (!Number.isFinite(n) || n < 0) return DEFAULT_DAILY_LIMIT_PER_PROJECT;
   return n;
+}
+
+// Backwards-compat alias — pre-PR-#32 callers reach for getDailyLimit()
+// with no project context. The cron + CLI both use proposeFix which
+// goes through resolveDailyLimit(projectId) now, but the export was
+// public and some external callers may exist.
+const getDailyLimit = getEnvDailyLimit;
+
+/**
+ * Resolve the effective daily limit for ONE project. Reads the
+ * per-project override from project_autofix_configs if present,
+ * otherwise falls back to the env-level default. The override wins
+ * even when 0 (explicit "disabled for this tenant" is meaningful).
+ *
+ * NULL daily_limit in the row means "use env default" — same semantics
+ * as having no row at all. Lets ops insert a row with daily_limit=NULL
+ * + a future enabled flag without forcing them to also pick a limit
+ * value they don't care about.
+ */
+async function resolveDailyLimit(projectId, deps = {}) {
+  const dbRef = deps.db || db;
+  const r = await dbRef.query(
+    `SELECT daily_limit FROM project_autofix_configs WHERE project_id = $1`,
+    [projectId]
+  );
+  if (r.rows.length === 0 || r.rows[0].daily_limit == null) {
+    return getEnvDailyLimit();
+  }
+  return r.rows[0].daily_limit;
 }
 
 /**
@@ -94,7 +127,12 @@ async function proposeFix(failureId, opts = {}) {
   // must not flip fix_status away from 'open', otherwise we leak the row
   // out of the eligibility pool without doing any work. Skipped when the
   // limit is 0 (CI / e2e demos that explicitly disable the gate).
-  const dailyLimit = getDailyLimit();
+  //
+  // Resolution priority (highest first):
+  //   1. project_autofix_configs.daily_limit (PR #32 — per-tenant override)
+  //   2. AUTOFIX_DAILY_LIMIT env var
+  //   3. DEFAULT_DAILY_LIMIT_PER_PROJECT constant (20)
+  const dailyLimit = await resolveDailyLimit(ctx.projectId);
   if (dailyLimit > 0) {
     const used = await countRecentAttempts(ctx.projectId);
     if (used >= dailyLimit) {
@@ -349,4 +387,4 @@ function truncate(s, max) {
   return s.length > max ? s.slice(0, max) : s;
 }
 
-module.exports = { proposeFix, countRecentAttempts, getDailyLimit };
+module.exports = { proposeFix, countRecentAttempts, getDailyLimit, getEnvDailyLimit, resolveDailyLimit };

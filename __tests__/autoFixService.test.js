@@ -105,6 +105,7 @@ describe('autoFixService.proposeFix', () => {
   it('happy path: claims the failure, writes attempt as proposed, stores diff + new_code', async () => {
     scriptDb([
       { rows: [failureRow()], rowCount: 1 },             // loadFailureContext SELECT
+      { rows: [], rowCount: 0 },                         // resolveDailyLimit — no per-project override → env default (PR #32)
       { rows: [{ n: 0 }], rowCount: 1 },                 // countRecentAttempts (quota check)
       { rows: [{ id: 42 }], rowCount: 1 },               // atomic claim UPDATE ... RETURNING id
       { rows: [{ id: 99 }], rowCount: 1 },               // insertAttempt RETURNING id
@@ -140,6 +141,7 @@ describe('autoFixService.proposeFix', () => {
   it('refuses to run when the claim returns 0 rows (already claimed)', async () => {
     scriptDb([
       { rows: [failureRow()], rowCount: 1 },             // loadFailureContext SELECT
+      { rows: [], rowCount: 0 },                         // resolveDailyLimit — env default
       { rows: [{ n: 0 }], rowCount: 1 },                 // quota check (under limit)
       { rows: [], rowCount: 0 },                         // atomic claim — LOSES the race
     ]);
@@ -158,6 +160,7 @@ describe('autoFixService.proposeFix', () => {
   it('releases the claim when the LLM throws', async () => {
     scriptDb([
       { rows: [failureRow()], rowCount: 1 },
+      { rows: [], rowCount: 0 },                         // resolveDailyLimit — env default
       { rows: [{ n: 0 }], rowCount: 1 },                 // quota check
       { rows: [{ id: 42 }], rowCount: 1 },               // claim wins
       { rows: [{ id: 99 }], rowCount: 1 },               // insertAttempt
@@ -183,6 +186,7 @@ describe('autoFixService.proposeFix', () => {
     const same = "test('login', async () => {});\n";
     scriptDb([
       { rows: [failureRow({ spec_code: same })], rowCount: 1 },
+      { rows: [], rowCount: 0 },                         // resolveDailyLimit — env default
       { rows: [{ n: 0 }], rowCount: 1 },                 // quota check
       { rows: [{ id: 42 }], rowCount: 1 },               // claim wins
       { rows: [{ id: 99 }], rowCount: 1 },               // insertAttempt
@@ -209,6 +213,7 @@ describe('autoFixService.proposeFix', () => {
     try {
       scriptDb([
         { rows: [failureRow()], rowCount: 1 },           // loadFailureContext
+        { rows: [], rowCount: 0 },                       // resolveDailyLimit — env default (5)
         { rows: [{ n: 5 }], rowCount: 1 },               // quota check — exactly at limit
       ]);
 
@@ -240,7 +245,8 @@ describe('autoFixService.proposeFix', () => {
     try {
       scriptDb([
         { rows: [failureRow()], rowCount: 1 },           // loadFailureContext
-        // NO quota SELECT — the limit=0 path skips it entirely.
+        { rows: [], rowCount: 0 },                       // resolveDailyLimit — env default (0)
+        // NO COUNT(*) — the limit=0 path skips the quota check entirely.
         { rows: [{ id: 42 }], rowCount: 1 },             // claim wins
         { rows: [{ id: 99 }], rowCount: 1 },             // insertAttempt
         { rows: [], rowCount: 1 },                       // branch_name UPDATE
