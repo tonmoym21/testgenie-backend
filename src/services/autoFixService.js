@@ -12,6 +12,7 @@ const config = require('../config');
 const db = require('../db');
 const logger = require('../utils/logger');
 const { classifyAiError } = require('../utils/aiMetrics');
+const { ApiError } = require('../utils/apiError');
 const { unifiedDiff } = require('../utils/unifiedDiff');
 const { buildFixPrompt, FIX_SYSTEM_PROMPT } = require('./autoFixPrompt');
 const { getProvider } = require('./llm');
@@ -97,15 +98,20 @@ async function proposeFix(failureId, opts = {}) {
   if (dailyLimit > 0) {
     const used = await countRecentAttempts(ctx.projectId);
     if (used >= dailyLimit) {
-      const err = new Error(
+      // Throw an ApiError so the HTTP errorHandler maps this to 429 +
+      // AUTOFIX_QUOTA_EXCEEDED. Prior code set plain `err.status`/`err.code`
+      // hoping the handler would honor them — but errorHandler only knows
+      // about ApiError, so quota exhaustion was leaking as HTTP 500
+      // INTERNAL_ERROR. The frontend couldn't distinguish "you hit the
+      // daily limit" from "something exploded server-side."
+      logger.warn({ event: 'autofix.quota_exceeded', projectId: ctx.projectId, used, limit: dailyLimit, failureId },
+        'autofix: daily quota exceeded');
+      throw new ApiError(
+        429,
+        'AUTOFIX_QUOTA_EXCEEDED',
         `Auto-fix daily limit reached for project ${ctx.projectId}: ${used}/${dailyLimit} attempts in last 24h. ` +
         `Set AUTOFIX_DAILY_LIMIT higher or wait for the window to slide.`
       );
-      err.status = 429;
-      err.code = 'AUTOFIX_QUOTA_EXCEEDED';
-      logger.warn({ event: 'autofix.quota_exceeded', projectId: ctx.projectId, used, limit: dailyLimit, failureId },
-        'autofix: daily quota exceeded');
-      throw err;
     }
   }
 

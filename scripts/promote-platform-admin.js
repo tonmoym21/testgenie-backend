@@ -121,9 +121,15 @@ async function main() {
       process.exit(1);
     }
     const hash = await bcrypt.hash(newPw, 12);
+    // email_verified_at must be set on creation — enforceAccountAccess()
+    // rejects login when it's NULL (the public-signup verification gate).
+    // The whole point of --create-admin is to bypass the email round-trip
+    // for ops/e2e use, so we grandfather the admin as verified at insert.
+    // Without this the freshly-created admin couldn't log in and the
+    // operator had to UPDATE users SET email_verified_at = NOW() by hand.
     const inserted = await db.query(
-      `INSERT INTO users (email, password_hash, organization_id, status, is_platform_admin)
-       VALUES ($1, $2, NULL, 'active', true)
+      `INSERT INTO users (email, password_hash, organization_id, status, is_platform_admin, email_verified_at)
+       VALUES ($1, $2, NULL, 'active', true, NOW())
        RETURNING id, email`,
       [email, hash]
     );

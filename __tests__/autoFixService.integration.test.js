@@ -238,8 +238,12 @@ describe('autoFixService.proposeFix [real DB]', () => {
       // No mockPatch() — the LLM must NOT be reached if the gate works.
       mockLlmCreate.mockReset();
 
+      // ApiError exposes the HTTP status as `statusCode` (the field
+      // errorHandler reads). The route then returns HTTP 429 — see the
+      // route-level test in routes/autofix.quota.test.js for the wire
+      // contract.
       await expect(autoFixService.proposeFix(failureId)).rejects.toMatchObject({
-        status: 429,
+        statusCode: 429,
         code: 'AUTOFIX_QUOTA_EXCEEDED',
       });
 
