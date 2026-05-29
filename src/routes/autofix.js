@@ -36,6 +36,7 @@ const autoFixService = require('../services/autoFixService');
 const autoFixApplyService = require('../services/autoFixApplyService');
 const autoFixVerifyService = require('../services/autoFixVerifyService');
 const autoFixCronService = require('../services/autoFixCronService');
+const autoFixMetricsService = require('../services/autoFixMetricsService');
 
 const router = Router();
 
@@ -103,6 +104,25 @@ router.post('/run', adminMutationLimiter, validate(runBody), async (req, res, ne
     const result = await autoFixCronService.tick({
       force: true,
       batchSize: req.body.batchSize,
+    });
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
+// Rolling-window summary over fix_attempts + test_failures. JSON shape
+// designed to be destination-agnostic — Datadog, Grafana, CloudWatch,
+// or a curl-driven dashboard can all parse it. Query params:
+//   windowHours    1..720 (default 24)
+//   topProjects    1..200 (default 25) — caps byProject array length
+// Out-of-range values are clamped to the legal range silently (rather
+// than 400-ing) because this endpoint is meant to be hit by long-lived
+// scrapers — a typo in a Datadog config shouldn't take the dashboard
+// dark. Bad TYPES (non-numeric) fall through to the service's default.
+router.get('/metrics', async (req, res, next) => {
+  try {
+    const result = await autoFixMetricsService.getMetrics({
+      windowHours: req.query.windowHours,
+      topProjects: req.query.topProjects,
     });
     res.json(result);
   } catch (err) { next(err); }
