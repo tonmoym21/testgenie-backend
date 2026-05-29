@@ -103,15 +103,18 @@ describe('autoFixVerifyService.verifyFix', () => {
     expect(db.calls.some((c) => /UPDATE test_failures SET fix_status = 'open'/.test(c.sql))).toBe(false);
   });
 
-  it('verify_failed: non-zero exit -> records verify_failed AND releases the claim', async () => {
+  it('verify_failed under the retry cap: releases the row back to open', async () => {
     const runGit = makeRunGit({ 'rev-parse': 'main' });
     const runPlaywright = makePlaywright({
       exitCode: 1, stdout: '1 failed', stderr: 'TimeoutError: locator(\'#login\')',
     });
     const db = makeDb([
+      // Order matters — patterns are first-match-wins. The cap-aware
+      // UPDATE contains `FROM fix_attempts` inside its COUNT CTE, so
+      // we MUST match it before the generic loadFixAttempt SELECT.
+      [/WITH cnt AS/, { rows: [{ fix_status: 'open', attempts: 1 }], rowCount: 1 }],
       [/FROM fix_attempts/, { rows: [fixRow()], rowCount: 1 }],
       [/UPDATE fix_attempts SET status = 'verify_failed'/, { rows: [], rowCount: 1 }],
-      [/UPDATE test_failures SET fix_status = 'open'/, { rows: [], rowCount: 1 }],
     ]);
 
     const out = await verifyFix(
@@ -122,12 +125,79 @@ describe('autoFixVerifyService.verifyFix', () => {
     expect(out.exitCode).toBe(1);
     expect(out.stderrTail).toMatch(/TimeoutError/);
 
-    // The release-claim UPDATE happened.
+    // The cap-aware release UPDATE happened with [failure_id, maxRetries].
     const release = db.calls.find(
-      (c) => /UPDATE test_failures SET fix_status = 'open'/.test(c.sql)
+      (c) => /UPDATE test_failures SET\s+fix_status = CASE/.test(c.sql)
     );
     expect(release).toBeTruthy();
-    expect(release.params).toEqual([42]);  // failure_id
+    expect(release.params[0]).toBe(42);  // failure_id
+    expect(release.params[1]).toBe(3);   // default maxRetries
+  });
+
+  // Regression: without a per-failure cap, a genuinely-unfixable spec
+  // gets retried every cron tick — eventually locking the whole
+  // project at the daily quota. After AUTOFIX_MAX_RETRIES_PER_FAILURE
+  // failed attempts the row promotes to wont_fix and stops being
+  // eligible (findEligibleFailures filters by fix_status='open').
+  it('verify_failed at the retry cap: promotes the row to wont_fix', async () => {
+    const runGit = makeRunGit({ 'rev-parse': 'main' });
+    const runPlaywright = makePlaywright({
+      exitCode: 1, stdout: '1 failed', stderr: 'TimeoutError after 3 tries',
+    });
+    const warnSpy = jest.fn();
+    const captureLogger = { ...silentLogger, warn: warnSpy };
+    const db = makeDb([
+      // Same first-match-wins ordering caveat — see note in the cap-released test.
+      [/WITH cnt AS/, { rows: [{ fix_status: 'wont_fix', attempts: 3 }], rowCount: 1 }],
+      [/FROM fix_attempts/, { rows: [fixRow()], rowCount: 1 }],
+      [/UPDATE fix_attempts SET status = 'verify_failed'/, { rows: [], rowCount: 1 }],
+    ]);
+
+    const out = await verifyFix(
+      { fixAttemptId: 99, repo: '/tmp/r', base: 'main' },
+      { db, logger: captureLogger, runGit, runPlaywright },
+    );
+    expect(out.status).toBe('verify_failed');
+    // Cap-reached event MUST surface — operator needs to know the loop
+    // has given up on this failure.
+    const capWarn = warnSpy.mock.calls.find(
+      (c) => c[0] && c[0].event === 'autofix.failure.cap_reached'
+    );
+    expect(capWarn).toBeTruthy();
+    expect(capWarn[0]).toMatchObject({
+      failureId: 42, fixAttemptId: 99, attempts: 3, maxRetries: 3,
+    });
+  });
+
+  it('AUTOFIX_MAX_RETRIES_PER_FAILURE=0 disables the cap (CI / e2e behavior)', async () => {
+    const ORIGINAL = process.env.AUTOFIX_MAX_RETRIES_PER_FAILURE;
+    process.env.AUTOFIX_MAX_RETRIES_PER_FAILURE = '0';
+    try {
+      const runGit = makeRunGit({ 'rev-parse': 'main' });
+      const runPlaywright = makePlaywright({ exitCode: 1, stdout: '', stderr: 'fail' });
+      const db = makeDb([
+        [/FROM fix_attempts/, { rows: [fixRow()], rowCount: 1 }],
+        [/UPDATE fix_attempts SET status = 'verify_failed'/, { rows: [], rowCount: 1 }],
+        // The legacy unconditional 'open' UPDATE must run, NOT the CASE.
+        [/UPDATE test_failures SET fix_status = 'open'/, { rows: [], rowCount: 1 }],
+      ]);
+
+      await verifyFix(
+        { fixAttemptId: 99, repo: '/tmp/r', base: 'main' },
+        { db, logger: silentLogger, runGit, runPlaywright },
+      );
+
+      // Saw the legacy SQL...
+      const legacy = db.calls.find((c) => /UPDATE test_failures SET fix_status = 'open'/.test(c.sql));
+      expect(legacy).toBeTruthy();
+      expect(legacy.params).toEqual([42]);
+      // ...and DID NOT execute the CASE branch.
+      const caseBranch = db.calls.find((c) => /fix_status = CASE/.test(c.sql));
+      expect(caseBranch).toBeFalsy();
+    } finally {
+      if (ORIGINAL === undefined) delete process.env.AUTOFIX_MAX_RETRIES_PER_FAILURE;
+      else process.env.AUTOFIX_MAX_RETRIES_PER_FAILURE = ORIGINAL;
+    }
   });
 
   it('returns to base branch even when Playwright itself throws', async () => {

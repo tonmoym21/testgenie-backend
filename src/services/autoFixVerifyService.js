@@ -76,23 +76,76 @@ async function recordVerified(db, fixAttemptId) {
   );
 }
 
-async function recordVerifyFailed(db, fixAttemptId, failureId, errorTail) {
+// Per-failure retry ceiling. Without one, a genuinely-unfixable spec
+// (LLM keeps proposing a patch that still fails Playwright) gets
+// retried every cron tick — eating quota on a row that will never
+// converge, eventually locking the WHOLE project at the daily limit.
+// 3 attempts is generous: each subsequent proposal sees the prior
+// error_message in its prompt and can adjust, so by the 3rd swing
+// the LLM has had two pieces of feedback to course-correct.
+// AUTOFIX_MAX_RETRIES_PER_FAILURE=0 disables the cap (CI / e2e).
+function getMaxRetries() {
+  const raw = process.env.AUTOFIX_MAX_RETRIES_PER_FAILURE;
+  if (raw === undefined || raw === '') return 3;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 3;
+}
+
+async function recordVerifyFailed(db, fixAttemptId, failureId, errorTail, logger) {
   // Two writes in series:
   //   1. fix_attempts -> 'verify_failed', error_message captures a tail of
   //      stderr so the next proposal's prompt can read it.
-  //   2. test_failures.fix_status -> 'open' so the row becomes available
-  //      to a retry. The corresponding 'fix_proposed' value was set when
-  //      proposeFix claimed it; this is the release.
+  //   2. test_failures.fix_status — either 'open' (retry-eligible) or
+  //      'wont_fix' (cap hit, give up). The CASE in SQL counts the
+  //      attempt we just flipped in step 1, so the count is current
+  //      without a separate round-trip. fix_status='wont_fix' takes
+  //      the row out of findEligibleFailures naturally — no cron
+  //      change needed. An operator can resurrect a 'wont_fix' row
+  //      with `UPDATE test_failures SET fix_status='open' WHERE id=…`
+  //      if they want to force another attempt (e.g. after editing
+  //      the spec by hand).
   await db.query(
     `UPDATE fix_attempts SET status = 'verify_failed', error_message = $2, finished_at = NOW()
        WHERE id = $1`,
     [fixAttemptId, errorTail]
   );
-  await db.query(
-    `UPDATE test_failures SET fix_status = 'open'
-       WHERE id = $1 AND fix_status = 'fix_proposed'`,
-    [failureId]
+  const maxRetries = getMaxRetries();
+  if (maxRetries === 0) {
+    // Cap disabled — original behavior: always release back to 'open'.
+    await db.query(
+      `UPDATE test_failures SET fix_status = 'open'
+         WHERE id = $1 AND fix_status = 'fix_proposed'`,
+      [failureId]
+    );
+    return { promoted: false, attempts: null, maxRetries: 0 };
+  }
+  const r = await db.query(
+    `WITH cnt AS (
+       SELECT COUNT(*)::int AS n FROM fix_attempts
+        WHERE test_failure_id = $1 AND status = 'verify_failed'
+     )
+     UPDATE test_failures SET
+       fix_status = CASE WHEN (SELECT n FROM cnt) >= $2 THEN 'wont_fix' ELSE 'open' END,
+       resolved_at = CASE WHEN (SELECT n FROM cnt) >= $2 THEN NOW() ELSE resolved_at END
+       WHERE id = $1 AND fix_status = 'fix_proposed'
+     RETURNING fix_status, (SELECT n FROM cnt) AS attempts`,
+    [failureId, maxRetries]
   );
+  const row = r.rows[0];
+  if (row && row.fix_status === 'wont_fix' && logger) {
+    // Cap-hit is a meaningful operator signal — the autofix loop has
+    // declared this failure unfixable on its own. Surface it loud so
+    // ops can decide whether to look at the spec by hand or accept
+    // it as a known-flaky and close the upstream ticket.
+    logger.warn({ event: 'autofix.failure.cap_reached', failureId,
+      fixAttemptId, attempts: row.attempts, maxRetries },
+      'autofix: per-failure retry cap reached, marking wont_fix');
+  }
+  return {
+    promoted: !!(row && row.fix_status === 'wont_fix'),
+    attempts: row ? row.attempts : null,
+    maxRetries,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -196,9 +249,15 @@ async function verifyFix(opts, deps = {}) {
   }
 
   const errorTail = (result.stderr || result.stdout || `Playwright exit ${result.exitCode}`).slice(-4000);
-  await recordVerifyFailed(db, row.id, row.failure_id, errorTail);
+  // recordVerifyFailed atomically decides whether to release the row
+  // back to 'open' or promote to 'wont_fix' based on the per-failure
+  // retry cap (AUTOFIX_MAX_RETRIES_PER_FAILURE, default 3). The
+  // promoted? bit becomes a field on autofix.verify_failed so dashboards
+  // can chart cap-hit rate without a separate join to fix_attempts.
+  const capInfo = await recordVerifyFailed(db, row.id, row.failure_id, errorTail, logger);
   logger.info({ event: 'autofix.verify_failed', fixAttemptId: row.id, failureId: row.failure_id,
-    projectId: row.project_id, branch: row.branch_name, exitCode: result.exitCode, durationMs },
+    projectId: row.project_id, branch: row.branch_name, exitCode: result.exitCode, durationMs,
+    attempts: capInfo.attempts, capReached: capInfo.promoted },
     'Auto-fix verify failed');
   return { fixAttemptId: row.id, status: 'verify_failed', exitCode: result.exitCode, stderrTail: errorTail };
 }
