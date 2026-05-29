@@ -212,8 +212,11 @@ describe('autoFixService.proposeFix', () => {
         { rows: [{ n: 5 }], rowCount: 1 },               // quota check — exactly at limit
       ]);
 
+      // ApiError exposes the HTTP code as `statusCode` — errorHandler
+      // reads that field and returns HTTP 429 to the client. See the
+      // route-level wire test in autofixRoute.quota.test.js.
       await expect(autoFixService.proposeFix(42)).rejects.toMatchObject({
-        status: 429,
+        statusCode: 429,
         code: 'AUTOFIX_QUOTA_EXCEEDED',
         message: expect.stringMatching(/daily limit/i),
       });
