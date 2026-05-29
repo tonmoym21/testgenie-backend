@@ -37,6 +37,7 @@ const autoFixApplyService = require('../services/autoFixApplyService');
 const autoFixVerifyService = require('../services/autoFixVerifyService');
 const autoFixCronService = require('../services/autoFixCronService');
 const autoFixMetricsService = require('../services/autoFixMetricsService');
+const autoFixFailuresService = require('../services/autoFixFailuresService');
 
 const router = Router();
 
@@ -124,6 +125,40 @@ router.get('/metrics', async (req, res, next) => {
       windowHours: req.query.windowHours,
       topProjects: req.query.topProjects,
     });
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
+// Paginated browse over test_failures for the failure-dashboard UI.
+// Query params:
+//   status        open | fix_proposed | fix_merged | wont_fix | resolved
+//   projectId     scope to one project
+//   q             substring match on signature OR sample_error_message
+//   limit         1..200 (default 50)
+//   offset        >= 0   (default 0)
+// Returns { items, total, limit, offset }. Same gentle-clamping policy
+// as /metrics — bad inputs don't 400, they fall back to defaults. status
+// is silently ignored if not a legal enum value (typo in a saved filter
+// shouldn't surface as a red error in the UI).
+router.get('/failures', async (req, res, next) => {
+  try {
+    const result = await autoFixFailuresService.listFailures({
+      status: req.query.status,
+      projectId: req.query.projectId,
+      q: req.query.q,
+      limit: req.query.limit,
+      offset: req.query.offset,
+    });
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
+// Full lineage for one failure: metadata + every fix_attempts row in
+// chronological order. The :id segment is validated by the service
+// (NaN/<=0 throws NotFoundError -> HTTP 404 via errorHandler).
+router.get('/failures/:id', async (req, res, next) => {
+  try {
+    const result = await autoFixFailuresService.getFailureDetail(req.params.id);
     res.json(result);
   } catch (err) { next(err); }
 });
