@@ -182,6 +182,79 @@ describe('autoFixVerifyService.verifyFix [real DB]', () => {
     expect(reclaim.rowCount).toBe(1);
   });
 
+  // Real-DB regression for the per-failure retry cap. The cap-aware
+  // UPDATE uses a CTE + CASE — exactly the kind of SQL that's easy to
+  // get wrong against a mocked db.query but fails immediately against
+  // real Postgres (syntax errors, return shape mismatches). This test
+  // pins the contract: after AUTOFIX_MAX_RETRIES_PER_FAILURE failed
+  // attempts the row promotes to wont_fix and disappears from the
+  // 'open' eligibility pool. An operator can still manually
+  // `UPDATE test_failures SET fix_status='open'` to force another try.
+  it('promotes test_failures to wont_fix after AUTOFIX_MAX_RETRIES_PER_FAILURE failed attempts', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    const ORIGINAL_MAX = process.env.AUTOFIX_MAX_RETRIES_PER_FAILURE;
+    // Lower the cap to 2 to keep the seed cheap — same code path,
+    // fewer historic rows to insert.
+    process.env.AUTOFIX_MAX_RETRIES_PER_FAILURE = '2';
+    try {
+      const { failureId, fixAttemptId } = await seedProposedFix({ branchSuffix: 'cap00001' });
+      // Seed one prior verify_failed attempt for the same failure so
+      // the count this run produces is exactly the cap.
+      await db.query(
+        `INSERT INTO fix_attempts
+           (test_failure_id, model_provider, model_name, branch_name, status,
+            new_code, patch_diff, started_at, finished_at)
+         VALUES ($1, 'openai', 'gpt-4o', $2, 'verify_failed',
+                 'n', 'd', NOW() - INTERVAL '5 minutes', NOW() - INTERVAL '4 minutes')`,
+        [failureId, `testforge/autofix/failure-${failureId}-historic1`]
+      );
+
+      const out = await verifyFix(
+        { fixAttemptId, repo: '/tmp/fake', base: 'main' },
+        {
+          runGit: stubGit,
+          runPlaywright: () => ({ exitCode: 1, stdout: '', stderr: 'still broken on attempt 2' }),
+          logger: silentLogger,
+        },
+      );
+      expect(out.status).toBe('verify_failed');
+
+      // The failure must now be wont_fix — not 'open' — so the cron's
+      // findEligibleFailures (WHERE fix_status='open') stops picking it.
+      const tf = await db.query(
+        `SELECT fix_status, resolved_at FROM test_failures WHERE id = $1`,
+        [failureId]
+      );
+      expect(tf.rows[0].fix_status).toBe('wont_fix');
+      // resolved_at is set on cap-hit too — useful for ops dashboards
+      // ("when did the loop give up on this failure?").
+      expect(tf.rows[0].resolved_at).toBeTruthy();
+
+      // Reclaim attempt MUST fail — the SQL guard `WHERE fix_status='open'`
+      // no longer matches. This is the actual behavioral promise: the
+      // cron will not retry this failure on subsequent ticks.
+      const reclaim = await db.query(
+        `UPDATE test_failures SET fix_status = 'fix_proposed'
+           WHERE id = $1 AND fix_status = 'open' RETURNING id`,
+        [failureId]
+      );
+      expect(reclaim.rowCount).toBe(0);
+
+      // Operator-resurrection path: explicit UPDATE back to 'open' works.
+      // Documents the escape hatch for a wont_fix that an operator
+      // believes is fixable after editing the spec by hand.
+      const resurrect = await db.query(
+        `UPDATE test_failures SET fix_status = 'open', resolved_at = NULL
+           WHERE id = $1 RETURNING id`,
+        [failureId]
+      );
+      expect(resurrect.rowCount).toBe(1);
+    } finally {
+      if (ORIGINAL_MAX === undefined) delete process.env.AUTOFIX_MAX_RETRIES_PER_FAILURE;
+      else process.env.AUTOFIX_MAX_RETRIES_PER_FAILURE = ORIGINAL_MAX;
+    }
+  });
+
   it('refuses to verify a row in status="failed" (no Playwright spawn, no DB writes)', async () => {
     if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
     const { fixAttemptId } = await seedProposedFix({ branchSuffix: 'wrong001' });
