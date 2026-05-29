@@ -181,4 +181,21 @@ router.post('/failures/:id/reopen', adminMutationLimiter, async (req, res, next)
   } catch (err) { next(err); }
 });
 
+// Pre-emptive wont_fix — inverse of /reopen. Operator-facing way to
+// say "don't bother trying this failure" before the per-failure cap
+// (PR #25) auto-fires. Saves 3 LLM calls + 3 verify spawns per row
+// when ops already know it's a known-flaky / waiting-on-infra case.
+//   200 + refreshed detail on success
+//   404 NOT_FOUND when id missing
+//   409 CONFLICT for non-markable source states (wont_fix, resolved,
+//       fix_merged) — see service comment for the legal source set
+router.post('/failures/:id/wont_fix', adminMutationLimiter, async (req, res, next) => {
+  try {
+    const result = await autoFixFailuresService.markWontFix(req.params.id, {
+      triggeredBy: req.user && req.user.id,
+    });
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
 module.exports = router;

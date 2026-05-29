@@ -20,6 +20,7 @@ jest.mock('../src/services/autoFixFailuresService', () => ({
   listFailures: jest.fn(),
   getFailureDetail: jest.fn(),
   reopenFailure: jest.fn(),
+  markWontFix: jest.fn(),
 }));
 
 jest.mock('pg', () => {
@@ -203,5 +204,56 @@ describe('POST /api/autofix/failures/:id/reopen', () => {
     const res = await request(app).post('/api/autofix/failures/42/reopen');
     expect(res.status).toBe(403);
     expect(autoFixFailuresService.reopenFailure).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/autofix/failures/:id/wont_fix', () => {
+  let app;
+  beforeAll(() => { app = buildApp(); });
+  beforeEach(() => {
+    autoFixFailuresService.markWontFix.mockReset();
+    mockIsAdmin = true;
+  });
+
+  it('200 + refreshed detail; passes id and triggeredBy to the service', async () => {
+    const payload = { id: 42, fix_status: 'wont_fix', attempts: [] };
+    autoFixFailuresService.markWontFix.mockResolvedValueOnce(payload);
+
+    const res = await request(app).post('/api/autofix/failures/42/wont_fix');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(payload);
+    expect(autoFixFailuresService.markWontFix).toHaveBeenCalledWith('42', { triggeredBy: 1 });
+  });
+
+  it('404 NOT_FOUND when the service throws NotFoundError', async () => {
+    autoFixFailuresService.markWontFix.mockRejectedValueOnce(new NotFoundError('test failure'));
+    const res = await request(app).post('/api/autofix/failures/999/wont_fix');
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe('NOT_FOUND');
+  });
+
+  it('409 CONFLICT when the row is in a non-markable source state', async () => {
+    autoFixFailuresService.markWontFix.mockRejectedValueOnce(
+      new ConflictError("Cannot mark wont_fix — failure is in fix_status='resolved'.")
+    );
+    const res = await request(app).post('/api/autofix/failures/1/wont_fix');
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('CONFLICT');
+    expect(res.body.error.message).toMatch(/resolved/);
+  });
+
+  it('401 without auth', async () => {
+    const res = await request(app)
+      .post('/api/autofix/failures/42/wont_fix')
+      .set('x-test-noauth', '1');
+    expect(res.status).toBe(401);
+    expect(autoFixFailuresService.markWontFix).not.toHaveBeenCalled();
+  });
+
+  it('403 for non-admin', async () => {
+    mockIsAdmin = false;
+    const res = await request(app).post('/api/autofix/failures/42/wont_fix');
+    expect(res.status).toBe(403);
+    expect(autoFixFailuresService.markWontFix).not.toHaveBeenCalled();
   });
 });
