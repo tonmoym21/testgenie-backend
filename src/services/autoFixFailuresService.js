@@ -394,14 +394,73 @@ async function getAttemptDiff(failureId, attemptId, deps = {}) {
   return r.rows[0];
 }
 
+// Upper bound on a single bulk-op request body. Enforced at the route
+// (zod) and used here as the contract documented for callers — keeps
+// a runaway dashboard from launching thousands of mutations on one
+// click. 100 is generous for a human-driven multi-select; anything
+// larger probably wants the cron loop or a back-office script anyway.
+const BULK_MAX_IDS = 100;
+
+/**
+ * Generic per-id batch driver. Runs the (single-id) `op` for each id
+ * sequentially and collects per-id outcomes — one bad id MUST NOT
+ * fail the batch. Result shape mirrors the autofix-cron tick: every
+ * id ends up in exactly one bucket so the dashboard can render
+ * "3 succeeded, 2 failed" plus a per-id reason for the failures.
+ *
+ * Sequential (not Promise.all) because the underlying ops do SQL
+ * writes — parallelising risks pool exhaustion + lock contention on
+ * the same project's project_repo_configs / fix_attempts rows. The
+ * UX cost is small: 100 ops at ~10ms each is 1s, well inside the
+ * frontend's "still feels responsive" budget.
+ *
+ * @param {number[]} ids
+ * @param {(id: number, opts: object, deps: object) => Promise<*>} op
+ * @param {object?} opts        forwarded to op() (e.g. triggeredBy)
+ * @param {object?} deps        forwarded to op()
+ */
+async function runBulk(ids, op, opts = {}, deps = {}) {
+  const succeeded = [];
+  const failed = [];
+  for (const id of ids) {
+    try {
+      await op(id, opts, deps);
+      succeeded.push(id);
+    } catch (err) {
+      // ApiError carries a typed code; plain Errors get bucketed as
+      // INTERNAL — the dashboard can show "Already in another state"
+      // (CONFLICT) differently from "Failure not found" (NOT_FOUND).
+      failed.push({
+        id,
+        error: {
+          code: err.code || 'INTERNAL_ERROR',
+          message: err.message,
+        },
+      });
+    }
+  }
+  return { succeeded, failed };
+}
+
+async function bulkMarkWontFix(ids, opts = {}, deps = {}) {
+  return runBulk(ids, markWontFix, opts, deps);
+}
+
+async function bulkReopen(ids, opts = {}, deps = {}) {
+  return runBulk(ids, reopenFailure, opts, deps);
+}
+
 module.exports = {
   listFailures,
   getFailureDetail,
   reopenFailure,
   markWontFix,
   getAttemptDiff,
+  bulkMarkWontFix,
+  bulkReopen,
   // exported for tests
   FIX_STATUSES,
   DEFAULT_LIMIT,
   MAX_LIMIT,
+  BULK_MAX_IDS,
 };
