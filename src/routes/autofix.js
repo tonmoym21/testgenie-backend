@@ -163,4 +163,22 @@ router.get('/failures/:id', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// "Force retry" — flip a wont_fix failure back to open so the cron
+// picks it up again next tick. Use case: operator believes a capped
+// failure is actually fixable (edited the spec by hand, or the
+// underlying app bug was patched). Rate-limited because a retry-loop
+// in a flaky dashboard could otherwise fire dozens per second.
+//   200 + refreshed detail on success
+//   404 NOT_FOUND when the id doesn't exist
+//   409 CONFLICT when the row isn't in wont_fix (prevents racing
+//       in-flight ticks or accidentally reopening a resolved fix)
+router.post('/failures/:id/reopen', adminMutationLimiter, async (req, res, next) => {
+  try {
+    const result = await autoFixFailuresService.reopenFailure(req.params.id, {
+      triggeredBy: req.user && req.user.id,
+    });
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
 module.exports = router;

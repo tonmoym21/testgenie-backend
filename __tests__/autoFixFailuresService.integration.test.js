@@ -12,7 +12,7 @@ process.env.NODE_ENV = 'test';
 
 const { Pool } = require('pg');
 const db = require('../src/db');
-const { listFailures, getFailureDetail } = require('../src/services/autoFixFailuresService');
+const { listFailures, getFailureDetail, reopenFailure } = require('../src/services/autoFixFailuresService');
 
 let canConnect = false;
 let seed = null;
@@ -182,6 +182,95 @@ describe('autoFixFailuresService.getFailureDetail [real DB]', () => {
   it('throws NotFoundError (404) when the id does not exist', async () => {
     if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
     await expect(getFailureDetail(999999999, { db })).rejects.toMatchObject({
+      statusCode: 404,
+      code: 'NOT_FOUND',
+    });
+  });
+});
+
+describe('autoFixFailuresService.reopenFailure [real DB]', () => {
+  const silentLogger = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
+
+  // Seed a single test_failures row with the given fix_status. Lets
+  // each test exercise a different "source state" against real
+  // Postgres (catches CHECK-constraint violations on fix_status that
+  // the unit suite wouldn't see).
+  async function seedFailureWithStatus(fix_status, { resolvedHoursAgo = null } = {}) {
+    const r = await db.query(
+      `INSERT INTO test_failures
+         (project_id, failure_signature, sample_error_message, occurrence_count,
+          first_seen_at, last_seen_at, fix_status)
+       VALUES ($1, $2, 'err', 1, NOW(), NOW(), $3)
+       RETURNING id`,
+      [seed.projectId, `reopen-${fix_status}-${Date.now()}-${Math.random()}`, fix_status]
+    );
+    const id = Number(r.rows[0].id);
+    if (resolvedHoursAgo != null) {
+      await db.query(
+        `UPDATE test_failures SET resolved_at = NOW() - ($1 || ' hours')::INTERVAL WHERE id = $2`,
+        [String(resolvedHoursAgo), id]
+      );
+    }
+    return id;
+  }
+
+  it('happy path: wont_fix -> open, clears resolved_at, returns refreshed detail', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    const id = await seedFailureWithStatus('wont_fix', { resolvedHoursAgo: 2 });
+
+    const out = await reopenFailure(id, { triggeredBy: 99 }, { db, logger: silentLogger });
+
+    expect(out.id).toBe(id);
+    expect(out.fix_status).toBe('open');
+    expect(out.resolved_at).toBeNull();
+    // Empty attempts list (no fix_attempts seeded) — proves the
+    // refreshed detail wiring works even on a row with no history.
+    expect(out.attempts).toEqual([]);
+
+    // Verify state actually persisted (not just the returned shape).
+    const after = await db.query(`SELECT fix_status, resolved_at FROM test_failures WHERE id = $1`, [id]);
+    expect(after.rows[0].fix_status).toBe('open');
+    expect(after.rows[0].resolved_at).toBeNull();
+  });
+
+  it('409 when row is in open state — does NOT silently re-touch the row', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    const id = await seedFailureWithStatus('open');
+    const before = await db.query(`SELECT last_seen_at FROM test_failures WHERE id = $1`, [id]);
+
+    await expect(reopenFailure(id, {}, { db, logger: silentLogger })).rejects.toMatchObject({
+      statusCode: 409,
+    });
+
+    // Critical: a refused reopen must leave the row untouched. The
+    // 'open' guard isn't just about returning an error — a stray
+    // UPDATE without a WHERE-clause guard would bump last_seen_at
+    // and reset any pending cron-tick ordering.
+    const after = await db.query(`SELECT last_seen_at FROM test_failures WHERE id = $1`, [id]);
+    expect(after.rows[0].last_seen_at.toISOString())
+      .toBe(before.rows[0].last_seen_at.toISOString());
+  });
+
+  it('409 when row is in fix_proposed state (race-with-in-flight-tick guard)', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    const id = await seedFailureWithStatus('fix_proposed');
+    await expect(reopenFailure(id, {}, { db, logger: silentLogger })).rejects.toMatchObject({
+      statusCode: 409,
+      code: 'CONFLICT',
+    });
+  });
+
+  it('409 when row is in resolved state (fix worked — refuse to reopen)', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    const id = await seedFailureWithStatus('resolved', { resolvedHoursAgo: 1 });
+    await expect(reopenFailure(id, {}, { db, logger: silentLogger })).rejects.toMatchObject({
+      statusCode: 409,
+    });
+  });
+
+  it('404 when the id does not exist at all', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    await expect(reopenFailure(999999999, {}, { db, logger: silentLogger })).rejects.toMatchObject({
       statusCode: 404,
       code: 'NOT_FOUND',
     });

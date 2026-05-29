@@ -12,7 +12,7 @@
 // test_failures (a few thousand rows per tenant) but would need a cursor
 // scheme if it grows by orders of magnitude.
 
-const { NotFoundError } = require('../utils/apiError');
+const { NotFoundError, ConflictError } = require('../utils/apiError');
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
@@ -172,9 +172,98 @@ async function getFailureDetail(id, deps = {}) {
   };
 }
 
+/**
+ * Reopen a wont_fix failure — the "Force retry" path for the dashboard
+ * + a documented escape hatch when an operator believes a capped
+ * failure is actually fixable (e.g. they edited the spec by hand, or
+ * the underlying app bug was patched and the spec just needs another
+ * run).
+ *
+ * Only legal source state is 'wont_fix':
+ *   'open'         no-op trap; already eligible (returns 409 so the UI
+ *                  doesn't silently "succeed" a meaningless click)
+ *   'fix_proposed' currently being worked by a tick (race with
+ *                  proposeFix's atomic claim — refuse)
+ *   'fix_merged'   a PR is open; the loop is mid-promotion
+ *   'resolved'     fix actually worked — reopening would race markMerged
+ *                  and confuse the lineage. If an operator really wants
+ *                  to retry a resolved failure they can UPDATE by hand.
+ *
+ * Clears resolved_at so the row looks like a fresh open failure to
+ * downstream consumers (eligibility query, dashboard sort).
+ *
+ * Returns the refreshed detail (same shape as getFailureDetail) so the
+ * UI doesn't need a follow-up round-trip.
+ *
+ * @param {number} id
+ * @param {object?} opts
+ * @param {number?} opts.triggeredBy  user id of the operator clicking
+ *                                    Reopen — kept for the log event
+ *                                    (not persisted; we don't have a
+ *                                    fix_attempts row to attach it to)
+ * @param {object?} deps
+ * @param {object?} deps.db
+ * @param {object?} deps.logger
+ */
+async function reopenFailure(id, opts = {}, deps = {}) {
+  const db = deps.db || require('../db');
+  const logger = deps.logger || require('../utils/logger');
+  const failureId = Number(id);
+  if (!Number.isFinite(failureId) || failureId <= 0) {
+    throw new NotFoundError('test failure');
+  }
+
+  // Atomic conditional UPDATE — single round-trip, no read-then-write
+  // race. RETURNING fix_status lets us distinguish "row didn't exist"
+  // (rowCount=0 AND lookup row also missing → 404) from "row was in
+  // a non-reopenable state" (rowCount=0 AND lookup row exists → 409).
+  const upd = await db.query(
+    `UPDATE test_failures
+        SET fix_status = 'open',
+            resolved_at = NULL
+      WHERE id = $1 AND fix_status = 'wont_fix'
+     RETURNING id`,
+    [failureId]
+  );
+
+  if (upd.rowCount === 0) {
+    // Read the row to decide 404 vs 409 — a 404 is fundamentally
+    // different ("you linked to a deleted failure") from a 409 ("this
+    // failure isn't in a reopenable state right now"), and the UI
+    // surfaces different messages.
+    const check = await db.query(
+      `SELECT fix_status FROM test_failures WHERE id = $1`,
+      [failureId]
+    );
+    if (check.rows.length === 0) {
+      throw new NotFoundError('test failure');
+    }
+    throw new ConflictError(
+      `Cannot reopen — failure is in fix_status='${check.rows[0].fix_status}', ` +
+      `only 'wont_fix' rows are reopenable. ` +
+      (check.rows[0].fix_status === 'open'
+        ? 'This failure is already eligible for the cron loop.'
+        : 'Wait for the current attempt to settle, or revert by SQL.')
+    );
+  }
+
+  // Reopen is meaningful operator action — it overrides the loop's
+  // own decision to give up. WARN level so it surfaces alongside the
+  // autofix.failure.cap_reached event from PR #25, giving a complete
+  // cap-then-reopen audit trail in the logs.
+  logger.warn({ event: 'autofix.failure.reopened', failureId,
+    triggeredBy: opts.triggeredBy || null },
+    'autofix: wont_fix failure reopened by operator');
+
+  // Return the refreshed detail (with the now-current attempts list)
+  // so the dashboard re-renders without a follow-up GET.
+  return getFailureDetail(failureId, { db });
+}
+
 module.exports = {
   listFailures,
   getFailureDetail,
+  reopenFailure,
   // exported for tests
   FIX_STATUSES,
   DEFAULT_LIMIT,

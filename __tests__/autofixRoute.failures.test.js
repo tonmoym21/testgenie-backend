@@ -9,7 +9,7 @@ process.env.NODE_ENV = 'test';
 const request = require('supertest');
 const express = require('express');
 
-const { NotFoundError } = require('../src/utils/apiError');
+const { NotFoundError, ConflictError } = require('../src/utils/apiError');
 
 jest.mock('../src/services/autoFixService', () => ({ proposeFix: jest.fn() }));
 jest.mock('../src/services/autoFixApplyService', () => ({ applyFix: jest.fn() }));
@@ -19,6 +19,7 @@ jest.mock('../src/services/autoFixMetricsService', () => ({ getMetrics: jest.fn(
 jest.mock('../src/services/autoFixFailuresService', () => ({
   listFailures: jest.fn(),
   getFailureDetail: jest.fn(),
+  reopenFailure: jest.fn(),
 }));
 
 jest.mock('pg', () => {
@@ -146,5 +147,61 @@ describe('GET /api/autofix/failures/:id (detail)', () => {
     const res = await request(app).get('/api/autofix/failures/42');
     expect(res.status).toBe(403);
     expect(autoFixFailuresService.getFailureDetail).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/autofix/failures/:id/reopen', () => {
+  let app;
+  beforeAll(() => { app = buildApp(); });
+  beforeEach(() => {
+    autoFixFailuresService.reopenFailure.mockReset();
+    mockIsAdmin = true;
+  });
+
+  it('200 + refreshed detail; passes id and triggeredBy to the service', async () => {
+    const payload = { id: 42, fix_status: 'open', attempts: [] };
+    autoFixFailuresService.reopenFailure.mockResolvedValueOnce(payload);
+
+    const res = await request(app).post('/api/autofix/failures/42/reopen');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(payload);
+    // Service got the raw :id string + triggeredBy from req.user.id
+    // (set to 1 by the mock auth middleware).
+    expect(autoFixFailuresService.reopenFailure).toHaveBeenCalledWith('42', { triggeredBy: 1 });
+  });
+
+  it('404 NOT_FOUND when service throws NotFoundError', async () => {
+    autoFixFailuresService.reopenFailure.mockRejectedValueOnce(new NotFoundError('test failure'));
+    const res = await request(app).post('/api/autofix/failures/999/reopen');
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe('NOT_FOUND');
+  });
+
+  it('409 CONFLICT when the row is not in wont_fix (the bug this guards)', async () => {
+    // This is the actual contract being pinned: a reopen attempt on
+    // a non-wont_fix row must NOT silently "succeed" the way an
+    // unconditional UPDATE would.
+    autoFixFailuresService.reopenFailure.mockRejectedValueOnce(
+      new ConflictError("Cannot reopen — failure is in fix_status='fix_proposed', only 'wont_fix' rows are reopenable.")
+    );
+    const res = await request(app).post('/api/autofix/failures/1/reopen');
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('CONFLICT');
+    expect(res.body.error.message).toMatch(/wont_fix/);
+  });
+
+  it('401 without auth', async () => {
+    const res = await request(app)
+      .post('/api/autofix/failures/42/reopen')
+      .set('x-test-noauth', '1');
+    expect(res.status).toBe(401);
+    expect(autoFixFailuresService.reopenFailure).not.toHaveBeenCalled();
+  });
+
+  it('403 for non-admin', async () => {
+    mockIsAdmin = false;
+    const res = await request(app).post('/api/autofix/failures/42/reopen');
+    expect(res.status).toBe(403);
+    expect(autoFixFailuresService.reopenFailure).not.toHaveBeenCalled();
   });
 });
