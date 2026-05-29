@@ -12,7 +12,7 @@ process.env.NODE_ENV = 'test';
 
 const { Pool } = require('pg');
 const db = require('../src/db');
-const { listFailures, getFailureDetail, reopenFailure } = require('../src/services/autoFixFailuresService');
+const { listFailures, getFailureDetail, reopenFailure, markWontFix } = require('../src/services/autoFixFailuresService');
 
 let canConnect = false;
 let seed = null;
@@ -274,5 +274,98 @@ describe('autoFixFailuresService.reopenFailure [real DB]', () => {
       statusCode: 404,
       code: 'NOT_FOUND',
     });
+  });
+});
+
+describe('autoFixFailuresService.markWontFix [real DB]', () => {
+  const silentLogger = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
+
+  // Same helper as the reopen suite — kept local because the
+  // describe blocks can't share scope cleanly.
+  async function seedFailureWithStatus(fix_status) {
+    const r = await db.query(
+      `INSERT INTO test_failures
+         (project_id, failure_signature, sample_error_message, occurrence_count,
+          first_seen_at, last_seen_at, fix_status)
+       VALUES ($1, $2, 'err', 1, NOW(), NOW(), $3)
+       RETURNING id`,
+      [seed.projectId, `markwf-${fix_status}-${Date.now()}-${Math.random()}`, fix_status]
+    );
+    return Number(r.rows[0].id);
+  }
+
+  it('happy path from open: flips to wont_fix and sets resolved_at', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    const id = await seedFailureWithStatus('open');
+
+    const out = await markWontFix(id, { triggeredBy: 99 }, { db, logger: silentLogger });
+
+    expect(out.id).toBe(id);
+    expect(out.fix_status).toBe('wont_fix');
+    expect(out.resolved_at).toBeTruthy();
+
+    // Verify persistence (not just returned shape).
+    const after = await db.query(`SELECT fix_status, resolved_at FROM test_failures WHERE id = $1`, [id]);
+    expect(after.rows[0].fix_status).toBe('wont_fix');
+    expect(after.rows[0].resolved_at).toBeTruthy();
+  });
+
+  it('happy path from fix_proposed: also markable (unsticks crashed-tick rows)', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    const id = await seedFailureWithStatus('fix_proposed');
+    const out = await markWontFix(id, {}, { db, logger: silentLogger });
+    expect(out.fix_status).toBe('wont_fix');
+  });
+
+  it('409 when row is already wont_fix — does NOT bump resolved_at', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    const id = await seedFailureWithStatus('wont_fix');
+    // Pin a known resolved_at so we can assert it's unchanged.
+    await db.query(
+      `UPDATE test_failures SET resolved_at = '2020-01-01T00:00:00Z' WHERE id = $1`,
+      [id]
+    );
+
+    await expect(markWontFix(id, {}, { db, logger: silentLogger })).rejects.toMatchObject({
+      statusCode: 409,
+    });
+
+    // Critical: refusing to mark must NOT touch the row. A stray UPDATE
+    // without the IN-guard would advance resolved_at to NOW().
+    const after = await db.query(`SELECT resolved_at FROM test_failures WHERE id = $1`, [id]);
+    expect(after.rows[0].resolved_at.toISOString()).toBe('2020-01-01T00:00:00.000Z');
+  });
+
+  it('409 when row is resolved (refuses to reverse a real success)', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    const id = await seedFailureWithStatus('resolved');
+    await expect(markWontFix(id, {}, { db, logger: silentLogger })).rejects.toMatchObject({
+      statusCode: 409,
+      code: 'CONFLICT',
+    });
+  });
+
+  it('404 when the id does not exist at all', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    await expect(markWontFix(999999998, {}, { db, logger: silentLogger })).rejects.toMatchObject({
+      statusCode: 404,
+      code: 'NOT_FOUND',
+    });
+  });
+
+  it('wont_fix-then-reopen round-trips back to open with resolved_at cleared', async () => {
+    // End-to-end check that PR #28 + this PR compose: mark → reopen
+    // returns the row to a clean 'open' state. Validates that the
+    // resolved_at-cleared invariant from reopenFailure works against
+    // a row resolved_at-set by markWontFix.
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    const id = await seedFailureWithStatus('open');
+    const marked = await markWontFix(id, {}, { db, logger: silentLogger });
+    expect(marked.fix_status).toBe('wont_fix');
+    expect(marked.resolved_at).toBeTruthy();
+
+    const reopened = await reopenFailure(id, {}, { db, logger: silentLogger });
+    expect(reopened.fix_status).toBe('open');
+    expect(reopened.resolved_at).toBeNull();
   });
 });

@@ -27,7 +27,7 @@ jest.mock('pg', () => {
   return { Pool };
 });
 
-const { listFailures, getFailureDetail, reopenFailure, DEFAULT_LIMIT, MAX_LIMIT } =
+const { listFailures, getFailureDetail, reopenFailure, markWontFix, DEFAULT_LIMIT, MAX_LIMIT } =
   require('../src/services/autoFixFailuresService');
 
 function makeDb(responses) {
@@ -322,6 +322,108 @@ describe('autoFixFailuresService.reopenFailure', () => {
     await expect(reopenFailure('abc', {}, { db, logger: silentLogger })).rejects.toMatchObject({ statusCode: 404 });
     await expect(reopenFailure(-1, {}, { db, logger: silentLogger })).rejects.toMatchObject({ statusCode: 404 });
     await expect(reopenFailure(0, {}, { db, logger: silentLogger })).rejects.toMatchObject({ statusCode: 404 });
+    expect(db.query).not.toHaveBeenCalled();
+  });
+});
+
+describe('autoFixFailuresService.markWontFix', () => {
+  const silentLogger = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
+
+  it('happy path from open: UPDATE matches -> returns refreshed detail, sets resolved_at', async () => {
+    const db = makeDb([
+      [/UPDATE test_failures\s+SET fix_status = 'wont_fix'/, [{ post_status: 'wont_fix' }]],
+      [/FROM test_failures/, [fakeFailure({ id: 42, fix_status: 'wont_fix' })]],
+      [/FROM fix_attempts/, []],
+    ]);
+    const warnSpy = jest.fn();
+
+    const out = await markWontFix(42, { triggeredBy: 7 },
+      { db, logger: { ...silentLogger, warn: warnSpy } });
+
+    expect(out.id).toBe(42);
+    expect(out.fix_status).toBe('wont_fix');
+
+    // The conditional UPDATE accepts BOTH open and fix_proposed as
+    // legal source states — the IN guard is the safety contract.
+    const upd = db.calls.find((c) => /UPDATE test_failures/.test(c.sql));
+    expect(upd.sql).toMatch(/fix_status IN \('open', 'fix_proposed'\)/);
+    // resolved_at is set to NOW() on success — parity with the auto-cap
+    // path from PR #25 ("time the loop stopped trying").
+    expect(upd.sql).toMatch(/resolved_at = NOW\(\)/);
+    expect(upd.params).toEqual([42]);
+
+    const auditWarn = warnSpy.mock.calls.find(
+      (c) => c[0] && c[0].event === 'autofix.failure.wont_fix_manual'
+    );
+    expect(auditWarn).toBeTruthy();
+    expect(auditWarn[0]).toMatchObject({ failureId: 42, triggeredBy: 7 });
+  });
+
+  it('happy path from fix_proposed: also legal (lets ops unstick crashed-tick rows)', async () => {
+    // The contract being pinned: 'fix_proposed' IS markable, not just
+    // 'open'. The IN clause in the SQL makes the trip; this test
+    // catches a future refactor that narrows the guard to 'open' only.
+    const db = makeDb([
+      [/UPDATE test_failures/, [{ post_status: 'wont_fix' }]],
+      [/FROM test_failures/, [fakeFailure({ id: 5, fix_status: 'wont_fix' })]],
+      [/FROM fix_attempts/, []],
+    ]);
+    const out = await markWontFix(5, {}, { db, logger: silentLogger });
+    expect(out.fix_status).toBe('wont_fix');
+  });
+
+  it('404 NOT_FOUND when the id does not exist', async () => {
+    const db = makeDb([
+      [/UPDATE test_failures/, []],
+      [/SELECT fix_status FROM test_failures/, []],
+    ]);
+    await expect(markWontFix(999, {}, { db, logger: silentLogger }))
+      .rejects.toMatchObject({ statusCode: 404, code: 'NOT_FOUND' });
+  });
+
+  it('409 CONFLICT when row is already wont_fix (no-op trap)', async () => {
+    const db = makeDb([
+      [/UPDATE test_failures/, []],
+      [/SELECT fix_status FROM test_failures/, [{ fix_status: 'wont_fix' }]],
+    ]);
+    await expect(markWontFix(1, {}, { db, logger: silentLogger })).rejects.toMatchObject({
+      statusCode: 409,
+      code: 'CONFLICT',
+      message: expect.stringMatching(/already marked wont_fix/i),
+    });
+  });
+
+  it('409 CONFLICT when row is resolved (refuses to reverse a real success)', async () => {
+    // This is the SAFETY guarantee: a resolved row means the fix
+    // actually verified. Marking it wont_fix would race the merge
+    // path and confuse the lineage. Pinning the refusal here so a
+    // future refactor that widens the IN clause notices.
+    const db = makeDb([
+      [/UPDATE test_failures/, []],
+      [/SELECT fix_status FROM test_failures/, [{ fix_status: 'resolved' }]],
+    ]);
+    await expect(markWontFix(1, {}, { db, logger: silentLogger })).rejects.toMatchObject({
+      statusCode: 409,
+      message: expect.stringMatching(/race the merge path/i),
+    });
+  });
+
+  it('409 CONFLICT when row is fix_merged (PR in flight)', async () => {
+    const db = makeDb([
+      [/UPDATE test_failures/, []],
+      [/SELECT fix_status FROM test_failures/, [{ fix_status: 'fix_merged' }]],
+    ]);
+    await expect(markWontFix(1, {}, { db, logger: silentLogger })).rejects.toMatchObject({
+      statusCode: 409,
+      message: expect.stringMatching(/PR is in flight/i),
+    });
+  });
+
+  it('throws NotFoundError on non-numeric / negative / zero id (no SQL fires)', async () => {
+    const db = makeDb([]);
+    await expect(markWontFix('abc', {}, { db, logger: silentLogger })).rejects.toMatchObject({ statusCode: 404 });
+    await expect(markWontFix(-1, {}, { db, logger: silentLogger })).rejects.toMatchObject({ statusCode: 404 });
+    await expect(markWontFix(0, {}, { db, logger: silentLogger })).rejects.toMatchObject({ statusCode: 404 });
     expect(db.query).not.toHaveBeenCalled();
   });
 });

@@ -260,10 +260,99 @@ async function reopenFailure(id, opts = {}, deps = {}) {
   return getFailureDetail(failureId, { db });
 }
 
+/**
+ * Pre-emptive wont_fix — the inverse of reopenFailure. Use case:
+ * operator sees a known-noisy failure on the dashboard (e.g. a flaky
+ * spec waiting on a CI-infra fix) and wants to stop the autofix loop
+ * from burning 3 quota slots before the cap auto-fires.
+ *
+ * Legal source states:
+ *   'open'         the common case — operator triages before the
+ *                  cron picks the row up
+ *   'fix_proposed' lets ops unstick rows from a crashed tick. Worst
+ *                  case: an LLM call is already in-flight; the next
+ *                  tick respects the new wont_fix and skips. The
+ *                  in-flight call writes its fix_attempts row with
+ *                  whatever status, but its recordVerifyFailed UPDATE
+ *                  is `WHERE id = $1 AND fix_status = 'fix_proposed'`
+ *                  — it won't reset our wont_fix back to 'open' (no
+ *                  rows match the guard).
+ * Refused states:
+ *   'fix_merged'   mid-promotion to a real PR — would confuse markMerged
+ *   'resolved'     fix actually worked — refusing here avoids
+ *                  reversing a real success
+ *   'wont_fix'     already wont_fix (no-op trap)
+ *
+ * Sets resolved_at = NOW() for parity with PR #25's auto-cap path
+ * — "time the loop stopped trying," whether by cap-hit or operator
+ * intervention.
+ *
+ * Returns the refreshed detail so the dashboard re-renders without
+ * a follow-up GET.
+ *
+ * @param {number} id
+ * @param {object?} opts
+ * @param {number?} opts.triggeredBy   operator user id for the audit event
+ * @param {object?} deps
+ */
+async function markWontFix(id, opts = {}, deps = {}) {
+  const db = deps.db || require('../db');
+  const logger = deps.logger || require('../utils/logger');
+  const failureId = Number(id);
+  if (!Number.isFinite(failureId) || failureId <= 0) {
+    throw new NotFoundError('test failure');
+  }
+
+  // Atomic conditional UPDATE. The IN-list guard is what makes this
+  // safe — we never overwrite resolved / fix_merged / already-wont_fix
+  // states by accident. RETURNING fix_status lets the caller log the
+  // source state for audit (so an ops dashboard can chart "operators
+  // pre-empted the cap N times vs. operators cleaned up stuck rows M
+  // times").
+  const upd = await db.query(
+    `UPDATE test_failures
+        SET fix_status = 'wont_fix',
+            resolved_at = NOW()
+      WHERE id = $1 AND fix_status IN ('open', 'fix_proposed')
+     RETURNING (SELECT fix_status FROM test_failures WHERE id = $1) AS post_status`,
+    [failureId]
+  );
+
+  if (upd.rowCount === 0) {
+    // Disambiguate missing-row (404) from non-markable-state (409),
+    // same pattern as reopenFailure above.
+    const check = await db.query(
+      `SELECT fix_status FROM test_failures WHERE id = $1`,
+      [failureId]
+    );
+    if (check.rows.length === 0) {
+      throw new NotFoundError('test failure');
+    }
+    const current = check.rows[0].fix_status;
+    const hints = {
+      wont_fix: 'This failure is already marked wont_fix.',
+      resolved: 'The fix has already verified for this failure — reversing it would race the merge path.',
+      fix_merged: 'A PR is in flight for this failure — wait for the merge to complete.',
+    };
+    throw new ConflictError(
+      `Cannot mark wont_fix — failure is in fix_status='${current}'. ` +
+      `Only 'open' or 'fix_proposed' rows can be manually capped. ` +
+      (hints[current] || '')
+    );
+  }
+
+  logger.warn({ event: 'autofix.failure.wont_fix_manual', failureId,
+    triggeredBy: opts.triggeredBy || null },
+    'autofix: failure manually marked wont_fix by operator');
+
+  return getFailureDetail(failureId, { db });
+}
+
 module.exports = {
   listFailures,
   getFailureDetail,
   reopenFailure,
+  markWontFix,
   // exported for tests
   FIX_STATUSES,
   DEFAULT_LIMIT,
