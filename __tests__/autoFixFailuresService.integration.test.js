@@ -12,7 +12,8 @@ process.env.NODE_ENV = 'test';
 
 const { Pool } = require('pg');
 const db = require('../src/db');
-const { listFailures, getFailureDetail, reopenFailure, markWontFix, getAttemptDiff } = require('../src/services/autoFixFailuresService');
+const { listFailures, getFailureDetail, reopenFailure, markWontFix, getAttemptDiff,
+  bulkMarkWontFix, bulkReopen } = require('../src/services/autoFixFailuresService');
 
 let canConnect = false;
 let seed = null;
@@ -444,5 +445,84 @@ describe('autoFixFailuresService.getAttemptDiff [real DB]', () => {
     if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
     await expect(getAttemptDiff(999999997, 999999996, { db }))
       .rejects.toMatchObject({ statusCode: 404, code: 'NOT_FOUND' });
+  });
+});
+
+describe('autoFixFailuresService.bulk operations [real DB]', () => {
+  const silentLogger = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
+
+  // Helper that returns ids for failures in the requested fix_status.
+  // Used per-test so each scenario has a known set of seeded rows.
+  async function seedFailure(fix_status, sig) {
+    const r = await db.query(
+      `INSERT INTO test_failures
+         (project_id, failure_signature, sample_error_message, occurrence_count,
+          first_seen_at, last_seen_at, fix_status)
+       VALUES ($1, $2, 'err', 1, NOW(), NOW(), $3)
+       RETURNING id`,
+      [seed.projectId, sig, fix_status]
+    );
+    return Number(r.rows[0].id);
+  }
+
+  it('bulkMarkWontFix: partial success — open and fix_proposed succeed, resolved is 409', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    // Three rows, three source states. The first two are markable
+    // (PR #29 contract); the third must be refused as CONFLICT.
+    const openId = await seedFailure('open', `bulk-mark-open-${Date.now()}`);
+    const proposedId = await seedFailure('fix_proposed', `bulk-mark-proposed-${Date.now()}`);
+    const resolvedId = await seedFailure('resolved', `bulk-mark-resolved-${Date.now()}`);
+
+    const out = await bulkMarkWontFix([openId, proposedId, resolvedId], { triggeredBy: 7 },
+      { db, logger: silentLogger });
+
+    expect(out.succeeded).toEqual(expect.arrayContaining([openId, proposedId]));
+    expect(out.succeeded).toHaveLength(2);
+    expect(out.failed).toHaveLength(1);
+    expect(out.failed[0]).toMatchObject({
+      id: resolvedId,
+      error: { code: 'CONFLICT' },
+    });
+
+    // Real-DB verification: the two markable rows actually flipped.
+    const after = await db.query(
+      `SELECT id::int AS id, fix_status FROM test_failures WHERE id = ANY($1::int[])`,
+      [[openId, proposedId, resolvedId]]
+    );
+    const byId = Object.fromEntries(after.rows.map((r) => [r.id, r.fix_status]));
+    expect(byId[openId]).toBe('wont_fix');
+    expect(byId[proposedId]).toBe('wont_fix');
+    // CRITICAL: the refused row is unchanged. A bulk driver that
+    // didn't isolate per-id could leak state across rows.
+    expect(byId[resolvedId]).toBe('resolved');
+  });
+
+  it('bulkReopen: only wont_fix is reopenable; other states are CONFLICT', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    const wontFixId = await seedFailure('wont_fix', `bulk-reopen-wf-${Date.now()}`);
+    const openId = await seedFailure('open', `bulk-reopen-open-${Date.now()}`);
+
+    const out = await bulkReopen([wontFixId, openId], {}, { db, logger: silentLogger });
+
+    expect(out.succeeded).toEqual([wontFixId]);
+    expect(out.failed).toHaveLength(1);
+    expect(out.failed[0]).toMatchObject({
+      id: openId,
+      error: { code: 'CONFLICT' },
+    });
+  });
+
+  it('bulkMarkWontFix: missing id → NOT_FOUND in failed array, other ids unaffected', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    const realId = await seedFailure('open', `bulk-mark-missing-${Date.now()}`);
+    const fakeId = 999999985;
+
+    const out = await bulkMarkWontFix([realId, fakeId], {}, { db, logger: silentLogger });
+
+    expect(out.succeeded).toEqual([realId]);
+    expect(out.failed[0]).toMatchObject({
+      id: fakeId,
+      error: { code: 'NOT_FOUND' },
+    });
   });
 });

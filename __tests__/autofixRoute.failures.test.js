@@ -22,6 +22,17 @@ jest.mock('../src/services/autoFixFailuresService', () => ({
   reopenFailure: jest.fn(),
   markWontFix: jest.fn(),
   getAttemptDiff: jest.fn(),
+  bulkMarkWontFix: jest.fn(),
+  bulkReopen: jest.fn(),
+  // Mirror the real export so the route's zod max-size message
+  // matches what's enforced.
+  BULK_MAX_IDS: 100,
+}));
+
+// Bypass admin-mutation rate limiter — this suite has many mutating
+// requests and was tripping 10/min during a single test run.
+jest.mock('../src/middleware/rateLimiter', () => ({
+  adminMutationLimiter: (_req, _res, next) => next(),
 }));
 
 jest.mock('pg', () => {
@@ -303,5 +314,124 @@ describe('GET /api/autofix/failures/:failureId/attempts/:attemptId/diff', () => 
     const res = await request(app).get('/api/autofix/failures/7/attempts/99/diff');
     expect(res.status).toBe(403);
     expect(autoFixFailuresService.getAttemptDiff).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/autofix/failures/bulk/wont_fix', () => {
+  let app;
+  beforeAll(() => { app = buildApp(); });
+  beforeEach(() => {
+    autoFixFailuresService.bulkMarkWontFix.mockReset();
+    mockIsAdmin = true;
+  });
+
+  it('200 + payload pass-through; passes ids + triggeredBy to the service', async () => {
+    const payload = { succeeded: [1, 2], failed: [{ id: 3, error: { code: 'NOT_FOUND', message: 'gone' } }] };
+    autoFixFailuresService.bulkMarkWontFix.mockResolvedValueOnce(payload);
+
+    const res = await request(app).post('/api/autofix/failures/bulk/wont_fix')
+      .send({ ids: [1, 2, 3] });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(payload);
+    expect(autoFixFailuresService.bulkMarkWontFix).toHaveBeenCalledWith(
+      [1, 2, 3], { triggeredBy: 1 }
+    );
+  });
+
+  // Regression: /failures/:id/wont_fix would shadow /failures/bulk/wont_fix
+  // if registered first (Express matches "bulk" as the :id param). Pin the
+  // route order so a future refactor can't silently break the bulk endpoint.
+  it('regression: bulk path does NOT dispatch to the single-id markWontFix handler', async () => {
+    autoFixFailuresService.bulkMarkWontFix.mockResolvedValueOnce({ succeeded: [1], failed: [] });
+    await request(app).post('/api/autofix/failures/bulk/wont_fix').send({ ids: [1] });
+    expect(autoFixFailuresService.bulkMarkWontFix).toHaveBeenCalledTimes(1);
+    // The single-id markWontFix MUST NOT have been called with id="bulk".
+    expect(autoFixFailuresService.markWontFix).not.toHaveBeenCalled();
+  });
+
+  it('200 even when all ids failed (partial success is a body field, not a status code)', async () => {
+    autoFixFailuresService.bulkMarkWontFix.mockResolvedValueOnce({
+      succeeded: [], failed: [{ id: 1, error: { code: 'NOT_FOUND' } }],
+    });
+    const res = await request(app).post('/api/autofix/failures/bulk/wont_fix').send({ ids: [1] });
+    expect(res.status).toBe(200);
+    expect(res.body.failed).toHaveLength(1);
+  });
+
+  it('400 VALIDATION_ERROR when ids is missing', async () => {
+    const res = await request(app).post('/api/autofix/failures/bulk/wont_fix').send({});
+    expect(res.status).toBe(400);
+    expect(autoFixFailuresService.bulkMarkWontFix).not.toHaveBeenCalled();
+  });
+
+  it('400 VALIDATION_ERROR when ids is empty (no-op trap)', async () => {
+    const res = await request(app).post('/api/autofix/failures/bulk/wont_fix').send({ ids: [] });
+    expect(res.status).toBe(400);
+    expect(autoFixFailuresService.bulkMarkWontFix).not.toHaveBeenCalled();
+  });
+
+  it('400 VALIDATION_ERROR when ids exceeds BULK_MAX_IDS (DoS guard)', async () => {
+    const tooMany = Array.from({ length: 101 }, (_, i) => i + 1);
+    const res = await request(app).post('/api/autofix/failures/bulk/wont_fix').send({ ids: tooMany });
+    expect(res.status).toBe(400);
+    expect(autoFixFailuresService.bulkMarkWontFix).not.toHaveBeenCalled();
+  });
+
+  it('400 VALIDATION_ERROR when any id is non-positive', async () => {
+    const res = await request(app).post('/api/autofix/failures/bulk/wont_fix').send({ ids: [1, 0, 3] });
+    expect(res.status).toBe(400);
+  });
+
+  it('400 VALIDATION_ERROR when any id is non-integer', async () => {
+    const res = await request(app).post('/api/autofix/failures/bulk/wont_fix').send({ ids: [1, 'two', 3] });
+    expect(res.status).toBe(400);
+  });
+
+  it('401 without auth', async () => {
+    const res = await request(app).post('/api/autofix/failures/bulk/wont_fix')
+      .set('x-test-noauth', '1').send({ ids: [1] });
+    expect(res.status).toBe(401);
+  });
+
+  it('403 for non-admin', async () => {
+    mockIsAdmin = false;
+    const res = await request(app).post('/api/autofix/failures/bulk/wont_fix').send({ ids: [1] });
+    expect(res.status).toBe(403);
+  });
+});
+
+describe('POST /api/autofix/failures/bulk/reopen', () => {
+  let app;
+  beforeAll(() => { app = buildApp(); });
+  beforeEach(() => {
+    autoFixFailuresService.bulkReopen.mockReset();
+    mockIsAdmin = true;
+  });
+
+  it('200 + payload; calls bulkReopen (not bulkMarkWontFix) for distinct verb semantics', async () => {
+    const payload = { succeeded: [5], failed: [] };
+    autoFixFailuresService.bulkReopen.mockResolvedValueOnce(payload);
+    const res = await request(app).post('/api/autofix/failures/bulk/reopen').send({ ids: [5] });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(payload);
+    expect(autoFixFailuresService.bulkReopen).toHaveBeenCalledWith([5], { triggeredBy: 1 });
+  });
+
+  it('shares the same zod schema → same 400 cases (sanity)', async () => {
+    const res = await request(app).post('/api/autofix/failures/bulk/reopen').send({});
+    expect(res.status).toBe(400);
+  });
+
+  it('401 without auth', async () => {
+    const res = await request(app).post('/api/autofix/failures/bulk/reopen')
+      .set('x-test-noauth', '1').send({ ids: [1] });
+    expect(res.status).toBe(401);
+  });
+
+  it('403 for non-admin', async () => {
+    mockIsAdmin = false;
+    const res = await request(app).post('/api/autofix/failures/bulk/reopen').send({ ids: [1] });
+    expect(res.status).toBe(403);
   });
 });

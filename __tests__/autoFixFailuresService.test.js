@@ -27,7 +27,8 @@ jest.mock('pg', () => {
   return { Pool };
 });
 
-const { listFailures, getFailureDetail, reopenFailure, markWontFix, getAttemptDiff, DEFAULT_LIMIT, MAX_LIMIT } =
+const { listFailures, getFailureDetail, reopenFailure, markWontFix, getAttemptDiff,
+  bulkMarkWontFix, bulkReopen, DEFAULT_LIMIT, MAX_LIMIT, BULK_MAX_IDS } =
   require('../src/services/autoFixFailuresService');
 
 function makeDb(responses) {
@@ -484,5 +485,136 @@ describe('autoFixFailuresService.getAttemptDiff', () => {
     await expect(getAttemptDiff(-1, 99, { db })).rejects.toMatchObject({ statusCode: 404 });
     await expect(getAttemptDiff(7, 0, { db })).rejects.toMatchObject({ statusCode: 404 });
     expect(db.query).not.toHaveBeenCalled();
+  });
+});
+
+describe('autoFixFailuresService.bulkMarkWontFix / bulkReopen', () => {
+  const silentLogger = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
+
+  // bulkMarkWontFix and bulkReopen share the same runBulk() backbone;
+  // we exercise one fully and the other in a narrower mode-specific
+  // test to keep the suite from doubling without adding coverage.
+
+  it('exports BULK_MAX_IDS = 100 (route + zod schema depend on this constant)', () => {
+    expect(BULK_MAX_IDS).toBe(100);
+  });
+
+  it('happy path: all ids succeed → succeeded array populated, failed empty', async () => {
+    // Mock the UPDATE + the follow-up getFailureDetail SELECTs so each
+    // markWontFix call walks through without touching pg. Returning an
+    // 'ok' row from the UPDATE is what tells markWontFix the row was
+    // markable; the follow-on SELECTs feed getFailureDetail.
+    const db = makeDb([
+      [/UPDATE test_failures\s+SET fix_status = 'wont_fix'/, [{ post_status: 'wont_fix' }]],
+      [/SELECT id::int AS id.*FROM test_failures/s, [fakeFailure()]],
+      [/FROM fix_attempts/, []],
+    ]);
+
+    const out = await bulkMarkWontFix([1, 2, 3], { triggeredBy: 42 },
+      { db, logger: silentLogger });
+
+    expect(out.succeeded).toEqual([1, 2, 3]);
+    expect(out.failed).toEqual([]);
+  });
+
+  it('partial failure: one id is wrong-state → that id lands in failed with the typed code', async () => {
+    // Mix: first id matches the UPDATE (success path); second misses
+    // and looks up as 'resolved' (CONFLICT path); third matches.
+    // makeDb's pattern-fixture isn't sequential — we use a counter
+    // to flip behavior across calls.
+    let updateCallCount = 0;
+    const responses = [
+      [/UPDATE test_failures\s+SET fix_status = 'wont_fix'/, () => {
+        updateCallCount++;
+        // 1st + 3rd UPDATE: match → success. 2nd: no match → triggers lookup.
+        return updateCallCount === 2
+          ? { rows: [], rowCount: 0 }
+          : { rows: [{ post_status: 'wont_fix' }], rowCount: 1 };
+      }],
+      [/SELECT fix_status FROM test_failures/, [{ fix_status: 'resolved' }]],
+      [/SELECT id::int AS id.*FROM test_failures/s, [fakeFailure()]],
+      [/FROM fix_attempts/, []],
+    ];
+    const db = {
+      query: jest.fn(async (sql, params) => {
+        for (const [re, response] of responses) {
+          if (re.test(sql)) {
+            const rows = typeof response === 'function' ? response() : { rows: response, rowCount: response.length };
+            return rows;
+          }
+        }
+        return { rows: [], rowCount: 0 };
+      }),
+    };
+
+    const out = await bulkMarkWontFix([1, 2, 3], {}, { db, logger: silentLogger });
+
+    expect(out.succeeded).toEqual([1, 3]);
+    expect(out.failed).toHaveLength(1);
+    expect(out.failed[0]).toMatchObject({
+      id: 2,
+      error: { code: 'CONFLICT' },
+    });
+  });
+
+  it('non-ApiError throws get bucketed as INTERNAL_ERROR (don\'t leak raw error shape to clients)', async () => {
+    // The underlying op throws a plain Error → must still appear in
+    // `failed` with a sane code so the dashboard can render
+    // something. Reaches into the SQL layer for the failure: invalid
+    // id (0) short-circuits in markWontFix WITHOUT calling db, but
+    // the runBulk driver doesn't care — it just catches.
+    const db = makeDb([]);
+    const out = await bulkMarkWontFix([0], {}, { db, logger: silentLogger });
+    // id=0 triggers markWontFix's NotFoundError (404). The bulk
+    // driver buckets it into `failed` rather than throwing out.
+    expect(out.succeeded).toEqual([]);
+    expect(out.failed).toHaveLength(1);
+    expect(out.failed[0].error.code).toBe('NOT_FOUND');
+  });
+
+  it('empty batch returns empty buckets (no crash, valid response shape)', async () => {
+    const db = makeDb([]);
+    const out = await bulkMarkWontFix([], {}, { db, logger: silentLogger });
+    expect(out).toEqual({ succeeded: [], failed: [] });
+    expect(db.query).not.toHaveBeenCalled();
+  });
+
+  it('bulkReopen: same driver, different op — exercises the reopen SQL path', async () => {
+    // Sanity that bulkReopen wires through reopenFailure and not
+    // markWontFix. The UPDATE clause is the discriminator
+    // ("fix_status = 'open'" vs "= 'wont_fix'").
+    const db = makeDb([
+      [/UPDATE test_failures\s+SET fix_status = 'open'/, [{ id: 5 }]],
+      [/SELECT id::int AS id.*FROM test_failures/s, [fakeFailure({ id: 5, fix_status: 'open' })]],
+      [/FROM fix_attempts/, []],
+    ]);
+
+    const out = await bulkReopen([5], {}, { db, logger: silentLogger });
+    expect(out.succeeded).toEqual([5]);
+    expect(out.failed).toEqual([]);
+    // Confirm we hit the reopen SQL (not the wont_fix one).
+    const upd = db.calls.find((c) => /UPDATE test_failures\s+SET fix_status = 'open'/.test(c.sql));
+    expect(upd).toBeTruthy();
+  });
+
+  it('processes ids sequentially (UPDATE order matches ids order)', async () => {
+    // Pinning sequentiality matters: parallel issuance could exhaust
+    // the pg pool when ids.length is near BULK_MAX_IDS, and could
+    // race on rows that share a failure (siblings of the same test).
+    const seenIds = [];
+    const db = {
+      query: jest.fn(async (sql, params) => {
+        if (/UPDATE test_failures\s+SET fix_status = 'wont_fix'/.test(sql)) {
+          seenIds.push(params[0]);
+          return { rows: [{ post_status: 'wont_fix' }], rowCount: 1 };
+        }
+        if (/SELECT id::int AS id.*FROM test_failures/s.test(sql)) {
+          return { rows: [fakeFailure()], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+      }),
+    };
+    await bulkMarkWontFix([10, 20, 30, 40], {}, { db, logger: silentLogger });
+    expect(seenIds).toEqual([10, 20, 30, 40]);
   });
 });

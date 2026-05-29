@@ -154,6 +154,43 @@ router.get('/failures', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// Bulk variants — dashboard multi-select. Same auth + rate limit as
+// the single-id endpoints. Per-id results are collected; one bad id
+// does NOT fail the batch. Always returns 200; the response body's
+// `failed` array tells the UI what went wrong per row.
+//
+// REGISTERED BEFORE /failures/:id/... routes because Express matches
+// in declaration order. Otherwise `/failures/bulk/wont_fix` would
+// hit `/failures/:id/wont_fix` with id="bulk".
+const bulkFailuresBody = z.object({
+  ids: z.array(z.number().int().positive())
+    .min(1, 'ids must contain at least one id')
+    .max(autoFixFailuresService.BULK_MAX_IDS,
+      `ids must contain at most ${autoFixFailuresService.BULK_MAX_IDS} entries`),
+});
+
+router.post('/failures/bulk/wont_fix',
+  adminMutationLimiter, validate(bulkFailuresBody),
+  async (req, res, next) => {
+    try {
+      const result = await autoFixFailuresService.bulkMarkWontFix(req.body.ids, {
+        triggeredBy: req.user && req.user.id,
+      });
+      res.json(result);
+    } catch (err) { next(err); }
+  });
+
+router.post('/failures/bulk/reopen',
+  adminMutationLimiter, validate(bulkFailuresBody),
+  async (req, res, next) => {
+    try {
+      const result = await autoFixFailuresService.bulkReopen(req.body.ids, {
+        triggeredBy: req.user && req.user.id,
+      });
+      res.json(result);
+    } catch (err) { next(err); }
+  });
+
 // Full lineage for one failure: metadata + every fix_attempts row in
 // chronological order. The :id segment is validated by the service
 // (NaN/<=0 throws NotFoundError -> HTTP 404 via errorHandler).
