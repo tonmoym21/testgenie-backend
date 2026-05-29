@@ -27,7 +27,7 @@ jest.mock('pg', () => {
   return { Pool };
 });
 
-const { listFailures, getFailureDetail, reopenFailure, markWontFix, DEFAULT_LIMIT, MAX_LIMIT } =
+const { listFailures, getFailureDetail, reopenFailure, markWontFix, getAttemptDiff, DEFAULT_LIMIT, MAX_LIMIT } =
   require('../src/services/autoFixFailuresService');
 
 function makeDb(responses) {
@@ -424,6 +424,65 @@ describe('autoFixFailuresService.markWontFix', () => {
     await expect(markWontFix('abc', {}, { db, logger: silentLogger })).rejects.toMatchObject({ statusCode: 404 });
     await expect(markWontFix(-1, {}, { db, logger: silentLogger })).rejects.toMatchObject({ statusCode: 404 });
     await expect(markWontFix(0, {}, { db, logger: silentLogger })).rejects.toMatchObject({ statusCode: 404 });
+    expect(db.query).not.toHaveBeenCalled();
+  });
+});
+
+describe('autoFixFailuresService.getAttemptDiff', () => {
+  it('happy path: returns the heavy diff fields plus light context', async () => {
+    const db = makeDb([
+      [/FROM fix_attempts/, [{
+        id: 99, test_failure_id: 7,
+        status: 'verified', model_provider: 'openai', model_name: 'gpt-4o',
+        branch_name: 'testforge/autofix/failure-7-abc',
+        patch_diff: '--- a/login.spec.ts\n+++ b/login.spec.ts\n@@ -1 +1 @@\n-old\n+new',
+        new_code: 'new spec body',
+        prompt_excerpt: 'system: ...\nuser: ...',
+      }]],
+    ]);
+
+    const out = await getAttemptDiff(7, 99, { db });
+
+    expect(out.id).toBe(99);
+    expect(out.test_failure_id).toBe(7);
+    expect(out.patch_diff).toMatch(/login\.spec\.ts/);
+    expect(out.new_code).toBe('new spec body');
+    expect(out.prompt_excerpt).toMatch(/system:/);
+    // Lightweight context fields for the modal header
+    expect(out.status).toBe('verified');
+    expect(out.model_name).toBe('gpt-4o');
+    expect(out.branch_name).toMatch(/failure-7/);
+  });
+
+  it('uses BOTH ids in the WHERE clause (defense-in-depth against cross-failure linking)', async () => {
+    // The bug being pinned: a SELECT keyed only on attempt id would
+    // happily return an attempt owned by a different failure when the
+    // dashboard URL has a stale/wrong failureId. The compound WHERE
+    // guarantees a clean 404 instead.
+    const db = makeDb([[/FROM fix_attempts/, [{ id: 99, test_failure_id: 7,
+      patch_diff: 'x', new_code: null, prompt_excerpt: null,
+      status: 'failed', model_provider: 'x', model_name: 'x', branch_name: 'x' }]]]);
+    await getAttemptDiff(7, 99, { db });
+    const call = db.calls.find((c) => /FROM fix_attempts/.test(c.sql));
+    expect(call.sql).toMatch(/WHERE id = \$1 AND test_failure_id = \$2/);
+    // attempt id is $1, failure id is $2 — order matches the SQL.
+    expect(call.params).toEqual([99, 7]);
+  });
+
+  it('404 NOT_FOUND when the attempt does not exist under the given failure', async () => {
+    const db = makeDb([[/FROM fix_attempts/, []]]);
+    await expect(getAttemptDiff(7, 99, { db })).rejects.toMatchObject({
+      statusCode: 404,
+      code: 'NOT_FOUND',
+    });
+  });
+
+  it('404 on invalid failureId / attemptId (no SQL fires)', async () => {
+    const db = makeDb([]);
+    await expect(getAttemptDiff('abc', 99, { db })).rejects.toMatchObject({ statusCode: 404 });
+    await expect(getAttemptDiff(7, 'abc', { db })).rejects.toMatchObject({ statusCode: 404 });
+    await expect(getAttemptDiff(-1, 99, { db })).rejects.toMatchObject({ statusCode: 404 });
+    await expect(getAttemptDiff(7, 0, { db })).rejects.toMatchObject({ statusCode: 404 });
     expect(db.query).not.toHaveBeenCalled();
   });
 });

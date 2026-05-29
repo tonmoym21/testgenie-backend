@@ -198,4 +198,24 @@ router.post('/failures/:id/wont_fix', adminMutationLimiter, async (req, res, nex
   } catch (err) { next(err); }
 });
 
+// Heavy-payload diff view for a single fix_attempts row — returns
+// patch_diff, new_code, prompt_excerpt (the columns GET /failures/:id
+// deliberately excluded for payload size). Used by the dashboard
+// "view diff" modal. Read-only, no rate limit.
+//
+// Nested under /failures/:failureId/ for two reasons:
+//   1. RESTful — the data model is "attempts belong to a failure"
+//   2. Defense in depth — a buggy frontend that links the wrong
+//      failureId to an attempt gets a clean 404 instead of leaking
+//      another failure's lineage into the wrong audit context.
+router.get('/failures/:failureId/attempts/:attemptId/diff', async (req, res, next) => {
+  try {
+    const result = await autoFixFailuresService.getAttemptDiff(
+      req.params.failureId,
+      req.params.attemptId,
+    );
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
 module.exports = router;

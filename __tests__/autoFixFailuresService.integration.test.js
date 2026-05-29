@@ -12,7 +12,7 @@ process.env.NODE_ENV = 'test';
 
 const { Pool } = require('pg');
 const db = require('../src/db');
-const { listFailures, getFailureDetail, reopenFailure, markWontFix } = require('../src/services/autoFixFailuresService');
+const { listFailures, getFailureDetail, reopenFailure, markWontFix, getAttemptDiff } = require('../src/services/autoFixFailuresService');
 
 let canConnect = false;
 let seed = null;
@@ -367,5 +367,82 @@ describe('autoFixFailuresService.markWontFix [real DB]', () => {
     const reopened = await reopenFailure(id, {}, { db, logger: silentLogger });
     expect(reopened.fix_status).toBe('open');
     expect(reopened.resolved_at).toBeNull();
+  });
+});
+
+describe('autoFixFailuresService.getAttemptDiff [real DB]', () => {
+  // Seed a failure + one fix_attempts row with the heavy diff fields
+  // populated. The interesting integration check is that the compound
+  // WHERE (id + test_failure_id) returns the right row AND rejects
+  // mismatched failureId without leaking another attempt's payload.
+  async function seedFailureAndAttempt({ patch_diff, new_code, prompt_excerpt, sig }) {
+    const f = await db.query(
+      `INSERT INTO test_failures
+         (project_id, failure_signature, sample_error_message, occurrence_count,
+          first_seen_at, last_seen_at, fix_status)
+       VALUES ($1, $2, 'err', 1, NOW(), NOW(), 'open')
+       RETURNING id`,
+      [seed.projectId, sig]
+    );
+    const failureId = Number(f.rows[0].id);
+    const a = await db.query(
+      `INSERT INTO fix_attempts
+         (test_failure_id, model_provider, model_name, branch_name, status,
+          patch_diff, new_code, prompt_excerpt, started_at)
+       VALUES ($1, 'openai', 'gpt-4o', $2, 'verified', $3, $4, $5, NOW())
+       RETURNING id`,
+      [failureId, `b-${sig}`, patch_diff, new_code, prompt_excerpt]
+    );
+    return { failureId, attemptId: Number(a.rows[0].id) };
+  }
+
+  it('happy path: returns the populated heavy fields', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    const { failureId, attemptId } = await seedFailureAndAttempt({
+      patch_diff: '--- a/login.spec.ts\n+++ b/login.spec.ts\n@@ -5 +5 @@\n-old\n+new',
+      new_code: 'test("login", () => { /* new body */ });',
+      prompt_excerpt: 'system: you are a senior...\nuser: fix this',
+      sig: `diff-happy-${Date.now()}`,
+    });
+
+    const out = await getAttemptDiff(failureId, attemptId, { db });
+    expect(out.id).toBe(attemptId);
+    expect(out.test_failure_id).toBe(failureId);
+    expect(out.patch_diff).toMatch(/login\.spec\.ts/);
+    expect(out.new_code).toMatch(/new body/);
+    expect(out.prompt_excerpt).toMatch(/senior/);
+    expect(out.status).toBe('verified');
+    expect(out.model_name).toBe('gpt-4o');
+  });
+
+  it('404 when the attempt id exists but belongs to a DIFFERENT failure', async () => {
+    // The defense-in-depth contract — the unit test mocks the SQL,
+    // this test exercises the WHERE clause against real Postgres
+    // to confirm it actually filters rather than just looking like
+    // it does. Without this, a bug that drops `AND test_failure_id =`
+    // would happily leak attempts across failures.
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    const a = await seedFailureAndAttempt({
+      patch_diff: 'A', new_code: 'A', prompt_excerpt: 'A',
+      sig: `diff-cross-A-${Date.now()}`,
+    });
+    const b = await seedFailureAndAttempt({
+      patch_diff: 'B', new_code: 'B', prompt_excerpt: 'B',
+      sig: `diff-cross-B-${Date.now()}`,
+    });
+
+    // Request attempt A's diff but with failureId pointing at B → 404.
+    await expect(getAttemptDiff(b.failureId, a.attemptId, { db }))
+      .rejects.toMatchObject({ statusCode: 404 });
+
+    // Sanity: requesting against the correct failureId still works.
+    const ok = await getAttemptDiff(a.failureId, a.attemptId, { db });
+    expect(ok.patch_diff).toBe('A');
+  });
+
+  it('404 when neither id exists at all', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    await expect(getAttemptDiff(999999997, 999999996, { db }))
+      .rejects.toMatchObject({ statusCode: 404, code: 'NOT_FOUND' });
   });
 });
