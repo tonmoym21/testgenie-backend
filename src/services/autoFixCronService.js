@@ -26,10 +26,18 @@ const defaultDeps = () => ({
   proposeFix: require('./autoFixService').proposeFix,
   applyFix: require('./autoFixApplyService').applyFix,
   verifyFix: require('./autoFixVerifyService').verifyFix,
+  tryClusterLock: defaultTryClusterLock,
 });
 
 const DEFAULT_BATCH = 3;
 const DEFAULT_SCHEDULE = '*/15 * * * *';
+
+// Postgres advisory-lock key for the cron tick. Two-int form picks a
+// dedicated slot in the per-database keyspace so we can't collide with
+// any other code reaching for an advisory lock. Namespace 0xa01 reads
+// as "autofix subsystem"; id 1 is "cron tick" specifically.
+const ADVISORY_LOCK_NS = 0xa01;
+const ADVISORY_LOCK_ID = 1;
 
 // node-cron does not skip overlapping invocations. A verify step can spawn
 // Playwright for minutes; if a tick is still running when the next fires,
@@ -37,7 +45,60 @@ const DEFAULT_SCHEDULE = '*/15 * * * *';
 // spending the LLM (409 on second claim), but the 409 surfaces as
 // status:'error' in the second tick's summary, polluting metrics. This
 // in-process flag drops the overlapping call cleanly.
+//
+// The flag only protects against same-instance overlap. Horizontal scale
+// (two backend pods, two cron processes) needs a cluster-wide gate —
+// that's what defaultTryClusterLock below provides via pg_advisory_lock.
 let tickInFlight = false;
+
+/**
+ * Acquire a Postgres session-scoped advisory lock so only ONE cron tick
+ * across the whole cluster runs at a time. Returns:
+ *   - an async release function on success (caller MUST call in finally)
+ *   - null when another instance already holds the lock (skip the tick)
+ *
+ * The lock is session-scoped, which means it must be acquired AND
+ * released on the SAME connection. We pin a dedicated client from the
+ * pool for the lifetime of the tick. The release path also returns the
+ * client to the pool so a tick can't slowly drain the pool by leaking
+ * checkouts.
+ *
+ * Short-circuits to a no-op release when the injected db wrapper doesn't
+ * expose getClient — keeps unit-test stubs (which only need .query) from
+ * having to mock the full pool. Single-instance correctness still holds
+ * via the in-process tickInFlight flag in those cases.
+ */
+async function defaultTryClusterLock(db) {
+  if (!db || typeof db.getClient !== 'function') {
+    return async () => {};
+  }
+  const client = await db.getClient();
+  try {
+    const r = await client.query(
+      'SELECT pg_try_advisory_lock($1, $2) AS locked',
+      [ADVISORY_LOCK_NS, ADVISORY_LOCK_ID]
+    );
+    if (!r.rows[0] || r.rows[0].locked !== true) {
+      client.release();
+      return null;
+    }
+    return async () => {
+      try {
+        await client.query(
+          'SELECT pg_advisory_unlock($1, $2)',
+          [ADVISORY_LOCK_NS, ADVISORY_LOCK_ID]
+        );
+      } finally {
+        client.release();
+      }
+    };
+  } catch (err) {
+    // If even the try-lock query fails (DB blip, schema missing) we must
+    // still release the client back to the pool before re-raising.
+    client.release();
+    throw err;
+  }
+}
 
 function isEnabled() {
   return process.env.AUTOFIX_CRON_ENABLED === '1';
@@ -124,17 +185,35 @@ async function tick(opts = {}, deps = {}) {
     return { skipped: true, processed: 0, results: [] };
   }
 
-  // Reject overlapping invocations. Each row's verify can take minutes —
-  // letting a second tick start would race the SQL claim and inflate the
-  // 'error' bucket in the summary. The flag is process-local; a horizontally
-  // scaled deploy still relies on the SQL claim as the source of truth.
+  // Reject overlapping invocations on this process FIRST (fast path —
+  // no DB round-trip on single-instance deploys). Each row's verify can
+  // take minutes; letting a second tick start would race the SQL claim
+  // and inflate the 'error' bucket in the summary. The `scope` field
+  // tells on-call which layer caught it — 'process' here, 'cluster'
+  // below — without that field, "overlap" is ambiguous in the logs.
   if (tickInFlight) {
-    d.logger.warn({ event: 'autofix.cron.overlap' }, 'autofix-cron: previous tick still running, skipping');
-    return { skipped: true, reason: 'overlap', processed: 0, results: [] };
+    d.logger.warn({ event: 'autofix.cron.overlap', scope: 'process' },
+      'autofix-cron: previous tick still running on this instance, skipping');
+    return { skipped: true, reason: 'overlap', scope: 'process', processed: 0, results: [] };
   }
   tickInFlight = true;
 
+  // Cross-instance gate. Once two pods run this cron concurrently the
+  // in-process flag above is no longer enough — both pods see
+  // tickInFlight=false and both call findEligibleFailures(). The SQL
+  // claim still prevents double-LLM-spend per row, but Playwright in
+  // verifyFix would spawn twice for the same fix_attempt. The advisory
+  // lock makes only one pod actually do the work; the others observe
+  // it's held and skip cleanly.
+  let releaseClusterLock = null;
   try {
+    releaseClusterLock = await d.tryClusterLock(d.db);
+    if (releaseClusterLock === null) {
+      d.logger.warn({ event: 'autofix.cron.overlap', scope: 'cluster' },
+        'autofix-cron: another instance holds the cluster lock, skipping');
+      return { skipped: true, reason: 'overlap', scope: 'cluster', processed: 0, results: [] };
+    }
+
     const batchSize = Number(opts.batchSize || process.env.AUTOFIX_CRON_BATCH || DEFAULT_BATCH);
     const ids = await findEligibleFailures(d.db, batchSize);
     if (ids.length === 0) {
@@ -168,6 +247,21 @@ async function tick(opts = {}, deps = {}) {
 
     return { skipped: false, processed: results.length, results, summary };
   } finally {
+    // Release order matters: cluster lock first (still holds the dedicated
+    // client; releasing it returns both the lock AND the connection to the
+    // pool), then the in-process flag. A release failure must NOT throw
+    // out of the finally — that would mask any real error from the try
+    // block. Log + swallow; pg auto-releases session locks when the client
+    // is destroyed or the session ends, so a leaked lock can't outlive the
+    // process.
+    if (releaseClusterLock) {
+      try { await releaseClusterLock(); }
+      catch (err) {
+        d.logger.warn({ event: 'autofix.cron.lock_release_failed', err: err.message,
+          errCode: err.code || null },
+          'autofix-cron: failed to release cluster lock — pg will reclaim on session end');
+      }
+    }
     tickInFlight = false;
   }
 }
@@ -224,4 +318,7 @@ module.exports = {
   // exported for tests
   findEligibleFailures,
   processFailure,
+  defaultTryClusterLock,
+  ADVISORY_LOCK_NS,
+  ADVISORY_LOCK_ID,
 };
