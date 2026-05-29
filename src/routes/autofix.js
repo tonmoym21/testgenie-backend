@@ -246,6 +246,14 @@ const projectConfigBody = z.object({
     z.null(),
   ]),
   enabled: z.boolean(),
+  // PR #34 — per-project override for the per-failure retry cap.
+  // Upper bound 1000 is operational sanity: anyone setting this
+  // higher is misusing the cap. 0 is legal (= "disable cap, retry
+  // forever"), matching the env-var semantics.
+  maxRetriesPerFailure: z.union([
+    z.number().int().min(0).max(1000),
+    z.null(),
+  ]),
 });
 
 router.get('/projects/:projectId/config', async (req, res, next) => {
