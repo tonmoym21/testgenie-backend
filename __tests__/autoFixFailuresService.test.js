@@ -27,7 +27,7 @@ jest.mock('pg', () => {
   return { Pool };
 });
 
-const { listFailures, getFailureDetail, DEFAULT_LIMIT, MAX_LIMIT } =
+const { listFailures, getFailureDetail, reopenFailure, DEFAULT_LIMIT, MAX_LIMIT } =
   require('../src/services/autoFixFailuresService');
 
 function makeDb(responses) {
@@ -233,6 +233,95 @@ describe('autoFixFailuresService.getFailureDetail', () => {
     await expect(getFailureDetail(-1, { db })).rejects.toMatchObject({ statusCode: 404 });
     await expect(getFailureDetail(0, { db })).rejects.toMatchObject({ statusCode: 404 });
     // No SQL ever issued for the invalid inputs above.
+    expect(db.query).not.toHaveBeenCalled();
+  });
+});
+
+describe('autoFixFailuresService.reopenFailure', () => {
+  const silentLogger = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
+
+  it('happy path: UPDATE matches a wont_fix row -> returns refreshed detail', async () => {
+    const db = makeDb([
+      // The UPDATE returns one row (we matched a wont_fix and flipped it)
+      [/UPDATE test_failures\s+SET fix_status = 'open'/, [{ id: 42 }]],
+      // getFailureDetail then fires its two SELECTs
+      [/FROM test_failures/, [fakeFailure({ id: 42, fix_status: 'open' })]],
+      [/FROM fix_attempts/, []],
+    ]);
+    const warnSpy = jest.fn();
+
+    const out = await reopenFailure(42, { triggeredBy: 7 },
+      { db, logger: { ...silentLogger, warn: warnSpy } });
+
+    expect(out.id).toBe(42);
+    expect(out.fix_status).toBe('open');
+    expect(out.attempts).toEqual([]);
+
+    // UPDATE SQL: WHERE clause guards against non-wont_fix rows and
+    // sets resolved_at = NULL so the row looks fresh.
+    const upd = db.calls.find((c) => /UPDATE test_failures/.test(c.sql));
+    expect(upd.sql).toMatch(/WHERE id = \$1 AND fix_status = 'wont_fix'/);
+    expect(upd.sql).toMatch(/resolved_at = NULL/);
+    expect(upd.params).toEqual([42]);
+
+    // Audit event MUST fire (operator action overriding the loop's decision)
+    const reopenedWarn = warnSpy.mock.calls.find(
+      (c) => c[0] && c[0].event === 'autofix.failure.reopened'
+    );
+    expect(reopenedWarn).toBeTruthy();
+    expect(reopenedWarn[0]).toMatchObject({ failureId: 42, triggeredBy: 7 });
+  });
+
+  it('404 NOT_FOUND when the id does not exist (UPDATE 0 rows + lookup 0 rows)', async () => {
+    const db = makeDb([
+      [/UPDATE test_failures/, []],          // no match
+      [/SELECT fix_status FROM test_failures/, []],  // row missing
+    ]);
+    await expect(reopenFailure(999, {}, { db, logger: silentLogger }))
+      .rejects.toMatchObject({ statusCode: 404, code: 'NOT_FOUND' });
+  });
+
+  it('409 CONFLICT when the row exists but is in fix_status=open (no-op trap)', async () => {
+    const db = makeDb([
+      [/UPDATE test_failures/, []],
+      [/SELECT fix_status FROM test_failures/, [{ fix_status: 'open' }]],
+    ]);
+    await expect(reopenFailure(1, {}, { db, logger: silentLogger })).rejects.toMatchObject({
+      statusCode: 409,
+      code: 'CONFLICT',
+      message: expect.stringMatching(/already eligible/i),
+    });
+  });
+
+  it('409 CONFLICT when the row is fix_proposed (race with in-flight tick)', async () => {
+    // This is the bug being prevented: a reopen during an in-flight
+    // tick could race the proposeFix atomic claim. Refuse cleanly.
+    const db = makeDb([
+      [/UPDATE test_failures/, []],
+      [/SELECT fix_status FROM test_failures/, [{ fix_status: 'fix_proposed' }]],
+    ]);
+    await expect(reopenFailure(1, {}, { db, logger: silentLogger })).rejects.toMatchObject({
+      statusCode: 409,
+      message: expect.stringMatching(/wait for the current attempt/i),
+    });
+  });
+
+  it('409 CONFLICT when the row is resolved (the fix worked — refuse to reopen)', async () => {
+    const db = makeDb([
+      [/UPDATE test_failures/, []],
+      [/SELECT fix_status FROM test_failures/, [{ fix_status: 'resolved' }]],
+    ]);
+    await expect(reopenFailure(1, {}, { db, logger: silentLogger })).rejects.toMatchObject({
+      statusCode: 409,
+      message: expect.stringMatching(/wont_fix/),
+    });
+  });
+
+  it('throws NotFoundError on non-numeric / negative / zero id (no SQL fires)', async () => {
+    const db = makeDb([]);
+    await expect(reopenFailure('abc', {}, { db, logger: silentLogger })).rejects.toMatchObject({ statusCode: 404 });
+    await expect(reopenFailure(-1, {}, { db, logger: silentLogger })).rejects.toMatchObject({ statusCode: 404 });
+    await expect(reopenFailure(0, {}, { db, logger: silentLogger })).rejects.toMatchObject({ statusCode: 404 });
     expect(db.query).not.toHaveBeenCalled();
   });
 });
