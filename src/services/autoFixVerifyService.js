@@ -56,12 +56,19 @@ async function loadFixAttempt(db, id) {
   // project_id is pulled through test_failures because fix_attempts itself
   // has no project_id column. Downstream observability needs project_id on
   // every autofix.verify* event so per-tenant verify-rate dashboards work.
+  //
+  // pac.max_retries_per_failure pulls the PR #34 per-project override
+  // for the retry cap so the verify_failed path can apply it without a
+  // second SELECT. NULL when no row exists OR no override is set — the
+  // caller falls back to getEnvMaxRetries() in either case.
   const r = await db.query(
     `SELECT fa.*, tf.id AS failure_id, tf.project_id, tf.failure_signature,
-            pt.file_name AS test_file_name
+            pt.file_name AS test_file_name,
+            pac.max_retries_per_failure
        FROM fix_attempts fa
        JOIN test_failures tf ON tf.id = fa.test_failure_id
        LEFT JOIN playwright_tests pt ON pt.id = tf.last_test_id
+       LEFT JOIN project_autofix_configs pac ON pac.project_id = tf.project_id
       WHERE fa.id = $1`,
     [id]
   );
@@ -76,22 +83,27 @@ async function recordVerified(db, fixAttemptId) {
   );
 }
 
-// Per-failure retry ceiling. Without one, a genuinely-unfixable spec
-// (LLM keeps proposing a patch that still fails Playwright) gets
-// retried every cron tick — eating quota on a row that will never
-// converge, eventually locking the WHOLE project at the daily limit.
-// 3 attempts is generous: each subsequent proposal sees the prior
-// error_message in its prompt and can adjust, so by the 3rd swing
-// the LLM has had two pieces of feedback to course-correct.
+// Env-level default for the per-failure retry ceiling. Without a
+// cap, a genuinely-unfixable spec (LLM keeps proposing patches that
+// still fail Playwright) gets retried every cron tick — eating quota
+// on a row that will never converge, eventually locking the WHOLE
+// project at the daily limit. 3 attempts is generous: each subsequent
+// proposal sees the prior error_message in its prompt, so by the 3rd
+// swing the LLM has had two pieces of feedback to course-correct.
 // AUTOFIX_MAX_RETRIES_PER_FAILURE=0 disables the cap (CI / e2e).
-function getMaxRetries() {
+//
+// PR #34: per-project overrides via project_autofix_configs.
+// max_retries_per_failure live in loadFixAttempt's JOIN; the caller
+// resolves `row.max_retries_per_failure ?? getEnvMaxRetries()` and
+// passes the resolved number into recordVerifyFailed.
+function getEnvMaxRetries() {
   const raw = process.env.AUTOFIX_MAX_RETRIES_PER_FAILURE;
   if (raw === undefined || raw === '') return 3;
   const n = Number(raw);
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 3;
 }
 
-async function recordVerifyFailed(db, fixAttemptId, failureId, errorTail, logger) {
+async function recordVerifyFailed(db, fixAttemptId, failureId, errorTail, maxRetries, logger) {
   // Two writes in series:
   //   1. fix_attempts -> 'verify_failed', error_message captures a tail of
   //      stderr so the next proposal's prompt can read it.
@@ -104,12 +116,17 @@ async function recordVerifyFailed(db, fixAttemptId, failureId, errorTail, logger
   //      with `UPDATE test_failures SET fix_status='open' WHERE id=…`
   //      if they want to force another attempt (e.g. after editing
   //      the spec by hand).
+  //
+  // maxRetries is resolved by the caller (verifyFix) from the
+  // per-project override pulled by loadFixAttempt's JOIN, falling
+  // back to getEnvMaxRetries(). Pushed through as a param so this
+  // function stays a pure SQL writer with no env or DB resolution
+  // concerns of its own.
   await db.query(
     `UPDATE fix_attempts SET status = 'verify_failed', error_message = $2, finished_at = NOW()
        WHERE id = $1`,
     [fixAttemptId, errorTail]
   );
-  const maxRetries = getMaxRetries();
   if (maxRetries === 0) {
     // Cap disabled — original behavior: always release back to 'open'.
     await db.query(
@@ -251,10 +268,14 @@ async function verifyFix(opts, deps = {}) {
   const errorTail = (result.stderr || result.stdout || `Playwright exit ${result.exitCode}`).slice(-4000);
   // recordVerifyFailed atomically decides whether to release the row
   // back to 'open' or promote to 'wont_fix' based on the per-failure
-  // retry cap (AUTOFIX_MAX_RETRIES_PER_FAILURE, default 3). The
-  // promoted? bit becomes a field on autofix.verify_failed so dashboards
-  // can chart cap-hit rate without a separate join to fix_attempts.
-  const capInfo = await recordVerifyFailed(db, row.id, row.failure_id, errorTail, logger);
+  // retry cap. PR #34: per-project override comes through loadFixAttempt's
+  // JOIN; NULL → fall back to AUTOFIX_MAX_RETRIES_PER_FAILURE (default 3).
+  // The promoted? bit becomes a field on autofix.verify_failed so
+  // dashboards can chart cap-hit rate without joining fix_attempts.
+  const maxRetries = row.max_retries_per_failure != null
+    ? row.max_retries_per_failure
+    : getEnvMaxRetries();
+  const capInfo = await recordVerifyFailed(db, row.id, row.failure_id, errorTail, maxRetries, logger);
   logger.info({ event: 'autofix.verify_failed', fixAttemptId: row.id, failureId: row.failure_id,
     projectId: row.project_id, branch: row.branch_name, exitCode: result.exitCode, durationMs,
     attempts: capInfo.attempts, capReached: capInfo.promoted },
@@ -313,4 +334,4 @@ async function markMerged(opts, deps = {}) {
   return { fixAttemptId: row.id, status: 'merged', failureId: row.test_failure_id };
 }
 
-module.exports = { verifyFix, markMerged };
+module.exports = { verifyFix, markMerged, getEnvMaxRetries };

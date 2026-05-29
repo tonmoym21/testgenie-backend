@@ -17,10 +17,14 @@ jest.mock('pg', () => {
   return { Pool };
 });
 
-// Stub the env-default reader so the test doesn't depend on whatever
-// AUTOFIX_DAILY_LIMIT happens to be set to in the host process.
+// Stub the env-default readers so the test doesn't depend on whatever
+// AUTOFIX_DAILY_LIMIT / AUTOFIX_MAX_RETRIES_PER_FAILURE happen to be
+// set to in the host process.
 jest.mock('../src/services/autoFixService', () => ({
   getEnvDailyLimit: jest.fn(() => 20),
+}));
+jest.mock('../src/services/autoFixVerifyService', () => ({
+  getEnvMaxRetries: jest.fn(() => 3),
 }));
 
 const { getConfig, upsertConfig } = require('../src/services/autoFixProjectConfigService');
@@ -50,6 +54,9 @@ describe('autoFixProjectConfigService.getConfig', () => {
       dailyLimit: null,
       effectiveDailyLimit: 20,
       envDailyLimit: 20,
+      maxRetriesPerFailure: null,
+      effectiveMaxRetriesPerFailure: 3,
+      envMaxRetriesPerFailure: 3,
       enabled: true,                     // pre-#33-compatible default
       createdAt: null,
       updatedAt: null,
@@ -60,7 +67,7 @@ describe('autoFixProjectConfigService.getConfig', () => {
     const now = new Date('2026-05-01T00:00:00Z');
     const db = makeDb([
       [/SELECT 1 FROM projects/, { rows: [{}], rowCount: 1 }],
-      [/FROM project_autofix_configs/, { rows: [{ daily_limit: 50, enabled: true, created_at: now, updated_at: now }], rowCount: 1 }],
+      [/FROM project_autofix_configs/, { rows: [{ daily_limit: 50, enabled: true, max_retries_per_failure: null, created_at: now, updated_at: now }], rowCount: 1 }],
     ]);
     const out = await getConfig(7, { db });
     expect(out.dailyLimit).toBe(50);
@@ -76,7 +83,7 @@ describe('autoFixProjectConfigService.getConfig', () => {
     // the env-level daily limit.
     const db = makeDb([
       [/SELECT 1 FROM projects/, { rows: [{}], rowCount: 1 }],
-      [/FROM project_autofix_configs/, { rows: [{ daily_limit: null, enabled: true, created_at: new Date(), updated_at: new Date() }], rowCount: 1 }],
+      [/FROM project_autofix_configs/, { rows: [{ daily_limit: null, enabled: true, max_retries_per_failure: null, created_at: new Date(), updated_at: new Date() }], rowCount: 1 }],
     ]);
     const out = await getConfig(7, { db });
     expect(out.dailyLimit).toBeNull();
@@ -90,7 +97,7 @@ describe('autoFixProjectConfigService.getConfig', () => {
     // ops set the override to 0 and forgot.
     const db = makeDb([
       [/SELECT 1 FROM projects/, { rows: [{}], rowCount: 1 }],
-      [/FROM project_autofix_configs/, { rows: [{ daily_limit: 0, enabled: true, created_at: new Date(), updated_at: new Date() }], rowCount: 1 }],
+      [/FROM project_autofix_configs/, { rows: [{ daily_limit: 0, enabled: true, max_retries_per_failure: null, created_at: new Date(), updated_at: new Date() }], rowCount: 1 }],
     ]);
     const out = await getConfig(7, { db });
     expect(out.dailyLimit).toBe(0);
@@ -100,7 +107,7 @@ describe('autoFixProjectConfigService.getConfig', () => {
   it('config row with enabled=false: surfaces the PR #33 pause state', async () => {
     const db = makeDb([
       [/SELECT 1 FROM projects/, { rows: [{}], rowCount: 1 }],
-      [/FROM project_autofix_configs/, { rows: [{ daily_limit: 50, enabled: false, created_at: new Date(), updated_at: new Date() }], rowCount: 1 }],
+      [/FROM project_autofix_configs/, { rows: [{ daily_limit: 50, enabled: false, max_retries_per_failure: null, created_at: new Date(), updated_at: new Date() }], rowCount: 1 }],
     ]);
     const out = await getConfig(7, { db });
     expect(out.enabled).toBe(false);
@@ -132,11 +139,12 @@ describe('autoFixProjectConfigService.upsertConfig', () => {
   // The previous shape mocked 4 queries (existence + INSERT + getConfig's
   // existence + configs SELECT); after the efficiency cleanup the
   // service issues only 2 (existence + INSERT RETURNING).
-  function upsertDb({ daily_limit, enabled, now = new Date() }) {
+  function upsertDb({ daily_limit, enabled, max_retries_per_failure = null, now = new Date() }) {
     return makeDb([
       [/SELECT 1 FROM projects/, { rows: [{}], rowCount: 1 }],
       [/INSERT INTO project_autofix_configs/, {
-        rows: [{ daily_limit, enabled, created_at: now, updated_at: now }], rowCount: 1,
+        rows: [{ daily_limit, enabled, max_retries_per_failure, created_at: now, updated_at: now }],
+        rowCount: 1,
       }],
     ]);
   }
@@ -145,7 +153,7 @@ describe('autoFixProjectConfigService.upsertConfig', () => {
     const db = upsertDb({ daily_limit: 100, enabled: true });
     const warnSpy = jest.fn();
 
-    const out = await upsertConfig(7, { dailyLimit: 100, enabled: true }, { triggeredBy: 42 },
+    const out = await upsertConfig(7, { dailyLimit: 100, enabled: true, maxRetriesPerFailure: null }, { triggeredBy: 42 },
       { db, logger: { ...silentLogger, warn: warnSpy } });
 
     expect(out.dailyLimit).toBe(100);
@@ -158,7 +166,7 @@ describe('autoFixProjectConfigService.upsertConfig', () => {
     expect(upsert.sql).toMatch(/ON CONFLICT \(project_id\) DO UPDATE/);
     expect(upsert.sql).toMatch(/enabled = EXCLUDED\.enabled/);
     expect(upsert.sql).toMatch(/RETURNING daily_limit, enabled/);
-    expect(upsert.params).toEqual([7, 100, true]);
+    expect(upsert.params).toEqual([7, 100, true, null]);
 
     const auditWarn = warnSpy.mock.calls.find(
       (c) => c[0] && c[0].event === 'autofix.project_config.updated'
@@ -169,19 +177,19 @@ describe('autoFixProjectConfigService.upsertConfig', () => {
 
   it('null dailyLimit clears override (UPSERT writes NULL → resolver falls back to env)', async () => {
     const db = upsertDb({ daily_limit: null, enabled: true });
-    const out = await upsertConfig(7, { dailyLimit: null, enabled: true }, {}, { db, logger: silentLogger });
+    const out = await upsertConfig(7, { dailyLimit: null, enabled: true, maxRetriesPerFailure: null }, {}, { db, logger: silentLogger });
     expect(out.dailyLimit).toBeNull();
     expect(out.effectiveDailyLimit).toBe(20);
 
     const upsert = db.calls.find((c) => /INSERT INTO project_autofix_configs/.test(c.sql));
-    expect(upsert.params).toEqual([7, null, true]);
+    expect(upsert.params).toEqual([7, null, true, null]);
   });
 
   it('0 is a legal explicit value — written as 0, not coerced to null', async () => {
     const db = upsertDb({ daily_limit: 0, enabled: true });
-    const out = await upsertConfig(7, { dailyLimit: 0, enabled: true }, {}, { db, logger: silentLogger });
+    const out = await upsertConfig(7, { dailyLimit: 0, enabled: true, maxRetriesPerFailure: null }, {}, { db, logger: silentLogger });
     const upsert = db.calls.find((c) => /INSERT INTO project_autofix_configs/.test(c.sql));
-    expect(upsert.params).toEqual([7, 0, true]);
+    expect(upsert.params).toEqual([7, 0, true, null]);
     expect(out.effectiveDailyLimit).toBe(0);
   });
 
@@ -190,24 +198,51 @@ describe('autoFixProjectConfigService.upsertConfig', () => {
   // state: "paused, but if/when we un-pause keep the configured cap."
   it('enabled=false pauses autofix; dailyLimit override is preserved alongside', async () => {
     const db = upsertDb({ daily_limit: 50, enabled: false });
-    const out = await upsertConfig(7, { dailyLimit: 50, enabled: false }, {}, { db, logger: silentLogger });
+    const out = await upsertConfig(7, { dailyLimit: 50, enabled: false, maxRetriesPerFailure: null }, {}, { db, logger: silentLogger });
     expect(out.enabled).toBe(false);
     expect(out.dailyLimit).toBe(50);
 
     const upsert = db.calls.find((c) => /INSERT INTO project_autofix_configs/.test(c.sql));
-    expect(upsert.params).toEqual([7, 50, false]);
+    expect(upsert.params).toEqual([7, 50, false, null]);
+  });
+
+  // PR #34 — per-project retry-cap override goes through the upsert
+  // alongside the existing fields. effectiveMaxRetriesPerFailure
+  // surfaces the override (not env default) when set.
+  it('maxRetriesPerFailure override: written as the 4th positional param + surfaced in response', async () => {
+    const db = upsertDb({ daily_limit: null, enabled: true, max_retries_per_failure: 5 });
+    const out = await upsertConfig(7, { dailyLimit: null, enabled: true, maxRetriesPerFailure: 5 }, {},
+      { db, logger: silentLogger });
+    const upsert = db.calls.find((c) => /INSERT INTO project_autofix_configs/.test(c.sql));
+    expect(upsert.params).toEqual([7, null, true, 5]);
+    expect(upsert.sql).toMatch(/max_retries_per_failure = EXCLUDED\.max_retries_per_failure/);
+    expect(out.maxRetriesPerFailure).toBe(5);
+    expect(out.effectiveMaxRetriesPerFailure).toBe(5);    // override wins
+    expect(out.envMaxRetriesPerFailure).toBe(3);          // env-default exposed for UI
+  });
+
+  it('maxRetriesPerFailure=0 is legal (explicit "disable cap, infinite retries")', async () => {
+    const db = upsertDb({ daily_limit: null, enabled: true, max_retries_per_failure: 0 });
+    const out = await upsertConfig(7, { dailyLimit: null, enabled: true, maxRetriesPerFailure: 0 }, {},
+      { db, logger: silentLogger });
+    const upsert = db.calls.find((c) => /INSERT INTO project_autofix_configs/.test(c.sql));
+    expect(upsert.params).toEqual([7, null, true, 0]);
+    // Critical: 0 is NOT coerced to null. The env semantics (= cap
+    // disabled) are preserved at per-tenant scope.
+    expect(out.maxRetriesPerFailure).toBe(0);
+    expect(out.effectiveMaxRetriesPerFailure).toBe(0);
   });
 
   it('404 when the project does not exist — no INSERT fires', async () => {
     const db = makeDb([[/SELECT 1 FROM projects/, { rows: [], rowCount: 0 }]]);
-    await expect(upsertConfig(999, { dailyLimit: 50, enabled: true }, {}, { db, logger: silentLogger }))
+    await expect(upsertConfig(999, { dailyLimit: 50, enabled: true, maxRetriesPerFailure: null }, {}, { db, logger: silentLogger }))
       .rejects.toMatchObject({ statusCode: 404 });
     expect(db.calls.find((c) => /INSERT INTO project_autofix_configs/.test(c.sql))).toBeFalsy();
   });
 
   it('404 on invalid projectId (no SQL fires at all)', async () => {
     const db = makeDb([]);
-    await expect(upsertConfig('abc', { dailyLimit: 50, enabled: true }, {}, { db, logger: silentLogger }))
+    await expect(upsertConfig('abc', { dailyLimit: 50, enabled: true, maxRetriesPerFailure: null }, {}, { db, logger: silentLogger }))
       .rejects.toMatchObject({ statusCode: 404 });
     expect(db.query).not.toHaveBeenCalled();
   });

@@ -255,6 +255,46 @@ describe('autoFixVerifyService.verifyFix [real DB]', () => {
     }
   });
 
+  // PR #34 — per-project max_retries_per_failure override should beat
+  // the env default. Real-DB test pins the resolver: with env=10 and
+  // a project override of 1, the very first verify_failed should
+  // promote to wont_fix.
+  it('per-project max_retries_per_failure override beats the env default', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    const ORIGINAL_MAX = process.env.AUTOFIX_MAX_RETRIES_PER_FAILURE;
+    // Generous env default — if the override doesn't beat it, the
+    // test will (incorrectly) leave the row 'open'.
+    process.env.AUTOFIX_MAX_RETRIES_PER_FAILURE = '10';
+    try {
+      await db.query(
+        `INSERT INTO project_autofix_configs (project_id, max_retries_per_failure, enabled)
+         VALUES ($1, 1, true)
+         ON CONFLICT (project_id) DO UPDATE SET max_retries_per_failure = EXCLUDED.max_retries_per_failure`,
+        [seed.projectId]
+      );
+
+      const { failureId, fixAttemptId } = await seedProposedFix({ branchSuffix: 'override1' });
+      const out = await verifyFix(
+        { fixAttemptId, repo: '/tmp/fake', base: 'main' },
+        {
+          runGit: stubGit,
+          runPlaywright: () => ({ exitCode: 1, stdout: '', stderr: 'first failure' }),
+          logger: silentLogger,
+        },
+      );
+      expect(out.status).toBe('verify_failed');
+
+      // With override=1, the very first verify_failed hits the cap.
+      // Without PR #34's resolver, env=10 would have released to 'open'.
+      const tf = await db.query(`SELECT fix_status FROM test_failures WHERE id = $1`, [failureId]);
+      expect(tf.rows[0].fix_status).toBe('wont_fix');
+    } finally {
+      await db.query(`DELETE FROM project_autofix_configs WHERE project_id = $1`, [seed.projectId]);
+      if (ORIGINAL_MAX === undefined) delete process.env.AUTOFIX_MAX_RETRIES_PER_FAILURE;
+      else process.env.AUTOFIX_MAX_RETRIES_PER_FAILURE = ORIGINAL_MAX;
+    }
+  });
+
   it('refuses to verify a row in status="failed" (no Playwright spawn, no DB writes)', async () => {
     if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
     const { fixAttemptId } = await seedProposedFix({ branchSuffix: 'wrong001' });

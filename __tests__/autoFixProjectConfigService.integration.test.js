@@ -63,7 +63,7 @@ describe('autoFixProjectConfigService [real DB]', () => {
   it('upsertConfig inserts → re-upsert updates the SAME row (ON CONFLICT path)', async () => {
     if (!canConnect) { console.warn('[integration] skipping'); return; }
 
-    await upsertConfig(seed.projectId, { dailyLimit: 100, enabled: true }, {}, { db, logger: silentLogger });
+    await upsertConfig(seed.projectId, { dailyLimit: 100, enabled: true, maxRetriesPerFailure: null }, {}, { db, logger: silentLogger });
     const after1 = await db.query(
       `SELECT daily_limit, enabled, created_at, updated_at FROM project_autofix_configs WHERE project_id = $1`,
       [seed.projectId]
@@ -74,7 +74,7 @@ describe('autoFixProjectConfigService [real DB]', () => {
     const firstCreatedAt = after1.rows[0].created_at;
 
     // Second upsert MUST update the existing row (one config row per project).
-    await upsertConfig(seed.projectId, { dailyLimit: 50, enabled: false }, {}, { db, logger: silentLogger });
+    await upsertConfig(seed.projectId, { dailyLimit: 50, enabled: false, maxRetriesPerFailure: null }, {}, { db, logger: silentLogger });
     const after2 = await db.query(
       `SELECT daily_limit, enabled, created_at, updated_at FROM project_autofix_configs WHERE project_id = $1`,
       [seed.projectId]
@@ -102,7 +102,7 @@ describe('autoFixProjectConfigService [real DB]', () => {
 
   it('0 is a legal explicit value (per the CHECK constraint and the env semantics)', async () => {
     if (!canConnect) { console.warn('[integration] skipping'); return; }
-    await upsertConfig(seed.projectId, { dailyLimit: 0, enabled: true }, {}, { db, logger: silentLogger });
+    await upsertConfig(seed.projectId, { dailyLimit: 0, enabled: true, maxRetriesPerFailure: null }, {}, { db, logger: silentLogger });
     const out = await getConfig(seed.projectId, { db });
     expect(out.dailyLimit).toBe(0);
     // NOT replaced by env — explicit 0 means "disabled for this tenant."
@@ -114,7 +114,7 @@ describe('autoFixProjectConfigService [real DB]', () => {
     // Baseline: no override → resolver returns env default.
     const before = (await resolveProjectConfig(seed.projectId, { db })).dailyLimit;
 
-    await upsertConfig(seed.projectId, { dailyLimit: 999, enabled: true }, {}, { db, logger: silentLogger });
+    await upsertConfig(seed.projectId, { dailyLimit: 999, enabled: true, maxRetriesPerFailure: null }, {}, { db, logger: silentLogger });
     const after = (await resolveProjectConfig(seed.projectId, { db })).dailyLimit;
 
     expect(after).toBe(999);
@@ -133,7 +133,7 @@ describe('autoFixProjectConfigService [real DB]', () => {
     expect(before.enabled).toBe(true);
 
     // Pause the tenant.
-    await upsertConfig(seed.projectId, { dailyLimit: null, enabled: false }, {}, { db, logger: silentLogger });
+    await upsertConfig(seed.projectId, { dailyLimit: null, enabled: false, maxRetriesPerFailure: null }, {}, { db, logger: silentLogger });
     const after = await resolveProjectConfig(seed.projectId, { db });
     expect(after.enabled).toBe(false);
   });
@@ -146,7 +146,7 @@ describe('autoFixProjectConfigService [real DB]', () => {
     const p = await db.query(`INSERT INTO projects (user_id, name) VALUES ($1, $2) RETURNING id`, [u.rows[0].id, tag]);
     const pid = Number(p.rows[0].id);
 
-    await upsertConfig(pid, { dailyLimit: 42, enabled: true }, {}, { db, logger: silentLogger });
+    await upsertConfig(pid, { dailyLimit: 42, enabled: true, maxRetriesPerFailure: null }, {}, { db, logger: silentLogger });
     await db.query(`DELETE FROM projects WHERE id = $1`, [pid]);
 
     const after = await db.query(
@@ -159,7 +159,7 @@ describe('autoFixProjectConfigService [real DB]', () => {
   it('404 when projectId does not exist', async () => {
     if (!canConnect) { console.warn('[integration] skipping'); return; }
     await expect(getConfig(999999987, { db })).rejects.toMatchObject({ statusCode: 404 });
-    await expect(upsertConfig(999999987, { dailyLimit: 10, enabled: true }, {}, { db, logger: silentLogger }))
+    await expect(upsertConfig(999999987, { dailyLimit: 10, enabled: true, maxRetriesPerFailure: null }, {}, { db, logger: silentLogger }))
       .rejects.toMatchObject({ statusCode: 404 });
   });
 });
