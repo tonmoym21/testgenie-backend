@@ -231,16 +231,21 @@ router.get('/failures/:failureId/attempts/:attemptId/diff', async (req, res, nex
 //        body: { dailyLimit: <int>=0 | null }
 //        -> refreshed read shape
 
-// Upper bound is generous (2e9 ≈ INT max) — the constraint at the DB
-// is daily_limit >= 0; the upper guard here is only to keep pg from
-// throwing a "integer out of range" surfaced as 500. 0 is a legal
-// explicit value meaning "disable autofix for this tenant"
-// (mirrors AUTOFIX_DAILY_LIMIT=0 env semantics).
+// PUT semantics — caller sends BOTH fields, replace not patch. The
+// frontend GETs the current config first and submits the full body.
+//
+// dailyLimit upper bound is generous (2e9 ≈ INT max) — the DB CHECK
+// enforces >= 0; the upper guard keeps pg from throwing "integer out
+// of range" surfaced as 500. 0 is legal here too — it means "out of
+// quota for this tenant" (NOT "autofix paused"; that's the enabled
+// toggle below). Both 0 and `enabled=false` are legitimate states a
+// dashboard might want to set independently.
 const projectConfigBody = z.object({
   dailyLimit: z.union([
     z.number().int().min(0).max(2_000_000_000),
     z.null(),
   ]),
+  enabled: z.boolean(),
 });
 
 router.get('/projects/:projectId/config', async (req, res, next) => {

@@ -74,7 +74,7 @@ describe('GET /api/autofix/projects/:projectId/config', () => {
   });
 
   it('200 + payload pass-through; passes :projectId to the service', async () => {
-    const payload = { projectId: 7, dailyLimit: 50, effectiveDailyLimit: 50, envDailyLimit: 20, createdAt: null, updatedAt: null };
+    const payload = { projectId: 7, dailyLimit: 50, effectiveDailyLimit: 50, envDailyLimit: 20, enabled: true, createdAt: null, updatedAt: null };
     autoFixProjectConfigService.getConfig.mockResolvedValueOnce(payload);
     const res = await request(app).get('/api/autofix/projects/7/config');
     expect(res.status).toBe(200);
@@ -111,48 +111,69 @@ describe('PUT /api/autofix/projects/:projectId/config', () => {
   });
 
   it('200 + refreshed payload; passes id + body + triggeredBy to the service', async () => {
-    const payload = { projectId: 7, dailyLimit: 50, effectiveDailyLimit: 50, envDailyLimit: 20, createdAt: null, updatedAt: null };
+    const payload = { projectId: 7, dailyLimit: 50, effectiveDailyLimit: 50, envDailyLimit: 20, enabled: true, createdAt: null, updatedAt: null };
     autoFixProjectConfigService.upsertConfig.mockResolvedValueOnce(payload);
 
     const res = await request(app)
       .put('/api/autofix/projects/7/config')
-      .send({ dailyLimit: 50 });
+      .send({ dailyLimit: 50, enabled: true });
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual(payload);
     expect(autoFixProjectConfigService.upsertConfig).toHaveBeenCalledWith(
-      '7', { dailyLimit: 50 }, { triggeredBy: 1 }
+      '7', { dailyLimit: 50, enabled: true }, { triggeredBy: 1 }
     );
   });
 
   it('accepts dailyLimit: null (clear override)', async () => {
     autoFixProjectConfigService.upsertConfig.mockResolvedValueOnce({ projectId: 7, dailyLimit: null });
-    const res = await request(app).put('/api/autofix/projects/7/config').send({ dailyLimit: null });
+    const res = await request(app).put('/api/autofix/projects/7/config').send({ dailyLimit: null, enabled: true });
     expect(res.status).toBe(200);
-    expect(autoFixProjectConfigService.upsertConfig.mock.calls[0][1]).toEqual({ dailyLimit: null });
+    expect(autoFixProjectConfigService.upsertConfig.mock.calls[0][1]).toEqual({ dailyLimit: null, enabled: true });
+  });
+
+  // PR #33 — explicit "pause autofix for this tenant" without
+  // changing the quota override. The frontend's enable/disable
+  // toggle hits this exact shape.
+  it('accepts enabled: false (pause autofix for tenant)', async () => {
+    autoFixProjectConfigService.upsertConfig.mockResolvedValueOnce({ projectId: 7, enabled: false });
+    const res = await request(app).put('/api/autofix/projects/7/config').send({ dailyLimit: null, enabled: false });
+    expect(res.status).toBe(200);
+    expect(autoFixProjectConfigService.upsertConfig.mock.calls[0][1]).toEqual({ dailyLimit: null, enabled: false });
   });
 
   it('400 VALIDATION_ERROR on negative dailyLimit (zod rejects before service)', async () => {
-    const res = await request(app).put('/api/autofix/projects/7/config').send({ dailyLimit: -5 });
+    const res = await request(app).put('/api/autofix/projects/7/config').send({ dailyLimit: -5, enabled: true });
     expect(res.status).toBe(400);
     expect(res.body.error.code).toBe('VALIDATION_ERROR');
     expect(autoFixProjectConfigService.upsertConfig).not.toHaveBeenCalled();
   });
 
   it('400 VALIDATION_ERROR on dailyLimit absent from body', async () => {
-    const res = await request(app).put('/api/autofix/projects/7/config').send({});
+    const res = await request(app).put('/api/autofix/projects/7/config').send({ enabled: true });
     expect(res.status).toBe(400);
     expect(autoFixProjectConfigService.upsertConfig).not.toHaveBeenCalled();
   });
 
+  it('400 VALIDATION_ERROR on enabled absent from body (PUT is replace, both fields required)', async () => {
+    const res = await request(app).put('/api/autofix/projects/7/config').send({ dailyLimit: 10 });
+    expect(res.status).toBe(400);
+    expect(autoFixProjectConfigService.upsertConfig).not.toHaveBeenCalled();
+  });
+
+  it('400 VALIDATION_ERROR on non-boolean enabled', async () => {
+    const res = await request(app).put('/api/autofix/projects/7/config').send({ dailyLimit: 10, enabled: 'yes' });
+    expect(res.status).toBe(400);
+  });
+
   it('400 VALIDATION_ERROR on non-integer dailyLimit', async () => {
-    const res = await request(app).put('/api/autofix/projects/7/config').send({ dailyLimit: 3.14 });
+    const res = await request(app).put('/api/autofix/projects/7/config').send({ dailyLimit: 3.14, enabled: true });
     expect(res.status).toBe(400);
   });
 
   it('404 NOT_FOUND when service throws (unknown projectId)', async () => {
     autoFixProjectConfigService.upsertConfig.mockRejectedValueOnce(new NotFoundError('project'));
-    const res = await request(app).put('/api/autofix/projects/999/config').send({ dailyLimit: 10 });
+    const res = await request(app).put('/api/autofix/projects/999/config').send({ dailyLimit: 10, enabled: true });
     expect(res.status).toBe(404);
   });
 
@@ -160,13 +181,13 @@ describe('PUT /api/autofix/projects/:projectId/config', () => {
     const res = await request(app)
       .put('/api/autofix/projects/7/config')
       .set('x-test-noauth', '1')
-      .send({ dailyLimit: 10 });
+      .send({ dailyLimit: 10, enabled: true });
     expect(res.status).toBe(401);
   });
 
   it('403 for non-admin', async () => {
     mockIsAdmin = false;
-    const res = await request(app).put('/api/autofix/projects/7/config').send({ dailyLimit: 10 });
+    const res = await request(app).put('/api/autofix/projects/7/config').send({ dailyLimit: 10, enabled: true });
     expect(res.status).toBe(403);
   });
 });

@@ -18,7 +18,7 @@ const { getEnvDailyLimit } = require('./autoFixService');
  * Read the per-project autofix config plus the env default and the
  * effective resolved value. The 404 here is "project doesn't exist,"
  * not "no config row" — a missing config row is a legitimate state
- * meaning "use env default."
+ * meaning "use env default, enabled by default."
  *
  * Response shape:
  *   {
@@ -27,6 +27,7 @@ const { getEnvDailyLimit } = require('./autoFixService');
  *     effectiveDailyLimit: int, what the autofix loop will actually use
  *     envDailyLimit: int,       the env-level fallback (so the UI can
  *                               render "using env default" vs override)
+ *     enabled: boolean,         PR #33 toggle. true when no row exists.
  *     createdAt, updatedAt
  *   }
  */
@@ -50,7 +51,7 @@ async function getConfig(projectIdRaw, deps = {}) {
   }
 
   const cfgRes = await db.query(
-    `SELECT daily_limit, created_at, updated_at
+    `SELECT daily_limit, enabled, created_at, updated_at
        FROM project_autofix_configs
       WHERE project_id = $1`,
     [projectId]
@@ -64,19 +65,23 @@ async function getConfig(projectIdRaw, deps = {}) {
     dailyLimit,
     effectiveDailyLimit: dailyLimit != null ? dailyLimit : envDefault,
     envDailyLimit: envDefault,
+    enabled: cfg ? cfg.enabled : true,  // default TRUE preserves pre-#33 behavior
     createdAt: cfg ? cfg.created_at : null,
     updatedAt: cfg ? cfg.updated_at : null,
   };
 }
 
 /**
- * Upsert the config row. Explicit null in body.dailyLimit clears the
- * override (revert to env default); omitted is rejected at the route
- * level via zod so this function doesn't need to distinguish.
+ * Upsert the config row. PUT semantics: caller sends BOTH dailyLimit
+ * and enabled — replace, not patch. The frontend does GET-then-PUT
+ * (standard REST); the race window is bounded because only ops touch
+ * this endpoint, very infrequently. Explicit null in body.dailyLimit
+ * clears the override.
  *
  * @param {number} projectIdRaw
  * @param {object} body
  * @param {number|null} body.dailyLimit  0..2_000_000_000 or null
+ * @param {boolean} body.enabled         false = autofix paused for tenant
  * @param {object?} opts
  * @param {number?} opts.triggeredBy   operator user id for the audit event
  */
@@ -96,24 +101,39 @@ async function upsertConfig(projectIdRaw, body, opts = {}, deps = {}) {
   }
 
   // The CHECK constraint in migration 023 enforces daily_limit >= 0
-  // when non-null; zod at the route enforces the upper bound. The
-  // INSERT…ON CONFLICT keeps the operation single-statement and atomic.
+  // when non-null; zod at the route enforces the upper bound. RETURNING
+  // lets us synthesize the response inline — saves the 2 extra queries
+  // a follow-up getConfig() would issue (projects existence + configs
+  // re-SELECT), since the FK on project_id already guarantees the
+  // project exists once the INSERT succeeds.
   const dailyLimit = body.dailyLimit == null ? null : Math.floor(Number(body.dailyLimit));
-  await db.query(
-    `INSERT INTO project_autofix_configs (project_id, daily_limit, created_at, updated_at)
-     VALUES ($1, $2, NOW(), NOW())
+  const { enabled } = body;
+  const r = await db.query(
+    `INSERT INTO project_autofix_configs (project_id, daily_limit, enabled, created_at, updated_at)
+     VALUES ($1, $2, $3, NOW(), NOW())
      ON CONFLICT (project_id) DO UPDATE
        SET daily_limit = EXCLUDED.daily_limit,
-           updated_at = NOW()`,
-    [projectId, dailyLimit]
+           enabled = EXCLUDED.enabled,
+           updated_at = NOW()
+     RETURNING daily_limit, enabled, created_at, updated_at`,
+    [projectId, dailyLimit, enabled]
   );
+  const row = r.rows[0];
 
   logger.warn({ event: 'autofix.project_config.updated',
-    projectId, dailyLimit, triggeredBy: opts.triggeredBy || null },
-    'autofix-project-config: per-project daily_limit updated');
+    projectId, dailyLimit, enabled, triggeredBy: opts.triggeredBy || null },
+    'autofix-project-config: per-project config updated');
 
-  // Return the refreshed read shape so the UI doesn't need a follow-up GET.
-  return getConfig(projectId, deps);
+  const envDefault = getEnvDailyLimit();
+  return {
+    projectId,
+    dailyLimit: row.daily_limit,
+    effectiveDailyLimit: row.daily_limit != null ? row.daily_limit : envDefault,
+    envDailyLimit: envDefault,
+    enabled: row.enabled,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 }
 
 module.exports = { getConfig, upsertConfig };
