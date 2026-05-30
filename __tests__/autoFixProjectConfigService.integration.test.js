@@ -163,3 +163,109 @@ describe('autoFixProjectConfigService [real DB]', () => {
       .rejects.toMatchObject({ statusCode: 404 });
   });
 });
+
+describe('autoFixProjectConfigService.previewConfig [real DB]', () => {
+  const { previewConfig } = require('../src/services/autoFixProjectConfigService');
+
+  // Seed shape: 4 open failures, one with 2 prior verify_failed
+  // attempts (cap-hit risk at threshold 2 or lower), plus a
+  // project_repo_configs row so the eligibility query has something
+  // to JOIN against.
+  beforeEach(async () => {
+    if (!canConnect) return;
+    await db.query(
+      `INSERT INTO project_repo_configs (project_id, repo_path, base_branch)
+       VALUES ($1, '/tmp/fake', 'main')
+       ON CONFLICT (project_id) DO NOTHING`,
+      [seed.projectId]
+    );
+  });
+
+  afterEach(async () => {
+    if (!canConnect) return;
+    await db.query(`DELETE FROM project_repo_configs WHERE project_id = $1`, [seed.projectId]);
+  });
+
+  async function seedFailureWithVerifyFailedAttempts(verifyFailedCount, sig) {
+    const f = await db.query(
+      `INSERT INTO test_failures
+         (project_id, failure_signature, sample_error_message, occurrence_count,
+          first_seen_at, last_seen_at, fix_status, last_test_id)
+       VALUES ($1, $2, 'err', 1, NOW(), NOW(), 'open', NULL)
+       RETURNING id`,
+      [seed.projectId, sig]
+    );
+    const failureId = Number(f.rows[0].id);
+    // Give it a last_test_id so it counts as eligible — use any
+    // existing one or skip if none. Easier: seed the failure with a
+    // throwaway playwright_tests entry. Avoid that complexity by
+    // updating last_test_id directly to a non-null sentinel that
+    // only matters to the IS NOT NULL filter.
+    await db.query(
+      `UPDATE test_failures SET last_test_id = 1 WHERE id = $1`,
+      [failureId]
+    );
+    for (let i = 0; i < verifyFailedCount; i++) {
+      await db.query(
+        `INSERT INTO fix_attempts
+           (test_failure_id, model_provider, model_name, branch_name, status, started_at, finished_at)
+         VALUES ($1, 'openai', 'gpt-4o', $2, 'verify_failed', NOW(), NOW())`,
+        [failureId, `${sig}-b${i}`]
+      );
+    }
+    return failureId;
+  }
+
+  it('preview reflects the stored config when no overrides are passed', async () => {
+    if (!canConnect) { console.warn('[integration] skipping'); return; }
+    await db.query(
+      `INSERT INTO project_autofix_configs (project_id, daily_limit, enabled, max_retries_per_failure)
+       VALUES ($1, 50, true, 3)
+       ON CONFLICT (project_id) DO UPDATE SET
+         daily_limit = EXCLUDED.daily_limit,
+         enabled = EXCLUDED.enabled,
+         max_retries_per_failure = EXCLUDED.max_retries_per_failure`,
+      [seed.projectId]
+    );
+
+    const out = await previewConfig(seed.projectId, {}, { db });
+    expect(out.previewedConfig).toEqual({ dailyLimit: 50, maxRetriesPerFailure: 3, enabled: true });
+    expect(typeof out.eligibleNow).toBe('number');
+    expect(typeof out.attemptsLast24h).toBe('number');
+    expect(out.remainingQuotaToday).toBeGreaterThanOrEqual(0);
+  });
+
+  it('capHitRisk counts open failures whose verify_failed COUNT >= (override - 1)', async () => {
+    if (!canConnect) { console.warn('[integration] skipping'); return; }
+    // Three open failures with 1, 2, 3 prior verify_failed attempts.
+    await seedFailureWithVerifyFailedAttempts(1, `pv-cap-1-${Date.now()}`);
+    await seedFailureWithVerifyFailedAttempts(2, `pv-cap-2-${Date.now()}`);
+    await seedFailureWithVerifyFailedAttempts(3, `pv-cap-3-${Date.now()}`);
+
+    // With previewedMaxRetries=3, threshold = 2 → failures with 2 OR
+    // 3 prior attempts are at risk (next failure promotes them). The
+    // failure with only 1 prior attempt is safe.
+    const out3 = await previewConfig(seed.projectId, { maxRetriesPerFailure: 3 }, { db });
+    expect(out3.capHitRisk).toBe(2);
+
+    // Lower the override to 2 → threshold = 1 → all three at risk.
+    const out2 = await previewConfig(seed.projectId, { maxRetriesPerFailure: 2 }, { db });
+    expect(out2.capHitRisk).toBe(3);
+
+    // Disable the cap (override = 0) → capHitRisk meaningless → 0.
+    const out0 = await previewConfig(seed.projectId, { maxRetriesPerFailure: 0 }, { db });
+    expect(out0.capHitRisk).toBe(0);
+  });
+
+  it('eligibleNow respects the previewed enabled toggle', async () => {
+    if (!canConnect) { console.warn('[integration] skipping'); return; }
+    // Seed an eligible failure (open + last_test_id set).
+    await seedFailureWithVerifyFailedAttempts(0, `pv-enabled-${Date.now()}`);
+
+    const enabledOut = await previewConfig(seed.projectId, { enabled: true }, { db });
+    expect(enabledOut.eligibleNow).toBeGreaterThan(0);
+
+    const disabledOut = await previewConfig(seed.projectId, { enabled: false }, { db });
+    expect(disabledOut.eligibleNow).toBe(0);
+  });
+});

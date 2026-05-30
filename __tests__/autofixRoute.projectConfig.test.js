@@ -24,6 +24,7 @@ jest.mock('../src/services/autoFixFailuresService', () => ({
 jest.mock('../src/services/autoFixProjectConfigService', () => ({
   getConfig: jest.fn(),
   upsertConfig: jest.fn(),
+  previewConfig: jest.fn(),
 }));
 
 jest.mock('pg', () => {
@@ -224,6 +225,87 @@ describe('PUT /api/autofix/projects/:projectId/config', () => {
   it('403 for non-admin', async () => {
     mockIsAdmin = false;
     const res = await request(app).put('/api/autofix/projects/7/config').send({ dailyLimit: 10, enabled: true, maxRetriesPerFailure: null });
+    expect(res.status).toBe(403);
+  });
+});
+
+describe('GET /api/autofix/projects/:projectId/config/preview', () => {
+  let app;
+  beforeAll(() => { app = buildApp(); });
+  beforeEach(() => {
+    autoFixProjectConfigService.previewConfig.mockReset();
+    mockIsAdmin = true;
+  });
+
+  it('200 + payload pass-through with no query overrides → service called with empty overrides', async () => {
+    const payload = {
+      projectId: 7,
+      previewedConfig: { dailyLimit: 20, maxRetriesPerFailure: 3, enabled: true },
+      eligibleNow: 5, attemptsLast24h: 2, remainingQuotaToday: 18, capHitRisk: 0,
+    };
+    autoFixProjectConfigService.previewConfig.mockResolvedValueOnce(payload);
+
+    const res = await request(app).get('/api/autofix/projects/7/config/preview');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(payload);
+    expect(autoFixProjectConfigService.previewConfig).toHaveBeenCalledWith('7', {});
+  });
+
+  it('parses + coerces numeric query overrides (dailyLimit, maxRetriesPerFailure)', async () => {
+    autoFixProjectConfigService.previewConfig.mockResolvedValueOnce({ projectId: 7 });
+    await request(app).get('/api/autofix/projects/7/config/preview?dailyLimit=50&maxRetriesPerFailure=5');
+    expect(autoFixProjectConfigService.previewConfig).toHaveBeenCalledWith('7', {
+      dailyLimit: 50,
+      maxRetriesPerFailure: 5,
+    });
+  });
+
+  it('coerces enabled query param (truthy/falsy string forms)', async () => {
+    autoFixProjectConfigService.previewConfig.mockResolvedValueOnce({ projectId: 7 });
+    await request(app).get('/api/autofix/projects/7/config/preview?enabled=true');
+    expect(autoFixProjectConfigService.previewConfig).toHaveBeenLastCalledWith('7', { enabled: true });
+
+    autoFixProjectConfigService.previewConfig.mockResolvedValueOnce({ projectId: 7 });
+    await request(app).get('/api/autofix/projects/7/config/preview?enabled=false');
+    expect(autoFixProjectConfigService.previewConfig).toHaveBeenLastCalledWith('7', { enabled: false });
+
+    autoFixProjectConfigService.previewConfig.mockResolvedValueOnce({ projectId: 7 });
+    await request(app).get('/api/autofix/projects/7/config/preview?enabled=1');
+    expect(autoFixProjectConfigService.previewConfig).toHaveBeenLastCalledWith('7', { enabled: true });
+  });
+
+  it('treats dailyLimit=null and empty-string as "clear override" → passes null through', async () => {
+    autoFixProjectConfigService.previewConfig.mockResolvedValueOnce({ projectId: 7 });
+    await request(app).get('/api/autofix/projects/7/config/preview?dailyLimit=null');
+    expect(autoFixProjectConfigService.previewConfig).toHaveBeenLastCalledWith('7', { dailyLimit: null });
+
+    autoFixProjectConfigService.previewConfig.mockResolvedValueOnce({ projectId: 7 });
+    await request(app).get('/api/autofix/projects/7/config/preview?dailyLimit=');
+    expect(autoFixProjectConfigService.previewConfig).toHaveBeenLastCalledWith('7', { dailyLimit: null });
+  });
+
+  it('silently drops garbage (typo in saved URL) instead of 400 — gentle-clamping policy', async () => {
+    autoFixProjectConfigService.previewConfig.mockResolvedValueOnce({ projectId: 7 });
+    await request(app).get('/api/autofix/projects/7/config/preview?dailyLimit=banana&maxRetriesPerFailure=-5&enabled=maybe');
+    // All three are invalid → service gets empty overrides, falls back to stored.
+    expect(autoFixProjectConfigService.previewConfig).toHaveBeenCalledWith('7', {});
+  });
+
+  it('404 NOT_FOUND when the service throws (project missing)', async () => {
+    autoFixProjectConfigService.previewConfig.mockRejectedValueOnce(new NotFoundError('project'));
+    const res = await request(app).get('/api/autofix/projects/999/config/preview');
+    expect(res.status).toBe(404);
+  });
+
+  it('401 without auth', async () => {
+    const res = await request(app).get('/api/autofix/projects/7/config/preview').set('x-test-noauth', '1');
+    expect(res.status).toBe(401);
+    expect(autoFixProjectConfigService.previewConfig).not.toHaveBeenCalled();
+  });
+
+  it('403 for non-admin', async () => {
+    mockIsAdmin = false;
+    const res = await request(app).get('/api/autofix/projects/7/config/preview');
     expect(res.status).toBe(403);
   });
 });

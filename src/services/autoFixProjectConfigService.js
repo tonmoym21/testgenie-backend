@@ -12,7 +12,7 @@
 // AUTOFIX_DAILY_LIMIT independently and recompute.
 
 const { NotFoundError } = require('../utils/apiError');
-const { getEnvDailyLimit } = require('./autoFixService');
+const { getEnvDailyLimit, countRecentAttempts } = require('./autoFixService');
 const { getEnvMaxRetries } = require('./autoFixVerifyService');
 
 /**
@@ -147,4 +147,142 @@ async function upsertConfig(projectIdRaw, body, opts = {}, deps = {}) {
   return shapeConfig(projectId, r.rows[0]);
 }
 
-module.exports = { getConfig, upsertConfig };
+/**
+ * Dry-run preview of the autofix state for a project under a (possibly
+ * hypothetical) config. The dashboard hits this as the operator edits
+ * the config form, BEFORE they save — answers "if I drop the cap from
+ * 10 to 5, how many failures will auto-promote on their next failed
+ * verify?" and "with my new dailyLimit, how much quota do I have left
+ * right now?"
+ *
+ * Optional overrides come from query params; absent fields fall back
+ * to the currently-stored effective config. Pure read — no writes.
+ *
+ * Response shape:
+ *   {
+ *     projectId,
+ *     previewedConfig: { dailyLimit, maxRetriesPerFailure, enabled },
+ *     eligibleNow: int,             // how many failures the cron would
+ *                                   //   pick up next tick under preview
+ *     attemptsLast24h: int,         // current rolling-24h spend
+ *     remainingQuotaToday: int|null,// previewedDailyLimit - attemptsLast24h,
+ *                                   //   floored at 0; null when cap disabled (0)
+ *     capHitRisk: int,              // open failures with verify_failed_count
+ *                                   //   already >= (previewedMaxRetries - 1) —
+ *                                   //   the NEXT verify_failed promotes them
+ *   }
+ *
+ * @param {number} projectIdRaw
+ * @param {object?} overrides       fields the form has changed but not saved
+ * @param {number|null|undefined} overrides.dailyLimit
+ * @param {number|null|undefined} overrides.maxRetriesPerFailure
+ * @param {boolean|undefined}     overrides.enabled
+ * @param {object?} deps
+ */
+async function previewConfig(projectIdRaw, overrides = {}, deps = {}) {
+  const db = deps.db || require('../db');
+  const projectId = Number(projectIdRaw);
+  if (!Number.isFinite(projectId) || projectId <= 0) {
+    throw new NotFoundError('project');
+  }
+
+  // Read the current stored config (also gives us 404 if the project
+  // doesn't exist — same gate as getConfig). Then layer the overrides
+  // on top.
+  const stored = await getConfig(projectId, deps);
+  const previewedConfig = {
+    dailyLimit: overrides.dailyLimit !== undefined
+      ? overrides.dailyLimit
+      : stored.effectiveDailyLimit,
+    maxRetriesPerFailure: overrides.maxRetriesPerFailure !== undefined
+      ? overrides.maxRetriesPerFailure
+      : stored.effectiveMaxRetriesPerFailure,
+    enabled: overrides.enabled !== undefined
+      ? overrides.enabled
+      : stored.enabled,
+  };
+
+  // Three counts, run in parallel — none depends on the others. The
+  // SQL is project-scoped throughout so the cost stays bounded by the
+  // tenant's row count regardless of total DB size.
+  //
+  // eligibleNow respects the previewedConfig.enabled toggle: if the
+  // preview turns autofix off, the count is 0 regardless of what's
+  // open in the DB. Mirrors the cron's findEligibleFailures filter.
+  //
+  // capHitRisk's threshold uses (previewedMaxRetries - 1) because
+  // recordVerifyFailed counts the JUST-flipped attempt — so a failure
+  // currently at N-1 verify_failed attempts will be at N after its
+  // next failed run, and N >= cap triggers wont_fix promotion. A
+  // previewedMaxRetries of 0 disables the cap (env semantics), so
+  // capHitRisk is meaningless — we report 0.
+  const capThreshold = previewedConfig.maxRetriesPerFailure > 0
+    ? previewedConfig.maxRetriesPerFailure - 1
+    : null;
+
+  const [eligibleNow, attemptsLast24h, capHitRisk] = await Promise.all([
+    previewedConfig.enabled
+      ? countEligibleFailures(db, projectId)
+      : Promise.resolve(0),
+    countRecentAttempts(projectId, { db }),
+    capThreshold == null
+      ? Promise.resolve(0)
+      : countCapHitRisk(db, projectId, capThreshold),
+  ]);
+
+  // remainingQuotaToday: null when cap is disabled (0 = "no limit"
+  // following the env semantics). Otherwise non-negative; a project
+  // that's already over its (newly-lowered) cap reports 0, not a
+  // negative number.
+  const remainingQuotaToday = previewedConfig.dailyLimit === 0
+    ? null
+    : Math.max(0, previewedConfig.dailyLimit - attemptsLast24h);
+
+  return {
+    projectId,
+    previewedConfig,
+    eligibleNow,
+    attemptsLast24h,
+    remainingQuotaToday,
+    capHitRisk,
+  };
+}
+
+// How many test_failures would the cron pick up next tick for THIS
+// project? Mirrors autoFixCronService.findEligibleFailures but
+// project-scoped + count-only.
+async function countEligibleFailures(db, projectId) {
+  const r = await db.query(
+    `SELECT COUNT(*)::int AS n
+       FROM test_failures tf
+       JOIN project_repo_configs prc ON prc.project_id = tf.project_id
+      WHERE tf.project_id = $1
+        AND tf.fix_status = 'open'
+        AND tf.last_test_id IS NOT NULL`,
+    [projectId]
+  );
+  return r.rows[0].n;
+}
+
+// Open failures whose existing verify_failed count is >= threshold.
+// Used for the "if I save this lowered cap, how many failures auto-
+// promote on the next bad run?" preview. HAVING because we're counting
+// attempts PER failure, not rows globally.
+async function countCapHitRisk(db, projectId, threshold) {
+  const r = await db.query(
+    `SELECT COUNT(*)::int AS n FROM (
+       SELECT tf.id
+         FROM test_failures tf
+         JOIN fix_attempts fa ON fa.test_failure_id = tf.id
+        WHERE tf.project_id = $1
+          AND tf.fix_status = 'open'
+          AND fa.status = 'verify_failed'
+        GROUP BY tf.id
+       HAVING COUNT(fa.id) >= $2
+     ) at_risk`,
+    [projectId, threshold]
+  );
+  return r.rows[0].n;
+}
+
+module.exports = { getConfig, upsertConfig, previewConfig };

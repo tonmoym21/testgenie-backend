@@ -17,11 +17,14 @@ jest.mock('pg', () => {
   return { Pool };
 });
 
-// Stub the env-default readers so the test doesn't depend on whatever
-// AUTOFIX_DAILY_LIMIT / AUTOFIX_MAX_RETRIES_PER_FAILURE happen to be
-// set to in the host process.
+// Stub the env-default readers + countRecentAttempts so the test
+// doesn't depend on host env vars or live DB queries. previewConfig
+// pulls countRecentAttempts via a top-level destructure of
+// autoFixService — mocking it later (after the destructure) is too
+// late, so the mock must expose it here at module-mock time.
 jest.mock('../src/services/autoFixService', () => ({
   getEnvDailyLimit: jest.fn(() => 20),
+  countRecentAttempts: jest.fn(async () => 0),
 }));
 jest.mock('../src/services/autoFixVerifyService', () => ({
   getEnvMaxRetries: jest.fn(() => 3),
@@ -244,6 +247,140 @@ describe('autoFixProjectConfigService.upsertConfig', () => {
     const db = makeDb([]);
     await expect(upsertConfig('abc', { dailyLimit: 50, enabled: true, maxRetriesPerFailure: null }, {}, { db, logger: silentLogger }))
       .rejects.toMatchObject({ statusCode: 404 });
+    expect(db.query).not.toHaveBeenCalled();
+  });
+});
+
+describe('autoFixProjectConfigService.previewConfig', () => {
+  const { previewConfig } = require('../src/services/autoFixProjectConfigService');
+  // countRecentAttempts is mocked at module load (top of file). Per
+  // test sets mockResolvedValue to control the rolling-24h count.
+  const autoFixService = require('../src/services/autoFixService');
+
+  // Helper for the three-SELECT preview pattern. NOTE: this file's
+  // makeDb returns responses verbatim (NOT wrapped) — each response
+  // must be a full `{rows, rowCount}` shape, matching pg's contract.
+  function previewDb({
+    eligibleNow = 0, attemptsLast24h = 0, capHitRisk = 0,
+    storedConfig = { daily_limit: null, enabled: true, max_retries_per_failure: null,
+                     created_at: new Date(), updated_at: new Date() },
+  } = {}) {
+    return makeDb([
+      [/SELECT 1 FROM projects/, { rows: [{}], rowCount: 1 }],
+      [/FROM project_autofix_configs/,
+        storedConfig ? { rows: [storedConfig], rowCount: 1 } : { rows: [], rowCount: 0 }],
+      // eligibleNow query: COUNT joined to project_repo_configs
+      [/JOIN project_repo_configs/, { rows: [{ n: eligibleNow }], rowCount: 1 }],
+      // capHitRisk subquery
+      [/HAVING COUNT/, { rows: [{ n: capHitRisk }], rowCount: 1 }],
+      // countRecentAttempts query lives in autoFixService — mocked above.
+    ]);
+  }
+
+  beforeEach(() => {
+    autoFixService.countRecentAttempts.mockReset();
+  });
+
+  it('happy path with no overrides: uses stored effective config; runs eligible + cap-risk + attempts in parallel', async () => {
+    autoFixService.countRecentAttempts.mockResolvedValue(7);
+    const db = previewDb({ eligibleNow: 3, capHitRisk: 1,
+      storedConfig: { daily_limit: 50, enabled: true, max_retries_per_failure: 5,
+                      created_at: new Date(), updated_at: new Date() } });
+    const out = await previewConfig(7, {}, { db });
+
+    expect(out.projectId).toBe(7);
+    expect(out.previewedConfig).toEqual({
+      dailyLimit: 50,
+      maxRetriesPerFailure: 5,
+      enabled: true,
+    });
+    expect(out.eligibleNow).toBe(3);
+    expect(out.attemptsLast24h).toBe(7);
+    expect(out.remainingQuotaToday).toBe(43);   // 50 - 7
+    expect(out.capHitRisk).toBe(1);
+  });
+
+  it('override fields beat stored ones (the "what if I save this?" flow)', async () => {
+    autoFixService.countRecentAttempts.mockResolvedValue(5);
+    const db = previewDb({ eligibleNow: 2, capHitRisk: 4,
+      storedConfig: { daily_limit: 100, enabled: true, max_retries_per_failure: 10,
+                      created_at: new Date(), updated_at: new Date() } });
+
+    const out = await previewConfig(7,
+      { dailyLimit: 20, maxRetriesPerFailure: 2 }, { db });
+
+    // Overrides win for the previewed config + downstream calculations.
+    expect(out.previewedConfig.dailyLimit).toBe(20);
+    expect(out.previewedConfig.maxRetriesPerFailure).toBe(2);
+    // enabled was NOT overridden → stored value flows through.
+    expect(out.previewedConfig.enabled).toBe(true);
+    // remainingQuotaToday computed off the OVERRIDE, not stored.
+    expect(out.remainingQuotaToday).toBe(15);   // 20 - 5
+    // capHitRisk uses (override - 1) = 1 as the threshold inside SQL.
+    // We pin that here by asserting the param flowed through.
+    const riskCall = db.calls.find((c) => /HAVING COUNT/.test(c.sql));
+    expect(riskCall.params).toEqual([7, 1]);
+  });
+
+  it('enabled=false override: eligibleNow short-circuits to 0 without hitting the DB', async () => {
+    // When the form is set to disable autofix, the cron filter would
+    // exclude every row — no point spending a query to count them.
+    autoFixService.countRecentAttempts.mockResolvedValue(2);
+    const db = previewDb({ eligibleNow: 99 /* would be returned IF queried */ });
+
+    const out = await previewConfig(7, { enabled: false }, { db });
+    expect(out.previewedConfig.enabled).toBe(false);
+    expect(out.eligibleNow).toBe(0);
+    // The eligibility query must NOT have fired.
+    const eligibleCall = db.calls.find((c) => /JOIN project_repo_configs/.test(c.sql));
+    expect(eligibleCall).toBeFalsy();
+  });
+
+  it('previewedDailyLimit=0 (cap disabled): remainingQuotaToday is null, not a number', async () => {
+    // The env semantics of "limit=0" is "infinite, no cap." The
+    // preview must surface that as null so the dashboard renders
+    // "No daily limit" rather than "0 remaining."
+    autoFixService.countRecentAttempts.mockResolvedValue(123);
+    const db = previewDb({});
+
+    const out = await previewConfig(7, { dailyLimit: 0 }, { db });
+    expect(out.remainingQuotaToday).toBeNull();
+  });
+
+  it('previewedMaxRetries=0 (cap disabled): capHitRisk is 0 without hitting the DB', async () => {
+    autoFixService.countRecentAttempts.mockResolvedValue(0);
+    const db = previewDb({ capHitRisk: 99 });
+
+    const out = await previewConfig(7, { maxRetriesPerFailure: 0 }, { db });
+    expect(out.capHitRisk).toBe(0);
+    // No HAVING-COUNT query fired — meaningless when the cap is off.
+    const riskCall = db.calls.find((c) => /HAVING COUNT/.test(c.sql));
+    expect(riskCall).toBeFalsy();
+  });
+
+  it('remainingQuotaToday floors at 0 (project already over its newly-lowered cap)', async () => {
+    // Real scenario: ops drops the cap from 50 to 5 mid-day after the
+    // project has burned 8 attempts. Preview shouldn't say -3; it
+    // should say 0 ("you're already over").
+    autoFixService.countRecentAttempts.mockResolvedValue(8);
+    const db = previewDb({});
+
+    const out = await previewConfig(7, { dailyLimit: 5 }, { db });
+    expect(out.remainingQuotaToday).toBe(0);
+  });
+
+  it('404 NOT_FOUND when project does not exist (delegates to getConfig)', async () => {
+    autoFixService.countRecentAttempts.mockResolvedValue(0);
+    const db = makeDb([[/SELECT 1 FROM projects/, { rows: [], rowCount: 0 }]]);
+    await expect(previewConfig(999, {}, { db })).rejects.toMatchObject({ statusCode: 404 });
+    // Critical: no count queries fired for a missing project.
+    expect(autoFixService.countRecentAttempts).not.toHaveBeenCalled();
+  });
+
+  it('404 on invalid projectId without hitting the DB', async () => {
+    const db = makeDb([]);
+    await expect(previewConfig('abc', {}, { db })).rejects.toMatchObject({ statusCode: 404 });
+    await expect(previewConfig(0, {}, { db })).rejects.toMatchObject({ statusCode: 404 });
     expect(db.query).not.toHaveBeenCalled();
   });
 });
