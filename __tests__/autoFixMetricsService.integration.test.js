@@ -19,7 +19,7 @@ process.env.NODE_ENV = 'test';
 
 const { Pool } = require('pg');
 const db = require('../src/db');
-const { getMetrics } = require('../src/services/autoFixMetricsService');
+const { getMetrics, getMetricsTimeseries } = require('../src/services/autoFixMetricsService');
 
 let canConnect = false;
 let seed = null;
@@ -209,5 +209,119 @@ describe('autoFixMetricsService.getMetrics [real DB]', () => {
       p.projectId === seed.projectAId || p.projectId === seed.projectBId
     );
     expect(ours).toEqual([]);  // nothing was seeded this test
+  });
+});
+
+describe('autoFixMetricsService.getMetricsTimeseries [real DB]', () => {
+  // Seed an attempt at a known offset from NOW so we can predict
+  // which bucket it lands in. Uses seed.projectA so the global-rollup
+  // tests above don't double-count.
+  async function seedAttemptAt(minutesAgo, status = 'verified') {
+    const fId = await seedFailure({ projectId: seed.projectAId, signature: `ts-${Date.now()}-${Math.random()}` });
+    await db.query(
+      `INSERT INTO fix_attempts
+         (test_failure_id, model_provider, model_name, branch_name, status,
+          started_at, finished_at)
+       VALUES ($1, 'openai', 'gpt-4o', $2, $3,
+               NOW() - ($4 || ' minutes')::INTERVAL,
+               NOW() - ($4 || ' minutes')::INTERVAL)
+       RETURNING id`,
+      [fId, `b-${minutesAgo}`, status, String(minutesAgo)]
+    );
+    return fId;
+  }
+
+  it('returns one bucket per hour over the window; gap hours still appear with attempts=0', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    // Seed three attempts at 10m / 70m / 130m ago — lands in three
+    // separate 1h buckets out of the 24 we'll request.
+    await seedAttemptAt(10, 'verified');
+    await seedAttemptAt(70, 'verify_failed');
+    await seedAttemptAt(130, 'failed');
+
+    const out = await getMetricsTimeseries(
+      { windowHours: 24, bucketHours: 1, projectId: seed.projectAId },
+      { db },
+    );
+
+    // generate_series gives N+1 buckets when start and end are
+    // multiples of the step apart — accept either 24 or 25.
+    expect(out.buckets.length).toBeGreaterThanOrEqual(24);
+    expect(out.buckets.length).toBeLessThanOrEqual(25);
+    expect(out.projectId).toBe(seed.projectAId);
+
+    // The three buckets with attempts contain exactly one each; the
+    // rest are zeros. Pinning the zero-bucket-still-rendered contract
+    // (the actual reason for generate_series + LEFT JOIN).
+    const withAttempts = out.buckets.filter((b) => b.attempts > 0);
+    expect(withAttempts).toHaveLength(3);
+    const statuses = withAttempts.map((b) => {
+      if (b.verified > 0) return 'verified';
+      if (b.verify_failed > 0) return 'verify_failed';
+      if (b.failed > 0) return 'failed';
+      return '?';
+    }).sort();
+    expect(statuses).toEqual(['failed', 'verified', 'verify_failed']);
+  });
+
+  it('bucketHours > 1 rolls multiple hours of attempts into one slice', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    // Two attempts within the same 4h window but in different hours.
+    await seedAttemptAt(30, 'verified');   // -30m
+    await seedAttemptAt(90, 'verified');   // -1.5h
+
+    const out = await getMetricsTimeseries(
+      { windowHours: 4, bucketHours: 4, projectId: seed.projectAId },
+      { db },
+    );
+
+    // 4h window with 4h buckets -> 1 or 2 buckets depending on
+    // alignment. Both seeded attempts must land in the SAME bucket
+    // since they're both inside the last 4h.
+    const totalVerified = out.buckets.reduce((acc, b) => acc + b.verified, 0);
+    expect(totalVerified).toBe(2);
+  });
+
+  it('cap-hits in the window appear in the bucket where they resolved', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    // Seed a wont_fix failure resolved 30 minutes ago.
+    const f = await db.query(
+      `INSERT INTO test_failures
+         (project_id, failure_signature, sample_error_message, occurrence_count,
+          first_seen_at, last_seen_at, fix_status, resolved_at)
+       VALUES ($1, $2, 'err', 1, NOW(), NOW(), 'wont_fix',
+               NOW() - INTERVAL '30 minutes')
+       RETURNING id`,
+      [seed.projectAId, `ts-caphit-${Date.now()}`]
+    );
+
+    const out = await getMetricsTimeseries(
+      { windowHours: 24, bucketHours: 1, projectId: seed.projectAId },
+      { db },
+    );
+
+    const totalCapHits = out.buckets.reduce((acc, b) => acc + b.capHits, 0);
+    expect(totalCapHits).toBeGreaterThanOrEqual(1);
+    // Cleanup so the cap-hit doesn't leak into later tests.
+    await db.query(`DELETE FROM test_failures WHERE id = $1`, [f.rows[0].id]);
+  });
+
+  it('projectId scopes results — attempts in OTHER projects do not appear', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    // Seed an attempt in projectB; query scoped to projectA should see 0.
+    const fId = await seedFailure({ projectId: seed.projectBId, signature: `ts-cross-${Date.now()}` });
+    await db.query(
+      `INSERT INTO fix_attempts
+         (test_failure_id, model_provider, model_name, branch_name, status, started_at, finished_at)
+       VALUES ($1, 'openai', 'gpt-4o', 'b-cross', 'verified', NOW(), NOW())`,
+      [fId]
+    );
+
+    const outA = await getMetricsTimeseries(
+      { windowHours: 1, bucketHours: 1, projectId: seed.projectAId },
+      { db },
+    );
+    const verifiedInA = outA.buckets.reduce((acc, b) => acc + b.verified, 0);
+    expect(verifiedInA).toBe(0);
   });
 });

@@ -180,12 +180,176 @@ async function getMetrics(opts = {}, deps = {}) {
   };
 }
 
+// -----------------------------------------------------------------
+// Time-series
+// -----------------------------------------------------------------
+// Bucketed history for dashboards that want to chart trend lines
+// rather than just a single rolling-window snapshot. Defaults to
+// 24 buckets x 1h covering the last day — same wall-clock budget
+// as getMetrics(), but sliced.
+
+const DEFAULT_BUCKET_HOURS = 1;
+const MAX_BUCKET_HOURS = 24;      // 1d buckets cap; finer-grained needs (5-min) should hit a real TSDB
+
+// Status buckets we explicitly chart per slice. Kept short — verified
+// + verify_failed are the "did the loop work" signal; failed is the
+// "LLM blew up before we got to verify" signal. The other states
+// (proposed, queued, pr_opened, merged) are transient or downstream
+// of the verify outcome and add noise to a trend line. Callers that
+// want them can hit getMetrics() for the snapshot.
+const TIMESERIES_STATUSES = ['verified', 'verify_failed', 'failed'];
+
+/**
+ * Bucketed counts over fix_attempts + test_failures, suitable for
+ * a frontend chart's data property. Returns one bucket per
+ * bucketHours covering windowHours, indexed by bucket-start
+ * timestamp. generate_series provides the spine so a bucket with
+ * zero attempts still appears (no gaps in the chart x-axis).
+ *
+ * @param {object?} opts
+ * @param {number?} opts.windowHours    1..720 (default 24)
+ * @param {number?} opts.bucketHours    1..24  (default 1) — must divide
+ *                                      windowHours evenly for a clean
+ *                                      spine; we don't enforce that
+ *                                      because users may genuinely
+ *                                      want 25-hour windows on 1h
+ *                                      buckets (today + last 1h of
+ *                                      yesterday for comparison).
+ * @param {number?} opts.projectId      scope to one project; omit for global
+ * @returns {Promise<{windowHours, bucketHours, generatedAt, buckets: [...]}>}
+ */
+async function getMetricsTimeseries(opts = {}, deps = {}) {
+  const db = deps.db || require('../db');
+  const windowHours = clampInt(opts.windowHours, DEFAULT_WINDOW_HOURS, 1, MAX_WINDOW_HOURS);
+  const bucketHours = clampInt(opts.bucketHours, DEFAULT_BUCKET_HOURS, 1, MAX_BUCKET_HOURS);
+  const projectId = opts.projectId != null && Number.isFinite(Number(opts.projectId))
+    ? Math.floor(Number(opts.projectId))
+    : null;
+
+  // Build the spine + attempts aggregation in one query. Bucket
+  // boundaries are anchored to NOW, not date_trunc — that's what
+  // makes "windowHours == bucketHours" behave correctly (one bucket
+  // covering the last N hours, ending at NOW). The cost is bucket
+  // edges aren't wall-clock aligned (12:34, 13:34, ...) — acceptable
+  // for a "last 24h" view, and charts handle non-round edges fine.
+  //
+  // The LEFT JOIN gives us zero-attempt buckets explicitly (0
+  // rather than missing) — critical for chart x-axis continuity.
+  //
+  // projectId is conditionally appended via SQL fragment because
+  // INTERVAL math + parameterised WHERE doesn't compose cleanly when
+  // mixed; keeping the project-scope filter as a literal additional
+  // AND clause avoids contorting the parameter shape.
+  const projectFilter = projectId != null ? `AND tf.project_id = $3` : '';
+  const params = projectId != null ? [windowHours, bucketHours, projectId] : [windowHours, bucketHours];
+
+  const attemptsSql = `
+    WITH spine AS (
+      SELECT generate_series(
+        NOW() - ($1 || ' hours')::INTERVAL,
+        NOW() - ($2 || ' hours')::INTERVAL,
+        ($2 || ' hours')::INTERVAL
+      ) AS bucket_start
+    ),
+    attempts_in_window AS (
+      SELECT fa.id, fa.status, fa.started_at
+        FROM fix_attempts fa
+        JOIN test_failures tf ON tf.id = fa.test_failure_id
+       WHERE fa.started_at >= NOW() - ($1 || ' hours')::INTERVAL
+         ${projectFilter}
+    )
+    SELECT
+      s.bucket_start,
+      COUNT(a.id)::int AS attempts,
+      ${TIMESERIES_STATUSES
+        .map((status) => `COUNT(*) FILTER (WHERE a.status = '${status}')::int AS s_${status}`)
+        .join(',\n      ')}
+      FROM spine s
+      LEFT JOIN attempts_in_window a
+        ON a.started_at >= s.bucket_start
+       AND a.started_at <  s.bucket_start + ($2 || ' hours')::INTERVAL
+     GROUP BY s.bucket_start
+     ORDER BY s.bucket_start
+  `;
+
+  // Cap-hits live in test_failures (resolved_at + fix_status='wont_fix'
+  // per PR #25). Separate query because the source table differs.
+  // We bucket by date_trunc('hour', ...) since cap-hit resolution
+  // doesn't need sub-hour precision — the JS layer then rolls those
+  // hour rows into the wider spine buckets via Map walk.
+  // capHits uses its own contiguous parameter numbering ($1, [$2])
+  // independent of the attempts query — different param list per
+  // query keeps the SQL minimal and pg-strict-compliant (no unused
+  // parameters in either call).
+  const capHitsSql = `
+    SELECT
+      date_trunc('hour', resolved_at)::timestamptz AS hour,
+      COUNT(*)::int AS cap_hits
+      FROM test_failures
+     WHERE fix_status = 'wont_fix'
+       AND resolved_at IS NOT NULL
+       AND resolved_at >= NOW() - ($1 || ' hours')::INTERVAL
+       ${projectId != null ? `AND project_id = $2` : ''}
+     GROUP BY 1
+  `;
+
+  // capHits SQL parameters its own contiguous list ($1 + optional $2),
+  // independent of attemptsSql's ($1, $2 [, $3]).
+  const capHitsParams = projectId != null ? [windowHours, projectId] : [windowHours];
+  const [attemptsRes, capHitsRes] = await Promise.all([
+    db.query(attemptsSql, params),
+    db.query(capHitsSql, capHitsParams),
+  ]);
+
+  // Bucket the cap-hit rows by HOUR (their natural truncation
+  // granularity) into a Map keyed by bucket_start. If bucketHours > 1
+  // we need to roll those hour-cap-hits up to the wider bucket. We
+  // do that by walking each spine bucket and summing every cap-hit
+  // hour that falls inside it. Cheap (<= 24 cap-hit rows in the
+  // pathological case, <= MAX_BUCKET_HOURS buckets to sum across).
+  const capHitsByHour = new Map();
+  for (const r of capHitsRes.rows) {
+    capHitsByHour.set(new Date(r.hour).getTime(), r.cap_hits);
+  }
+  const bucketMs = bucketHours * 3600 * 1000;
+  const buckets = attemptsRes.rows.map((row) => {
+    const bucketStartMs = new Date(row.bucket_start).getTime();
+    let capHits = 0;
+    for (const [hourMs, count] of capHitsByHour) {
+      if (hourMs >= bucketStartMs && hourMs < bucketStartMs + bucketMs) {
+        capHits += count;
+      }
+    }
+    const result = {
+      startedAt: new Date(row.bucket_start).toISOString(),
+      attempts: row.attempts || 0,
+      capHits,
+    };
+    for (const status of TIMESERIES_STATUSES) {
+      result[status] = row[`s_${status}`] || 0;
+    }
+    return result;
+  });
+
+  return {
+    windowHours,
+    bucketHours,
+    projectId,
+    generatedAt: new Date().toISOString(),
+    buckets,
+  };
+}
+
 module.exports = {
   getMetrics,
+  getMetricsTimeseries,
   // exported for tests
   ALL_STATUSES,
+  TIMESERIES_STATUSES,
   DEFAULT_WINDOW_HOURS,
   MAX_WINDOW_HOURS,
   DEFAULT_TOP_PROJECTS,
   MAX_TOP_PROJECTS,
+  DEFAULT_BUCKET_HOURS,
+  MAX_BUCKET_HOURS,
 };

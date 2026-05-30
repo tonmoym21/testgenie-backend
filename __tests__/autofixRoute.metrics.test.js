@@ -18,7 +18,10 @@ jest.mock('../src/services/autoFixService', () => ({ proposeFix: jest.fn() }));
 jest.mock('../src/services/autoFixApplyService', () => ({ applyFix: jest.fn() }));
 jest.mock('../src/services/autoFixVerifyService', () => ({ verifyFix: jest.fn() }));
 jest.mock('../src/services/autoFixCronService', () => ({ tick: jest.fn() }));
-jest.mock('../src/services/autoFixMetricsService', () => ({ getMetrics: jest.fn() }));
+jest.mock('../src/services/autoFixMetricsService', () => ({
+  getMetrics: jest.fn(),
+  getMetricsTimeseries: jest.fn(),
+}));
 
 jest.mock('pg', () => {
   class Pool {
@@ -116,6 +119,63 @@ describe('GET /api/autofix/metrics', () => {
   it('surfaces unexpected service errors as 500 INTERNAL_ERROR', async () => {
     autoFixMetricsService.getMetrics.mockRejectedValueOnce(new Error('db down'));
     const res = await request(app).get('/api/autofix/metrics');
+    expect(res.status).toBe(500);
+    expect(res.body.error.code).toBe('INTERNAL_ERROR');
+  });
+});
+
+describe('GET /api/autofix/metrics/timeseries', () => {
+  let app;
+  beforeAll(() => { app = buildApp(); });
+  beforeEach(() => {
+    autoFixMetricsService.getMetricsTimeseries.mockReset();
+    mockIsAdmin = true;
+  });
+
+  it('200 + payload pass-through; plumbs windowHours/bucketHours/projectId to the service', async () => {
+    const payload = {
+      windowHours: 24, bucketHours: 1, projectId: 7,
+      generatedAt: '2026-05-30T00:00:00.000Z',
+      buckets: [{ startedAt: '...', attempts: 1, verified: 1, verify_failed: 0, failed: 0, capHits: 0 }],
+    };
+    autoFixMetricsService.getMetricsTimeseries.mockResolvedValueOnce(payload);
+
+    const res = await request(app)
+      .get('/api/autofix/metrics/timeseries?windowHours=24&bucketHours=1&projectId=7');
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(payload);
+    // Express delivers query params as strings — the service is the
+    // coercion + clamping seam. Pinning that here so a future
+    // refactor that adds coerce-at-route logic notices.
+    expect(autoFixMetricsService.getMetricsTimeseries).toHaveBeenCalledWith({
+      windowHours: '24', bucketHours: '1', projectId: '7',
+    });
+  });
+
+  it('passes undefined for omitted query params (no defaults at route layer)', async () => {
+    autoFixMetricsService.getMetricsTimeseries.mockResolvedValueOnce({ buckets: [] });
+    await request(app).get('/api/autofix/metrics/timeseries');
+    expect(autoFixMetricsService.getMetricsTimeseries).toHaveBeenCalledWith({
+      windowHours: undefined, bucketHours: undefined, projectId: undefined,
+    });
+  });
+
+  it('401 without auth', async () => {
+    const res = await request(app).get('/api/autofix/metrics/timeseries').set('x-test-noauth', '1');
+    expect(res.status).toBe(401);
+    expect(autoFixMetricsService.getMetricsTimeseries).not.toHaveBeenCalled();
+  });
+
+  it('403 for non-admin', async () => {
+    mockIsAdmin = false;
+    const res = await request(app).get('/api/autofix/metrics/timeseries');
+    expect(res.status).toBe(403);
+  });
+
+  it('500 INTERNAL_ERROR for unexpected service errors', async () => {
+    autoFixMetricsService.getMetricsTimeseries.mockRejectedValueOnce(new Error('db down'));
+    const res = await request(app).get('/api/autofix/metrics/timeseries');
     expect(res.status).toBe(500);
     expect(res.body.error.code).toBe('INTERNAL_ERROR');
   });
