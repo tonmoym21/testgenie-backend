@@ -300,6 +300,52 @@ router.get('/projects/:projectId/config', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// Dry-run preview — "what would the autofix loop look like if I saved
+// the current form values?" Read-only, no DB writes. Query params are
+// optional overrides for the stored config; absent means "use stored
+// effective value." Hit by the dashboard's config form on every input
+// change so the operator sees the consequence of their edit live.
+//
+// Same gentle-clamping policy as /metrics: unparseable inputs fall
+// through to the stored value rather than 400 — a typo in a saved
+// dashboard URL must not blank the preview panel. Invalid TYPES
+// (e.g. enabled=banana) get silently treated as "not provided."
+router.get('/projects/:projectId/config/preview', async (req, res, next) => {
+  try {
+    const overrides = {};
+    if (req.query.dailyLimit !== undefined) {
+      // Empty string and 'null' both mean "clear override → use env
+      // default" in the form's mental model. Pass null through to the
+      // service, which then computes effectiveDailyLimit from env.
+      if (req.query.dailyLimit === '' || req.query.dailyLimit === 'null') {
+        overrides.dailyLimit = null;
+      } else {
+        const n = Number(req.query.dailyLimit);
+        if (Number.isFinite(n) && n >= 0) overrides.dailyLimit = Math.floor(n);
+        // else: silently drop — clamping policy
+      }
+    }
+    if (req.query.maxRetriesPerFailure !== undefined) {
+      if (req.query.maxRetriesPerFailure === '' || req.query.maxRetriesPerFailure === 'null') {
+        overrides.maxRetriesPerFailure = null;
+      } else {
+        const n = Number(req.query.maxRetriesPerFailure);
+        if (Number.isFinite(n) && n >= 0) overrides.maxRetriesPerFailure = Math.floor(n);
+      }
+    }
+    if (req.query.enabled !== undefined) {
+      // Accept the common truthy/falsy string forms. Anything else
+      // gets dropped → fall back to stored.
+      const v = String(req.query.enabled).toLowerCase();
+      if (v === 'true' || v === '1') overrides.enabled = true;
+      else if (v === 'false' || v === '0') overrides.enabled = false;
+    }
+
+    const result = await autoFixProjectConfigService.previewConfig(req.params.projectId, overrides);
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
 router.put(
   '/projects/:projectId/config',
   adminMutationLimiter,
