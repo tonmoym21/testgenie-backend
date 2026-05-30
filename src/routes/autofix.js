@@ -130,6 +130,30 @@ router.get('/metrics', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// Bucketed time-series of the same fix_attempts data. Dashboards
+// hit this to render trend-line charts ("verify success rate over
+// the last 24h") rather than the snapshot /metrics returns. Same
+// gentle-clamping policy as /metrics. Buckets always include
+// zero-attempt slices (no gaps in the chart x-axis).
+//   windowHours    1..720 (default 24)
+//   bucketHours    1..24  (default 1) — bucket width
+//   projectId      optional; omit for global rollup
+//
+// REGISTERED BEFORE other /metrics... paths if any get added later.
+// Currently /metrics matches an exact path with no :param so there's
+// no shadowing risk, but flagging the convention here so future
+// nested routes don't reintroduce the PR #35 bulk/:id collision.
+router.get('/metrics/timeseries', async (req, res, next) => {
+  try {
+    const result = await autoFixMetricsService.getMetricsTimeseries({
+      windowHours: req.query.windowHours,
+      bucketHours: req.query.bucketHours,
+      projectId: req.query.projectId,
+    });
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
 // Paginated browse over test_failures for the failure-dashboard UI.
 // Query params:
 //   status        open | fix_proposed | fix_merged | wont_fix | resolved

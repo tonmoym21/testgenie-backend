@@ -21,7 +21,9 @@ jest.mock('pg', () => {
   return { Pool };
 });
 
-const { getMetrics, ALL_STATUSES, MAX_WINDOW_HOURS, MAX_TOP_PROJECTS } =
+const { getMetrics, getMetricsTimeseries, ALL_STATUSES, TIMESERIES_STATUSES,
+  MAX_WINDOW_HOURS, MAX_TOP_PROJECTS,
+  DEFAULT_BUCKET_HOURS, MAX_BUCKET_HOURS } =
   require('../src/services/autoFixMetricsService');
 
 // Scripted db that returns successive responses keyed by SQL fragment.
@@ -172,5 +174,171 @@ describe('autoFixMetricsService.getMetrics', () => {
       const out = await getMetrics({ windowHours: 12.7 }, { db });
       expect(out.windowHours).toBe(12);
     });
+  });
+});
+
+describe('autoFixMetricsService.getMetricsTimeseries', () => {
+  // Fake a row returned by the WITH-spine query: bucket_start +
+  // attempts + per-status counts. We supply a couple of buckets so
+  // the tests have something interesting to assert.
+  function fakeBucket(overrides = {}) {
+    const base = { bucket_start: '2026-05-30T00:00:00Z', attempts: 0 };
+    for (const s of TIMESERIES_STATUSES) base[`s_${s}`] = 0;
+    return { ...base, ...overrides };
+  }
+
+  it('issues two queries (attempts spine, cap-hits); each gets its own minimal param list', async () => {
+    const db = makeDb([
+      [/WITH spine AS/, [fakeBucket()]],
+      [/FROM test_failures/, []],
+    ]);
+
+    await getMetricsTimeseries({ windowHours: 24, bucketHours: 1 }, { db });
+
+    expect(db.query).toHaveBeenCalledTimes(2);
+    const spineCall = db.calls.find((c) => /WITH spine AS/.test(c.sql));
+    const capCall = db.calls.find((c) => /FROM test_failures/.test(c.sql));
+    // Attempts spine needs window + bucket
+    expect(spineCall.params).toEqual([24, 1]);
+    // capHits only needs window — pg rejects calls with bound but
+    // unreferenced parameters, so we pass a tailored list.
+    expect(capCall.params).toEqual([24]);
+  });
+
+  it('returns one bucket per spine row with status keys + capHits present', async () => {
+    const db = makeDb([
+      [/WITH spine AS/, [
+        fakeBucket({ bucket_start: '2026-05-30T00:00:00Z',
+          attempts: 5, s_verified: 3, s_verify_failed: 1, s_failed: 1 }),
+        fakeBucket({ bucket_start: '2026-05-30T01:00:00Z',
+          attempts: 2, s_verified: 2 }),
+      ]],
+      [/FROM test_failures/, [
+        { hour: '2026-05-30T00:00:00Z', cap_hits: 1 },
+        { hour: '2026-05-30T01:00:00Z', cap_hits: 0 },
+      ]],
+    ]);
+
+    const out = await getMetricsTimeseries({}, { db });
+
+    expect(out.windowHours).toBe(24);
+    expect(out.bucketHours).toBe(1);
+    expect(out.generatedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(out.projectId).toBeNull();
+    expect(out.buckets).toHaveLength(2);
+
+    expect(out.buckets[0]).toMatchObject({
+      startedAt: '2026-05-30T00:00:00.000Z',
+      attempts: 5,
+      verified: 3,
+      verify_failed: 1,
+      failed: 1,
+      capHits: 1,
+    });
+    expect(out.buckets[1].capHits).toBe(0);
+  });
+
+  it('zero-attempt buckets still appear (no chart gaps — that is the actual contract)', async () => {
+    // The spine + LEFT JOIN guarantees this in SQL; this test pins
+    // the JS layer doesn't filter zero buckets out. A refactor that
+    // drops zero rows would silently re-introduce x-axis gaps.
+    const db = makeDb([
+      [/WITH spine AS/, [
+        fakeBucket({ bucket_start: '2026-05-30T00:00:00Z' }),  // all zeros
+        fakeBucket({ bucket_start: '2026-05-30T01:00:00Z', attempts: 1, s_verified: 1 }),
+        fakeBucket({ bucket_start: '2026-05-30T02:00:00Z' }),  // all zeros
+      ]],
+      [/FROM test_failures/, []],
+    ]);
+    const out = await getMetricsTimeseries({}, { db });
+    expect(out.buckets).toHaveLength(3);
+    expect(out.buckets[0].attempts).toBe(0);
+    expect(out.buckets[0].capHits).toBe(0);
+    expect(out.buckets[2].attempts).toBe(0);
+  });
+
+  it('rolls hour-bucketed cap-hits into wider bucketHours (e.g. 2h buckets)', async () => {
+    // capHitsByHour returns hour-bucketed rows (date_trunc('hour',
+    // resolved_at)). When bucketHours > 1 the JS layer sums those
+    // hour rows into the wider spine bucket. Pinning that math.
+    const db = makeDb([
+      [/WITH spine AS/, [
+        fakeBucket({ bucket_start: '2026-05-30T00:00:00Z' }),
+      ]],
+      [/FROM test_failures/, [
+        { hour: '2026-05-30T00:00:00Z', cap_hits: 2 },
+        { hour: '2026-05-30T01:00:00Z', cap_hits: 3 },
+        // 02:00 is outside the 2h bucket starting at 00:00.
+        { hour: '2026-05-30T02:00:00Z', cap_hits: 99 },
+      ]],
+    ]);
+    const out = await getMetricsTimeseries({ bucketHours: 2 }, { db });
+    // 2 + 3 from the in-range hours; 99 excluded.
+    expect(out.buckets[0].capHits).toBe(5);
+  });
+
+  it('projectId scopes both queries (attempts: $3, cap-hits: $2 — distinct numbering)', async () => {
+    const db = makeDb([
+      [/WITH spine AS/, []],
+      [/FROM test_failures/, []],
+    ]);
+    await getMetricsTimeseries({ projectId: 42 }, { db });
+    const spineCall = db.calls.find((c) => /WITH spine AS/.test(c.sql));
+    const capCall = db.calls.find((c) => /FROM test_failures/.test(c.sql));
+    // Attempts: $1=window, $2=bucket, $3=projectId
+    expect(spineCall.params[2]).toBe(42);
+    expect(spineCall.sql).toMatch(/AND tf\.project_id = \$3/);
+    // cap-hits: $1=window, $2=projectId (own contiguous list)
+    expect(capCall.params[1]).toBe(42);
+    expect(capCall.sql).toMatch(/AND project_id = \$2/);
+  });
+
+  it('omitting projectId yields global rollup ($3 not used)', async () => {
+    const db = makeDb([
+      [/WITH spine AS/, []],
+      [/FROM test_failures/, []],
+    ]);
+    await getMetricsTimeseries({}, { db });
+    const spineCall = db.calls.find((c) => /WITH spine AS/.test(c.sql));
+    expect(spineCall.params).toHaveLength(2);  // only window + bucket
+    expect(spineCall.sql).not.toMatch(/\$3/);
+  });
+
+  describe('clamping (long-lived scrapers must not 400 on a typo)', () => {
+    let db;
+    beforeEach(() => {
+      db = makeDb([[/WITH spine AS/, []], [/FROM test_failures/, []]]);
+    });
+
+    it('clamps windowHours above MAX_WINDOW_HOURS', async () => {
+      const out = await getMetricsTimeseries({ windowHours: 99999 }, { db });
+      expect(out.windowHours).toBe(MAX_WINDOW_HOURS);
+    });
+
+    it('clamps bucketHours above MAX_BUCKET_HOURS', async () => {
+      const out = await getMetricsTimeseries({ bucketHours: 9999 }, { db });
+      expect(out.bucketHours).toBe(MAX_BUCKET_HOURS);
+    });
+
+    it('clamps bucketHours below 1', async () => {
+      const out = await getMetricsTimeseries({ bucketHours: 0 }, { db });
+      expect(out.bucketHours).toBe(1);
+    });
+
+    it('non-numeric bucketHours -> default', async () => {
+      const out = await getMetricsTimeseries({ bucketHours: 'abc' }, { db });
+      expect(out.bucketHours).toBe(DEFAULT_BUCKET_HOURS);
+    });
+
+    it('non-numeric projectId -> null (treated as "no override")', async () => {
+      const out = await getMetricsTimeseries({ projectId: 'nope' }, { db });
+      expect(out.projectId).toBeNull();
+    });
+  });
+
+  it('empty data: returns empty buckets array without crashing', async () => {
+    const db = makeDb([]);
+    const out = await getMetricsTimeseries({}, { db });
+    expect(out.buckets).toEqual([]);
   });
 });
