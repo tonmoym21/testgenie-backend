@@ -39,6 +39,7 @@ const autoFixCronService = require('../services/autoFixCronService');
 const autoFixMetricsService = require('../services/autoFixMetricsService');
 const autoFixFailuresService = require('../services/autoFixFailuresService');
 const autoFixProjectConfigService = require('../services/autoFixProjectConfigService');
+const autoFixAuditService = require('../services/autoFixAuditService');
 
 const router = Router();
 
@@ -419,5 +420,28 @@ router.put(
     } catch (err) { next(err); }
   }
 );
+
+// Persisted audit log (PR #40) — "who did what when" for the
+// dashboard's activity panel. Read-only. Filters mirror the
+// listFailures shape so the same UI controls (project + event-type
+// dropdowns + date range) drive both. Same gentle-clamping policy:
+// invalid limits/offsets fall back to defaults rather than 400.
+//
+// Wiring of the WRITE side is one-event-at-a-time over follow-up
+// PRs — this PR ships the substrate plus the reopen call site as
+// the worked example.
+router.get('/audit', async (req, res, next) => {
+  try {
+    const result = await autoFixAuditService.listEvents({
+      eventType: req.query.eventType,
+      projectId: req.query.projectId,
+      failureId: req.query.failureId,
+      since: req.query.since,
+      limit: req.query.limit,
+      offset: req.query.offset,
+    });
+    res.json(result);
+  } catch (err) { next(err); }
+});
 
 module.exports = router;
