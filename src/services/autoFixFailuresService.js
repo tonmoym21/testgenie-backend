@@ -361,6 +361,19 @@ async function markWontFix(id, opts = {}, deps = {}) {
     triggeredBy: opts.triggeredBy || null },
     'autofix: failure manually marked wont_fix by operator');
 
+  // Persist to autofix_audit_events (PR #42 substrate). Same pattern
+  // as the reopen wiring in this file — mirror call right next to
+  // the existing logger.warn so audit-relevant context stays local
+  // to the action. Best-effort: recordEvent swallows DB errors and
+  // returns null so a failed audit write never bubbles back to the
+  // operator (better to keep the wont_fix flip than to 500 on it).
+  await audit.recordEvent({
+    eventType: 'autofix.failure.wont_fix_manual',
+    failureId,
+    triggeredBy: opts.triggeredBy || null,
+    payload: { source: 'markWontFix' },
+  }, { db, logger });
+
   return getFailureDetail(failureId, { db });
 }
 
