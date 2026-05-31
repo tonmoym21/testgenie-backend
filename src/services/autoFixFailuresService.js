@@ -13,6 +13,7 @@
 // scheme if it grows by orders of magnitude.
 
 const { NotFoundError, ConflictError } = require('../utils/apiError');
+const audit = require('./autoFixAuditService');
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
@@ -254,6 +255,21 @@ async function reopenFailure(id, opts = {}, deps = {}) {
   logger.warn({ event: 'autofix.failure.reopened', failureId,
     triggeredBy: opts.triggeredBy || null },
     'autofix: wont_fix failure reopened by operator');
+
+  // Persist the same event to the audit table (PR #40). Best-effort;
+  // a write failure logs but doesn't throw. projectId is pulled
+  // from the previous-state lookup in `check` so the audit row is
+  // queryable by project even though the UPDATE itself didn't
+  // RETURNING project_id. (When the UPDATE matched on first try
+  // `check` was never queried — we just don't have projectId on
+  // that path and accept a null in the audit row. The failure_id
+  // is enough to join back to project via test_failures if needed.)
+  await audit.recordEvent({
+    eventType: 'autofix.failure.reopened',
+    failureId,
+    triggeredBy: opts.triggeredBy || null,
+    payload: { source: 'reopenFailure' },
+  }, { db, logger });
 
   // Return the refreshed detail (with the now-current attempts list)
   // so the dashboard re-renders without a follow-up GET.
