@@ -618,3 +618,148 @@ describe('autoFixFailuresService.bulkMarkWontFix / bulkReopen', () => {
     expect(seenIds).toEqual([10, 20, 30, 40]);
   });
 });
+
+describe('autoFixFailuresService.exportFailuresCsv', () => {
+  const { exportFailuresCsv, CSV_COLUMNS, CSV_DEFAULT_LIMIT, CSV_MAX_LIMIT, csvEscape } =
+    require('../src/services/autoFixFailuresService');
+
+  // Tiny writable spy that just collects strings — we assert on the
+  // concatenated CSV text per test.
+  function makeWritable() {
+    const chunks = [];
+    return {
+      write: (s) => { chunks.push(s); return true; },
+      end: () => {},
+      get text() { return chunks.join(''); },
+    };
+  }
+
+  // Override deps.runStream so the test drives row delivery without
+  // touching pg. The service still builds the SQL + params and
+  // hands them to the visitor, so we can assert on those too.
+  function makeStreamDriver(rows) {
+    let capturedSql = null;
+    let capturedParams = null;
+    return {
+      runStream: async (visit, { sql, params }) => {
+        capturedSql = sql;
+        capturedParams = params;
+        for (const row of rows) visit(row);
+      },
+      get sql() { return capturedSql; },
+      get params() { return capturedParams; },
+    };
+  }
+
+  function fakeCsvRow(overrides = {}) {
+    const base = {
+      id: 1, project_id: 7, fix_status: 'open',
+      failure_signature: 'sig',
+      occurrence_count: 1,
+      first_seen_at: new Date('2026-01-01T00:00:00Z'),
+      last_seen_at: new Date('2026-01-02T00:00:00Z'),
+      resolved_at: null,
+      last_test_id: 100, last_run_id: 200, last_story_id: 300,
+      sample_error_message: 'TimeoutError',
+    };
+    return { ...base, ...overrides };
+  }
+
+  it('writes header row first even with zero data rows (file must remain valid)', async () => {
+    const w = makeWritable();
+    const drv = makeStreamDriver([]);
+    const out = await exportFailuresCsv({}, w, drv);
+
+    const lines = w.text.split('\n').filter(Boolean);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toBe(CSV_COLUMNS.join(','));
+    expect(out.rowsWritten).toBe(0);
+  });
+
+  it('renders rows in CSV_COLUMNS order with ISO-formatted dates and empty NULLs', async () => {
+    const w = makeWritable();
+    const drv = makeStreamDriver([fakeCsvRow()]);
+    await exportFailuresCsv({}, w, drv);
+
+    const lines = w.text.split('\n').filter(Boolean);
+    expect(lines).toHaveLength(2);
+    const cols = lines[1].split(',');
+    expect(cols[0]).toBe('1');                            // id
+    expect(cols[1]).toBe('7');                            // project_id
+    expect(cols[2]).toBe('open');                         // fix_status
+    expect(cols[5]).toBe('2026-01-01T00:00:00.000Z');     // first_seen_at
+    expect(cols[7]).toBe('');                             // resolved_at NULL -> empty
+  });
+
+  it('escapes fields that contain commas, quotes, or newlines (RFC 4180-ish)', async () => {
+    const w = makeWritable();
+    const drv = makeStreamDriver([fakeCsvRow({
+      failure_signature: 'has,comma',
+      sample_error_message: 'has "quote" and\nnewline',
+    })]);
+    await exportFailuresCsv({}, w, drv);
+
+    // The escaped row should keep the header intact and quote the
+    // tricky fields. Pulling fields by header order rather than by
+    // raw-split (which would itself split on the inner commas).
+    expect(w.text).toContain('"has,comma"');
+    expect(w.text).toContain('"has ""quote"" and\nnewline"');
+  });
+
+  it('csvEscape: empty / null / non-string round-trips', () => {
+    expect(csvEscape(null)).toBe('');
+    expect(csvEscape(undefined)).toBe('');
+    expect(csvEscape(42)).toBe('42');
+    expect(csvEscape('plain')).toBe('plain');
+    expect(csvEscape('has,comma')).toBe('"has,comma"');
+    expect(csvEscape('has"quote')).toBe('"has""quote"');
+    expect(csvEscape('has\nnewline')).toBe('"has\nnewline"');
+  });
+
+  it('filter shape mirrors listFailures — status/projectId/q reach the SQL', async () => {
+    const w = makeWritable();
+    const drv = makeStreamDriver([]);
+    await exportFailuresCsv(
+      { status: 'wont_fix', projectId: 42, q: 'TimeoutError' },
+      w, drv
+    );
+    // status: $1, projectId: $2, q (with %wildcards%): $3, limit: $4
+    expect(drv.sql).toMatch(/fix_status = \$1/);
+    expect(drv.sql).toMatch(/project_id = \$2/);
+    expect(drv.sql).toMatch(/ILIKE \$3/);
+    expect(drv.params).toEqual(['wont_fix', 42, '%TimeoutError%', CSV_DEFAULT_LIMIT]);
+  });
+
+  it('limit is clamped to CSV_MAX_LIMIT (10k) regardless of caller request', async () => {
+    const w = makeWritable();
+    const drv = makeStreamDriver([]);
+    await exportFailuresCsv({ limit: 99999 }, w, drv);
+    // limit lives at the end of the params array.
+    expect(drv.params[drv.params.length - 1]).toBe(CSV_MAX_LIMIT);
+  });
+
+  it('limit defaults to CSV_DEFAULT_LIMIT when absent', async () => {
+    const w = makeWritable();
+    const drv = makeStreamDriver([]);
+    await exportFailuresCsv({}, w, drv);
+    expect(drv.params).toEqual([CSV_DEFAULT_LIMIT]);
+  });
+
+  it('non-numeric limit falls back to default (gentle clamping)', async () => {
+    const w = makeWritable();
+    const drv = makeStreamDriver([]);
+    await exportFailuresCsv({ limit: 'banana' }, w, drv);
+    expect(drv.params[drv.params.length - 1]).toBe(CSV_DEFAULT_LIMIT);
+  });
+
+  it('bogus status is silently dropped — no WHERE clause for it', async () => {
+    const w = makeWritable();
+    const drv = makeStreamDriver([]);
+    await exportFailuresCsv({ status: 'not-a-status' }, w, drv);
+    // fix_status appears in the SELECT list always; the assertion is
+    // that it does NOT show up in the WHERE / filter position. Easier
+    // to assert by params shape: nothing besides the limit got bound.
+    expect(drv.sql).not.toMatch(/WHERE/);
+    expect(drv.params).toEqual([CSV_DEFAULT_LIMIT]);
+  });
+});

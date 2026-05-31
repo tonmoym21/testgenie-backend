@@ -178,6 +178,40 @@ router.get('/failures', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// CSV export for the dashboard "Export" button. Same filter shape as
+// the JSON list endpoint above, but with a much higher row ceiling
+// (10k vs 200) since export is meant for spreadsheet work, not
+// pagination. Streams via a pg cursor so memory stays bounded.
+//
+// Content-Disposition: attachment triggers the browser's Save-As
+// dialog with a timestamped filename — operators get a clean
+// "autofix-failures-<iso>.csv" without having to rename in Finder.
+//
+// REGISTERED BEFORE /failures/:id and /failures/bulk/... — the
+// trailing .csv would otherwise be parsed as part of an :id param.
+router.get('/failures.csv', async (req, res, next) => {
+  try {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="autofix-failures-${stamp}.csv"`);
+
+    await autoFixFailuresService.exportFailuresCsv({
+      status: req.query.status,
+      projectId: req.query.projectId,
+      q: req.query.q,
+      limit: req.query.limit,
+    }, res);
+    res.end();
+  } catch (err) {
+    // If anything fails AFTER we've started writing rows, the
+    // response is partially flushed — there's no clean way to
+    // emit a JSON error body at that point. Let the default
+    // Express error path log + close the socket; the operator
+    // sees a truncated CSV which is the best signal we can give.
+    next(err);
+  }
+});
+
 // Bulk variants — dashboard multi-select. Same auth + rate limit as
 // the single-id endpoints. Per-id results are collected; one bad id
 // does NOT fail the batch. Always returns 200; the response body's
