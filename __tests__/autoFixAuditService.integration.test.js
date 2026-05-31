@@ -15,7 +15,7 @@ process.env.NODE_ENV = 'test';
 const { Pool } = require('pg');
 const db = require('../src/db');
 const { recordEvent, listEvents } = require('../src/services/autoFixAuditService');
-const { reopenFailure } = require('../src/services/autoFixFailuresService');
+const { reopenFailure, markWontFix } = require('../src/services/autoFixFailuresService');
 
 let canConnect = false;
 let seed = null;
@@ -181,5 +181,50 @@ describe('reopen wiring [real DB end-to-end]', () => {
       triggered_by: seed.userId,
     });
     expect(out.items[0].payload).toEqual({ source: 'reopenFailure' });
+  });
+});
+
+// PR #43 — same wiring shape as the reopen e2e above, for the
+// markWontFix call site. This proves the audit substrate (PR #42)
+// scales beyond one wire site without needing per-event-type
+// special-casing.
+describe('markWontFix wiring [real DB end-to-end]', () => {
+  it('markWontFix also persists an autofix.failure.wont_fix_manual audit row', async () => {
+    if (!canConnect) { console.warn('[integration] skipping'); return; }
+    // Source state for markWontFix must be 'open' or 'fix_proposed'
+    // (per PR #29). Using 'open' here.
+    const failureId = await seedFailure('open', `audit-wf-${Date.now()}`);
+
+    await markWontFix(failureId, { triggeredBy: seed.userId }, { db, logger: silentLogger });
+
+    const out = await listEvents(
+      { eventType: 'autofix.failure.wont_fix_manual', failureId },
+      { db }
+    );
+    expect(out.total).toBe(1);
+    expect(out.items[0]).toMatchObject({
+      event_type: 'autofix.failure.wont_fix_manual',
+      failure_id: failureId,
+      triggered_by: seed.userId,
+    });
+    expect(out.items[0].payload).toEqual({ source: 'markWontFix' });
+  });
+
+  it('failed markWontFix (wrong source state) does NOT write an audit row', async () => {
+    // Defensive: a CONFLICT-raising markWontFix throws before reaching
+    // the audit call site. Pinning that — an audit row for a
+    // rejected action would be misleading ("operator marked wont_fix"
+    // when in fact they didn't, the system refused).
+    if (!canConnect) { console.warn('[integration] skipping'); return; }
+    const failureId = await seedFailure('resolved', `audit-wf-refuse-${Date.now()}`);
+
+    await expect(markWontFix(failureId, {}, { db, logger: silentLogger }))
+      .rejects.toMatchObject({ statusCode: 409 });
+
+    const out = await listEvents(
+      { eventType: 'autofix.failure.wont_fix_manual', failureId },
+      { db }
+    );
+    expect(out.total).toBe(0);
   });
 });
