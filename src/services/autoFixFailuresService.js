@@ -450,6 +450,159 @@ async function bulkReopen(ids, opts = {}, deps = {}) {
   return runBulk(ids, reopenFailure, opts, deps);
 }
 
+// -----------------------------------------------------------------
+// CSV export
+// -----------------------------------------------------------------
+// Dashboard "Export" button. Same filters as listFailures, but
+// allows a much larger limit (export is meant for spreadsheet work,
+// not a paged UI). Streams rows row-by-row via a pg cursor so a
+// 10k-row export doesn't buffer in process memory.
+
+const CSV_DEFAULT_LIMIT = 1000;
+const CSV_MAX_LIMIT = 10000;
+
+// Fixed column order — first row of the CSV header. Order is
+// dashboard-friendly: identifiers first, then state, then context.
+// Keep in sync with the row-shape pulled by the streaming SELECT.
+const CSV_COLUMNS = [
+  'id', 'project_id', 'fix_status', 'failure_signature',
+  'occurrence_count', 'first_seen_at', 'last_seen_at', 'resolved_at',
+  'last_test_id', 'last_run_id', 'last_story_id',
+  'sample_error_message',
+];
+
+// RFC 4180-ish escaping: wrap in double quotes whenever a field
+// contains comma, double-quote, newline, or carriage return. Doubled
+// double-quote escapes the quote itself. NULL becomes empty string —
+// distinct from "null" because spreadsheet tools interpret unquoted
+// empty as a true empty cell, which is the intended semantic.
+function csvEscape(value) {
+  if (value == null) return '';
+  let s;
+  if (value instanceof Date) s = value.toISOString();
+  else s = String(value);
+  if (/[",\n\r]/.test(s)) {
+    return '"' + s.replace(/"/g, '""') + '"';
+  }
+  return s;
+}
+
+function rowToCsvLine(row) {
+  return CSV_COLUMNS.map((col) => csvEscape(row[col])).join(',') + '\n';
+}
+
+/**
+ * Stream a CSV export of failures matching the given filters to the
+ * provided writable stream (typically the Express response). The
+ * filter shape mirrors listFailures' so the dashboard's "Export"
+ * button can reuse the same query params it already builds for the
+ * list view. Returns the number of data rows written so the caller
+ * can log it.
+ *
+ * Uses a pg cursor (via deps.db.getClient + CURSOR FETCH) to keep
+ * memory bounded even at the CSV_MAX_LIMIT ceiling. Tests can pass
+ * a deps.runStream override that calls the visitor with synthetic
+ * rows; default implementation hits real pg.
+ *
+ * @param {object} filters       same shape as listFailures filters
+ * @param {Writable} writable    where to pipe rows (e.g. res)
+ * @param {object?} deps
+ * @param {object?} deps.db
+ * @param {(row) => void => void} deps.runStream  override for tests
+ * @returns {Promise<{rowsWritten: number, filters}>}
+ */
+async function exportFailuresCsv(filters = {}, writable, deps = {}) {
+  // Write the header first regardless of row count — keeps the file
+  // valid even when the filter matches zero rows. Without this an
+  // empty result would be a zero-byte file and confuse spreadsheets.
+  writable.write(CSV_COLUMNS.join(',') + '\n');
+
+  // Build the SQL once. Reuses listFailures' WHERE-building pattern
+  // so a refactor that touches filter shape there mostly carries
+  // over. limit comes from a separate clamp to allow the much
+  // higher CSV ceiling (export is bulk-shaped; the UI list isn't).
+  const where = [];
+  const params = [];
+  if (filters.status && FIX_STATUSES.has(filters.status)) {
+    params.push(filters.status);
+    where.push(`fix_status = $${params.length}`);
+  }
+  if (filters.projectId != null) {
+    const n = Number(filters.projectId);
+    if (Number.isFinite(n)) {
+      params.push(Math.floor(n));
+      where.push(`project_id = $${params.length}`);
+    }
+  }
+  if (filters.q && typeof filters.q === 'string' && filters.q.trim()) {
+    params.push(`%${filters.q.trim()}%`);
+    where.push(`(failure_signature ILIKE $${params.length} OR sample_error_message ILIKE $${params.length})`);
+  }
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+  const limit = clampCsvLimit(filters.limit);
+  params.push(limit);
+  const limitIdx = params.length;
+
+  const sql = `
+    SELECT ${CSV_COLUMNS.join(', ')}
+      FROM test_failures
+      ${whereSql}
+      ORDER BY last_seen_at DESC NULLS LAST, id DESC
+      LIMIT $${limitIdx}
+  `;
+
+  let rowsWritten = 0;
+  if (deps.runStream) {
+    // Test seam: drive the visitor with whatever rows the harness
+    // supplies, bypassing pg entirely. Real production path always
+    // goes through the pg cursor branch below.
+    await deps.runStream((row) => {
+      writable.write(rowToCsvLine(row));
+      rowsWritten++;
+    }, { sql, params, limit });
+    return { rowsWritten, filters: { ...filters, limit } };
+  }
+
+  // Real pg cursor: dedicated client (cursors are session-scoped),
+  // declare → fetch in chunks → close → release. The chunk size of
+  // 250 balances pg round-trips against per-fetch memory; with 10k
+  // max rows that's at most 40 round-trips, well under the
+  // 30-second express default response timeout.
+  const db = deps.db || require('../db');
+  const client = await db.getClient();
+  try {
+    await client.query('BEGIN');
+    await client.query(`DECLARE failures_csv NO SCROLL CURSOR FOR ${sql}`, params);
+    while (true) {
+      // eslint-disable-next-line no-await-in-loop
+      const chunk = await client.query('FETCH 250 FROM failures_csv');
+      if (chunk.rows.length === 0) break;
+      for (const row of chunk.rows) {
+        writable.write(rowToCsvLine(row));
+        rowsWritten++;
+      }
+    }
+    await client.query('CLOSE failures_csv');
+    await client.query('COMMIT');
+  } catch (err) {
+    // Best-effort rollback — if the BEGIN succeeded but FETCH failed,
+    // we still need to release the txn before returning the client.
+    try { await client.query('ROLLBACK'); } catch { /* swallow */ }
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  return { rowsWritten, filters: { ...filters, limit } };
+}
+
+function clampCsvLimit(raw) {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return CSV_DEFAULT_LIMIT;
+  return Math.max(1, Math.min(CSV_MAX_LIMIT, Math.floor(n)));
+}
+
 module.exports = {
   listFailures,
   getFailureDetail,
@@ -458,9 +611,14 @@ module.exports = {
   getAttemptDiff,
   bulkMarkWontFix,
   bulkReopen,
+  exportFailuresCsv,
   // exported for tests
   FIX_STATUSES,
   DEFAULT_LIMIT,
   MAX_LIMIT,
   BULK_MAX_IDS,
+  CSV_DEFAULT_LIMIT,
+  CSV_MAX_LIMIT,
+  CSV_COLUMNS,
+  csvEscape,
 };

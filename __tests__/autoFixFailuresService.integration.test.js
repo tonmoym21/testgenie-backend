@@ -13,7 +13,8 @@ process.env.NODE_ENV = 'test';
 const { Pool } = require('pg');
 const db = require('../src/db');
 const { listFailures, getFailureDetail, reopenFailure, markWontFix, getAttemptDiff,
-  bulkMarkWontFix, bulkReopen } = require('../src/services/autoFixFailuresService');
+  bulkMarkWontFix, bulkReopen, exportFailuresCsv, CSV_COLUMNS } =
+  require('../src/services/autoFixFailuresService');
 
 let canConnect = false;
 let seed = null;
@@ -524,5 +525,89 @@ describe('autoFixFailuresService.bulk operations [real DB]', () => {
       id: fakeId,
       error: { code: 'NOT_FOUND' },
     });
+  });
+});
+
+describe('autoFixFailuresService.exportFailuresCsv [real DB]', () => {
+  function makeWritable() {
+    const chunks = [];
+    return {
+      write: (s) => { chunks.push(s); return true; },
+      end: () => {},
+      get text() { return chunks.join(''); },
+    };
+  }
+
+  it('streams via real pg cursor; produces a valid CSV with header + data rows', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    // Seed 3 failures with distinguishable signatures.
+    await seedFailures(3, { sigPrefix: 'csv-real' });
+
+    const w = makeWritable();
+    const out = await exportFailuresCsv(
+      { projectId: seed.projectId },
+      w,
+      { db }
+    );
+
+    const lines = w.text.split('\n').filter(Boolean);
+    // Header + 3 rows
+    expect(lines).toHaveLength(4);
+    expect(lines[0]).toBe(CSV_COLUMNS.join(','));
+    expect(out.rowsWritten).toBe(3);
+    // The rows have our signature prefix somewhere in them — proves
+    // the cursor pulled the seeded data not stale rows.
+    expect(w.text).toContain('csv-real');
+  });
+
+  it('respects the limit parameter (cursor closes after LIMIT rows)', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    await seedFailures(5, { sigPrefix: 'csv-lim' });
+
+    const w = makeWritable();
+    const out = await exportFailuresCsv(
+      { projectId: seed.projectId, limit: 2 },
+      w,
+      { db }
+    );
+
+    // Header + 2 rows (limited).
+    expect(out.rowsWritten).toBe(2);
+    expect(w.text.split('\n').filter(Boolean)).toHaveLength(3);
+  });
+
+  it('filters reach the cursor SQL — status narrows result set', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    // 2 open + 2 wont_fix in this project, distinct sigs.
+    await seedFailures(2, { sigPrefix: 'csv-fopen' });
+    await seedFailures(2, { sigPrefix: 'csv-fwf', fix_status: 'wont_fix' });
+
+    const w = makeWritable();
+    const out = await exportFailuresCsv(
+      { projectId: seed.projectId, status: 'wont_fix' },
+      w,
+      { db }
+    );
+
+    expect(out.rowsWritten).toBe(2);
+    // Should NOT contain the open-prefix signatures.
+    expect(w.text).not.toContain('csv-fopen');
+    expect(w.text).toContain('csv-fwf');
+  });
+
+  it('empty result still emits a valid CSV (header only)', async () => {
+    if (!canConnect) { console.warn('[integration] skipping — DB unreachable'); return; }
+    // Don't seed — beforeEach cleans owned rows so the project is empty.
+    const w = makeWritable();
+    const out = await exportFailuresCsv(
+      { projectId: seed.projectId },
+      w,
+      { db }
+    );
+
+    expect(out.rowsWritten).toBe(0);
+    const lines = w.text.split('\n').filter(Boolean);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toBe(CSV_COLUMNS.join(','));
   });
 });

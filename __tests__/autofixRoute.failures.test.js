@@ -24,6 +24,7 @@ jest.mock('../src/services/autoFixFailuresService', () => ({
   getAttemptDiff: jest.fn(),
   bulkMarkWontFix: jest.fn(),
   bulkReopen: jest.fn(),
+  exportFailuresCsv: jest.fn(),
   // Mirror the real export so the route's zod max-size message
   // matches what's enforced.
   BULK_MAX_IDS: 100,
@@ -433,5 +434,68 @@ describe('POST /api/autofix/failures/bulk/reopen', () => {
     mockIsAdmin = false;
     const res = await request(app).post('/api/autofix/failures/bulk/reopen').send({ ids: [1] });
     expect(res.status).toBe(403);
+  });
+});
+
+describe('GET /api/autofix/failures.csv', () => {
+  let app;
+  beforeAll(() => { app = buildApp(); });
+  beforeEach(() => {
+    autoFixFailuresService.exportFailuresCsv.mockReset();
+    mockIsAdmin = true;
+  });
+
+  it('200 + text/csv + attachment disposition; passes filters to the service', async () => {
+    // Mock the service to write a header + one synthetic row to the
+    // response stream and resolve. We're not exercising the SQL here
+    // — just the route's plumbing.
+    autoFixFailuresService.exportFailuresCsv.mockImplementationOnce(async (filters, writable) => {
+      writable.write('id,project_id\n');
+      writable.write('1,7\n');
+      return { rowsWritten: 1, filters };
+    });
+
+    const res = await request(app)
+      .get('/api/autofix/failures.csv?status=open&projectId=7&q=Timeout&limit=500');
+
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toMatch(/text\/csv/);
+    expect(res.headers['content-disposition'])
+      .toMatch(/^attachment; filename="autofix-failures-\d{4}-\d{2}-\d{2}T/);
+    expect(res.text).toBe('id,project_id\n1,7\n');
+
+    // Filters reach the service (still as strings, coercion happens there).
+    const [filters, writable] = autoFixFailuresService.exportFailuresCsv.mock.calls[0];
+    expect(filters).toEqual({
+      status: 'open', projectId: '7', q: 'Timeout', limit: '500',
+    });
+    // Second arg is the Express response object — has a .write fn.
+    expect(typeof writable.write).toBe('function');
+  });
+
+  it('regression: .csv path does NOT match the /failures/:id detail handler', async () => {
+    // The route ordering matters — see the bulk/:id collision from
+    // PR #35. Asserting that getFailureDetail (the :id handler) was
+    // not invoked when the URL ends in .csv.
+    autoFixFailuresService.exportFailuresCsv.mockImplementationOnce(async (_f, w) => {
+      w.write('id\n');
+      return { rowsWritten: 0 };
+    });
+    await request(app).get('/api/autofix/failures.csv');
+    expect(autoFixFailuresService.exportFailuresCsv).toHaveBeenCalledTimes(1);
+    expect(autoFixFailuresService.getFailureDetail).not.toHaveBeenCalled();
+  });
+
+  it('401 without auth', async () => {
+    const res = await request(app).get('/api/autofix/failures.csv').set('x-test-noauth', '1');
+    expect(res.status).toBe(401);
+    expect(autoFixFailuresService.exportFailuresCsv).not.toHaveBeenCalled();
+  });
+
+  it('403 for non-admin', async () => {
+    mockIsAdmin = false;
+    const res = await request(app).get('/api/autofix/failures.csv');
+    expect(res.status).toBe(403);
+    expect(autoFixFailuresService.exportFailuresCsv).not.toHaveBeenCalled();
   });
 });
